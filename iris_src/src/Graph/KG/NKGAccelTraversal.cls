@@ -356,9 +356,18 @@ ClassMethod BFSJson(seed As %String, predicatesJson As %String = "[]", maxHops A
         Return ##class(Graph.KG.Traversal).BFSFastJsonSorted(seed, predicatesJson, maxHops, "", "out", maxResults)
     }
     Set adjStr = ##class(Graph.KG.NKGAccelAdjacency).ExportAdjacencyWithPreds()
-    Set raw = $ZF(-5, dllid, fnid, adjStr, seed, predicatesJson, maxHops, maxResults)
+    Set resultGlobal = "ArnoKG"
+    Kill ^ArnoKG("bfs_result")
+    Set raw = $ZF(-5, dllid, fnid, adjStr, resultGlobal, seed, predicatesJson, maxHops, maxResults)
     If raw = "" || $Extract(raw, 1, 6) = "DEBUG:" {
         Return ##class(Graph.KG.Traversal).BFSFastJsonSorted(seed, predicatesJson, maxHops, "", "out", maxResults)
+    }
+    If $Extract(raw, 1, 10) = "CHUNKED:BFS" {
+        Set n = +$Piece(raw, ":", 3)
+        Set json = ""
+        For i = 1:1:n { Set json = json _ $Get(^ArnoKG("bfs_result", i), "") }
+        Kill ^ArnoKG("bfs_result")
+        Set raw = json
     }
     Set tag = $Job _ "_bfs"
     Kill ^ArnoKG("bfs_r", tag)

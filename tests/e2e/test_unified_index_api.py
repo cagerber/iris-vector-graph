@@ -1,6 +1,7 @@
 import pytest
 
 from iris_vector_graph.engine import IRISGraphEngine
+from iris_vector_graph.schema import GraphSchema
 from iris_vector_graph import (
     VectorIndexConfig,
     FulltextIndexConfig,
@@ -12,16 +13,21 @@ from iris_vector_graph import (
 
 @pytest.fixture()
 def engine(iris_connection):
-    return IRISGraphEngine(iris_connection, embedding_dimension=128)
+    # Detect the live container's actual kg_NodeEmbeddings dimension (ivg's own
+    # primitive) instead of hardcoding — a mismatch here poisons the shared
+    # session connection for every other test relying on it.
+    dim = GraphSchema.get_embedding_dimension(iris_connection.cursor()) or 768
+    return IRISGraphEngine(iris_connection, embedding_dimension=dim)
 
 
 @pytest.fixture()
 def seeded_vectors(engine, clean_test_data):
     prefix = clean_test_data
     ids = []
+    dim = engine.embedding_dimension
     for i in range(20):
         nid = f"{prefix}n{i}"
-        vec = [(i + j) % 7 / 7.0 for j in range(128)]
+        vec = [(i + j) % 7 / 7.0 for j in range(dim)]
         engine.create_node(nid)
         engine.store_embedding(nid, vec)
         ids.append(nid)

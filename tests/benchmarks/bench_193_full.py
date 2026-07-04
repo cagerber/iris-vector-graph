@@ -57,6 +57,9 @@ SEP2 = "-" * 68
 # Connection helpers
 # ---------------------------------------------------------------------------
 
+ARNO_LIB = os.environ.get("ARNO_LIB", "/usr/irissys/mgr/libarno_callout.so")
+
+
 def _connect(port, user="_SYSTEM", pw="SYS", ns="USER"):
     import iris
     host = os.environ.get("IRIS_HOST", "localhost")
@@ -518,8 +521,7 @@ def main():
             try:
                 iris_obj.classMethodVoid("Graph.KG.NKGAccel", "ResetCache")
                 iris_obj.classMethodValue(
-                    "Graph.KG.NKGAccel", "Load",
-                    "/usr/irissys/mgr/libarno_callout.so")
+                    "Graph.KG.NKGAccel", "Load", ARNO_LIB)
                 iris_obj.classMethodVoid("Graph.KG.NKGAccel", "InvalidateAdjCache")
             except Exception:
                 pass
@@ -593,8 +595,7 @@ def main():
                     try:
                         eiris.classMethodVoid("Graph.KG.NKGAccel", "ResetCache")
                         eiris.classMethodValue(
-                            "Graph.KG.NKGAccel", "Load",
-                            "/usr/irissys/mgr/libarno_callout.so")
+                            "Graph.KG.NKGAccel", "Load", ARNO_LIB)
                     except Exception:
                         pass
 

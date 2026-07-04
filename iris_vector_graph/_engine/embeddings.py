@@ -79,17 +79,20 @@ class EmbeddingsMixin:
     def _get_embedding_dimension(self) -> int:
         """
         Get the vector embedding dimension, either from initialization or auto-detection.
-        Prioritizes database detection if the schema exists.
+        Prioritizes the already-known instance value to avoid a per-call class-dictionary
+        query — querying %Dictionary.CompiledProperty on every write contends for the
+        class's Class-Changed_Timestamp and can raise SQLCODE -150 (optimistic concurrency
+        locking failure) under concurrent writers.
         """
-        cursor = self.conn.cursor()
+        # 1. Fast path: caller already provided it, or a prior DB detection cached it here.
+        if self.embedding_dimension is not None:
+            return self.embedding_dimension
 
-        # 1. Try to detect from DB first
+        # 2. Fall back to DB detection only when the dimension is truly unknown.
+        cursor = self.conn.cursor()
         dim = GraphSchema.get_embedding_dimension(cursor)
         if dim:
-            return int(dim)
-
-        # 2. Fallback to instance variable if DB detection fails or table doesn't exist
-        if self.embedding_dimension is not None:
+            self.embedding_dimension = int(dim)
             return self.embedding_dimension
 
         raise ValueError(

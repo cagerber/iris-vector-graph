@@ -46,13 +46,24 @@ import subprocess, iris
 ip = subprocess.run(['docker','inspect','$CONTAINER','--format',
     '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'],
     capture_output=True, text=True).stdout.strip()
+conn = None
 if ip:
-    conn = iris.connect(hostname=ip, port=1972, namespace='USER', username='_SYSTEM', password='SYS')
-else:
-    from iris_devtester import IRISContainer as C
-    c = C.attach('$CONTAINER'); c._connection = None; conn = c.get_connection()
+    try:
+        conn = iris.connect(hostname=ip, port=1972, namespace='USER', username='_SYSTEM', password='SYS')
+    except Exception:
+        conn = None
+if conn is None:
+    # Container IP not routable from host (macOS Docker Desktop/OrbStack) —
+    # fall back to the published port on localhost, same as tests/conftest.py.
+    try:
+        conn = iris.connect(hostname='localhost', port=31972, namespace='USER', username='_SYSTEM', password='SYS')
+    except Exception:
+        from iris_devtester import IRISContainer as C
+        c = C.attach('$CONTAINER'); c._connection = None; conn = c.get_connection()
 from iris_vector_graph import IRISGraphEngine
-IRISGraphEngine(conn, embedding_dimension=128).initialize_schema()
+# 768 matches schema.py's own default (get_base_schema_sql) and what most of
+# the e2e/integration suite assumes for kg_NodeEmbeddings' VECTOR dimension.
+IRISGraphEngine(conn, embedding_dimension=768).initialize_schema()
 print('✓ schema initialized')
 " 2>&1 | grep -E 'schema initialized|ERROR|CRITICAL' | grep -v 'Embedding dimension'
     echo "Deploying and compiling ObjectScript..."
@@ -66,16 +77,31 @@ OSEOF
       "$0" compile "$_cls" > /dev/null 2>&1 || true
     done
     echo "Loading libarno_callout.so..."
+    # NKGAccel/NKGAccelLoader.Load's ObjectScript default parameter is
+    # /usr/irissys/mgr/libarno_callout.so (not /tmp/) — several e2e tests and
+    # benchmarks call Load() with that literal or no argument at all, relying
+    # on the default. Copy it there too so those callers don't need to know
+    # about /tmp/ at all; /tmp/ remains the explicit path used by this script.
+    docker exec "$CONTAINER" cp /tmp/libarno_callout.so /usr/irissys/mgr/libarno_callout.so
     python3 -c "
 import subprocess, iris, json
 ip = subprocess.run(['docker','inspect','$CONTAINER','--format',
     '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'],
     capture_output=True, text=True).stdout.strip()
+conn = None
 if ip:
-    conn = iris.connect(hostname=ip, port=1972, namespace='USER', username='_SYSTEM', password='SYS')
-else:
-    from iris_devtester import IRISContainer as C
-    c = C.attach('$CONTAINER'); c._connection = None; conn = c.get_connection()
+    try:
+        conn = iris.connect(hostname=ip, port=1972, namespace='USER', username='_SYSTEM', password='SYS')
+    except Exception:
+        conn = None
+if conn is None:
+    # Container IP not routable from host (macOS Docker Desktop/OrbStack) —
+    # fall back to the published port on localhost, same as tests/conftest.py.
+    try:
+        conn = iris.connect(hostname='localhost', port=31972, namespace='USER', username='_SYSTEM', password='SYS')
+    except Exception:
+        from iris_devtester import IRISContainer as C
+        c = C.attach('$CONTAINER'); c._connection = None; conn = c.get_connection()
 irisobj = iris.createIRIS(conn)
 # Load via ArnoAccel (rzf-style, sets rust_callout capability)
 r1 = irisobj.classMethodValue('Graph.KG.ArnoAccel', 'Load', '/tmp/libarno_callout.so')

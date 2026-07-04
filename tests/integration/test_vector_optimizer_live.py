@@ -12,6 +12,7 @@ Also covers:
 import hashlib
 import pytest
 from iris_vector_graph.engine import IRISGraphEngine
+from iris_vector_graph.schema import GraphSchema
 from iris_vector_graph.vector_utils import VectorOptimizer
 
 
@@ -28,14 +29,18 @@ def _make_vec(seed: str, dim=128):
 @pytest.fixture
 def opt_eng(iris_connection, iris_master_cleanup):
     """Engine + VectorOptimizer with embeddings stored."""
-    eng = IRISGraphEngine(iris_connection, embedding_dimension=128)
+    # Detect the live table's actual dimension instead of hardcoding 128 — a
+    # mismatch here poisons the shared session connection for every other test.
+    dim = GraphSchema.get_embedding_dimension(iris_connection.cursor()) or 128
+    eng = IRISGraphEngine(iris_connection, embedding_dimension=dim)
     eng.initialize_schema(auto_deploy_objectscript=False)
     for i in range(5):
         eng.create_node(f"vo_{i}", labels=["Doc"])
     for i in range(5):
-        eng.store_embedding(f"vo_{i}", _make_vec(f"vo_{i}"))
+        eng.store_embedding(f"vo_{i}", _make_vec(f"vo_{i}", dim=dim))
     eng.sync()
     opt = VectorOptimizer(iris_connection)
+    opt._test_dim = dim
     return opt, iris_connection
 
 
@@ -116,7 +121,7 @@ class TestBenchmarkVectorSearchLive:
     def test_benchmark_with_test_vectors(self, opt_eng):
         """benchmark_vector_search with explicit test vectors."""
         opt, _ = opt_eng
-        test_vectors = [_make_vec(f"bench_{i}") for i in range(3)]
+        test_vectors = [_make_vec(f"bench_{i}", dim=opt._test_dim) for i in range(3)]
         try:
             result = opt.benchmark_vector_search(
                 test_vectors=test_vectors,

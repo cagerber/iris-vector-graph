@@ -3,10 +3,10 @@ import random
 import pytest
 from iris_vector_graph.engine import IRISGraphEngine
 from iris_vector_graph.index_protocol import IVGIndex, IndexHandle
+from iris_vector_graph.schema import GraphSchema
 
 
 DIM = 16
-EMBED_DIM = 768
 
 
 @pytest.fixture(scope="module")
@@ -15,8 +15,19 @@ def engine(iris_connection):
 
 
 @pytest.fixture(scope="module")
-def engine_with_embeddings(iris_connection):
-    eng = IRISGraphEngine(iris_connection, embedding_dimension=EMBED_DIM)
+def embed_dim(iris_connection):
+    """The live container's actual kg_NodeEmbeddings dimension (ivg's own
+    detection primitive) — hardcoding a dimension here collides with whatever
+    the shared table was really initialized at and poisons the connection for
+    every other test sharing this fixture. Falls back to 768 (schema.py's own
+    default) if the table doesn't exist yet."""
+    cursor = iris_connection.cursor()
+    return GraphSchema.get_embedding_dimension(cursor) or 768
+
+
+@pytest.fixture(scope="module")
+def engine_with_embeddings(iris_connection, embed_dim):
+    eng = IRISGraphEngine(iris_connection, embedding_dimension=embed_dim)
     return eng
 
 
@@ -61,7 +72,7 @@ def hnsw_data(engine_with_embeddings):
             cur.execute("INSERT INTO Graph_KG.nodes (node_id) VALUES (?)", [nid])
     eng.conn.commit()
     for nid in nodes:
-        vec = [rng.gauss(0, 1) for _ in range(EMBED_DIM)]
+        vec = [rng.gauss(0, 1) for _ in range(eng.embedding_dimension)]
         eng.store_embedding(nid, vec)
     if not eng._probe_native_vec():
         pytest.skip("Native HNSW (kg_KNN_VEC) not available on this IRIS tier")
@@ -80,7 +91,10 @@ class TestEngineIndex:
         query = [rng.gauss(0, 1) for _ in range(DIM)]
         handle = engine.index("idx_proto_ivf")
         assert isinstance(handle, IndexHandle)
-        assert handle.type == "ivf"
+        # engine.index().type returns the unified concept name, not the legacy
+        # backend label — "ivf" maps to "vector" (Index Protocol Unification,
+        # spec 149 / _LEGACY_TO_CONCEPT in engine.py).
+        assert handle.type == "vector"
         via_handle = handle.search(query, k=3)
         via_direct = engine.ivf_search("idx_proto_ivf", query, k=3)
         assert via_handle == via_direct
@@ -88,7 +102,7 @@ class TestEngineIndex:
     def test_engine_index_bm25_dispatch(self, engine, bm25_index):
         handle = engine.index("idx_proto_bm25")
         assert isinstance(handle, IndexHandle)
-        assert handle.type == "bm25"
+        assert handle.type == "fulltext"
         via_handle = handle.search("graph", k=2)
         via_direct = engine.bm25_search("idx_proto_bm25", "graph", k=2)
         assert via_handle == via_direct
@@ -98,10 +112,11 @@ class TestEngineIndex:
         if "idx_proto_ivf" not in new_engine._index_registry:
             pytest.skip("gref $Order probe not supported on this IRIS build — registry rebuild skipped")
         handle = new_engine.index("idx_proto_ivf")
-        assert handle.type == "ivf"
+        assert handle.type == "vector"
 
     def test_engine_index_raises_for_unknown_name(self, engine):
-        with pytest.raises(ValueError, match="not found"):
+        from iris_vector_graph.errors import IndexNotFoundError
+        with pytest.raises(IndexNotFoundError, match="not found"):
             engine.index("this_index_definitely_does_not_exist_xyz")
 
     def test_engine_index_returns_ivgindex(self, engine, ivf_index):
@@ -109,6 +124,8 @@ class TestEngineIndex:
         assert isinstance(handle, IVGIndex)
 
     def test_engine_index_info_has_type(self, engine, ivf_index):
+        # info() returns the raw backend dict (legacy label "ivf"), unlike
+        # handle.type which returns the unified concept ("vector").
         info = engine.index("idx_proto_ivf").info()
         assert info.get("type") == "ivf"
 
@@ -144,7 +161,7 @@ class TestEngineIndexHNSW:
         eng = engine_with_embeddings
         rng = random.Random(99)
         new_id = "hnsw_e2e_new"
-        vec = [rng.gauss(0, 1) for _ in range(EMBED_DIM)]
+        vec = [rng.gauss(0, 1) for _ in range(eng.embedding_dimension)]
         cur = eng.conn.cursor()
         cur.execute("SELECT COUNT(*) FROM Graph_KG.nodes WHERE node_id=?", [new_id])
         if cur.fetchone()[0] == 0:
@@ -160,7 +177,7 @@ class TestEngineIndexHNSW:
     def test_hnsw_search_returns_results(self, engine_with_embeddings, hnsw_data):
         eng = engine_with_embeddings
         rng = random.Random(77)
-        query = [rng.gauss(0, 1) for _ in range(EMBED_DIM)]
+        query = [rng.gauss(0, 1) for _ in range(eng.embedding_dimension)]
         results = eng.index("hnsw").search(query, k=5)
         assert isinstance(results, list)
         assert len(results) > 0
@@ -169,7 +186,7 @@ class TestEngineIndexHNSW:
     def test_hnsw_search_matches_search_nodes_by_vector(self, engine_with_embeddings, hnsw_data):
         eng = engine_with_embeddings
         rng = random.Random(88)
-        query = [rng.gauss(0, 1) for _ in range(EMBED_DIM)]
+        query = [rng.gauss(0, 1) for _ in range(eng.embedding_dimension)]
         via_handle = eng.index("hnsw").search(query, k=5)
         via_direct = eng.search_nodes_by_vector(query, k=5)
         assert len(via_handle) == len(via_direct)

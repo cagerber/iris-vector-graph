@@ -31,12 +31,16 @@ import json
 import time
 import pytest
 from iris_vector_graph.engine import IRISGraphEngine
+from iris_vector_graph.schema import GraphSchema
 from iris_vector_graph.result import IVGResult
 
 
 @pytest.fixture
 def eng(iris_connection, iris_master_cleanup):
-    e = IRISGraphEngine(iris_connection, embedding_dimension=128)
+    # Detect the live table's actual dimension instead of hardcoding 128 — a
+    # mismatch here poisons the shared session connection for every other test.
+    dim = GraphSchema.get_embedding_dimension(iris_connection.cursor()) or 128
+    e = IRISGraphEngine(iris_connection, embedding_dimension=dim)
     e.initialize_schema(auto_deploy_objectscript=False)
     for i in range(10):
         e.create_node(f"sw_{i}", labels=["Entity"], properties={"score": str(i * 0.1)})
@@ -222,8 +226,9 @@ class TestStoreGetNodesFiltered:
 
 class TestVectorPaths:
 
-    def _store_embedding(self, eng, node_id, dim=128):
+    def _store_embedding(self, eng, node_id, dim=None):
         import hashlib
+        dim = dim or eng.embedding_dimension
         h = hashlib.md5(node_id.encode()).digest()
         raw = []
         while len(raw) < dim:
@@ -236,7 +241,7 @@ class TestVectorPaths:
         """kg_KNN_VEC with label_filter exercises the label-filter branch."""
         for i in range(3):
             self._store_embedding(eng, f"sw_{i}")
-        vec = [0.1] * 128
+        vec = [0.1] * eng.embedding_dimension
         try:
             result = eng.kg_KNN_VEC(query_vector=json.dumps(vec), k=3, label_filter="Entity")
             assert result is not None
@@ -245,7 +250,7 @@ class TestVectorPaths:
 
     def test_multi_vector_search_empty(self, eng):
         """multi_vector_search on empty indexes returns []."""
-        vec = [0.1] * 128
+        vec = [0.1] * eng.embedding_dimension
         try:
             result = eng.multi_vector_search(
                 sources=[{"table": "Graph_KG.kg_NodeEmbeddings", "id_col": "id", "vec_col": "emb"}],
@@ -258,7 +263,7 @@ class TestVectorPaths:
 
     def test_kg_rrf_fuse_no_indexes(self, eng):
         """kg_RRF_FUSE when no IVF/BM25 indexes exist — returns fused empty list."""
-        vec = json.dumps([0.1] * 128)
+        vec = json.dumps([0.1] * eng.embedding_dimension)
         try:
             result = eng.kg_RRF_FUSE(k=5, k1=10, k2=10, c=60,
                                       query_vector=vec, query_text="test")
@@ -270,7 +275,7 @@ class TestVectorPaths:
         """vector_search with label filter."""
         for i in range(3):
             self._store_embedding(eng, f"sw_{i}")
-        vec = [0.1] * 128
+        vec = [0.1] * eng.embedding_dimension
         try:
             result = eng.vector_search(vec, k=3, label="Entity")
             assert result is not None
@@ -497,7 +502,7 @@ class TestEmbeddingQueuePipeline:
     def test_embed_nodes_callable_with_selector(self, eng):
         from iris_vector_graph.embed_selector import EmbedSelector
         sel = EmbedSelector(label="Entity", missing_only=True)
-        eng.embedder = lambda text: [0.1] * 128
+        eng.embedder = lambda text: [0.1] * eng.embedding_dimension
         try:
             result = eng.embed_nodes(selector=sel, batch_size=5)
             assert result is not None

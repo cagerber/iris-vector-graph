@@ -1,5 +1,88 @@
 # Changelog
 
+### v2.4.5 (2026-07-04)
+
+**Test-suite dimension hardcodes, index_protocol row-count bugs, ObjectScript
+visibility bug, and BFSJson chunking regression (paired arno fix)**
+
+Surfaced during a live full-suite run against a fresh enterprise container; none
+of these are regressions from v2.4.4, all pre-existing.
+
+- fix: 8+ e2e/integration test fixtures hardcoded `embedding_dimension=128` or
+  `768`, colliding with whatever the shared `kg_NodeEmbeddings` table was
+  actually initialized at and throwing a `DataError` that corrupted the shared
+  session connection for every other test relying on it. Fixtures now detect the
+  live dimension via `GraphSchema.get_embedding_dimension()` instead of guessing.
+- fix: `index_protocol.py` — `hnsw`'s `_INFO`/`_BUILD` handlers never reported a
+  row count, so `IndexHandle.search()` always raised `IndexNotBuiltError` for
+  hnsw regardless of actual data (added `"rows": engine.embedding_count()`).
+  `bm25_info()`'s doc-count key `"N"` wasn't in `_rows_of()`'s accepted-key list,
+  causing the same false-empty failure for bm25.
+- fix: `tests/e2e/test_index_protocol.py` had stale assertions from the Index
+  Protocol Unification (spec 149) — expected legacy backend labels (`"ivf"`,
+  `"bm25"`) where the API now returns unified concepts (`"vector"`,
+  `"fulltext"`), and expected `ValueError` where the code raises
+  `IndexNotFoundError`.
+- fix: `iris_master_cleanup` test fixture (`tests/conftest.py`) now skips
+  gracefully instead of raising when the shared session connection is already
+  unusable (e.g. corrupted by an unrelated test's native-API call), preventing
+  one bad test from cascading into ~1900 spurious errors across the suite.
+- fix(ObjectScript): `Graph.KG.NKGAccelAdjacency.ExportAdjacencyWithPreds` and
+  `.StoreLargeOut` were left `[Private]` after the spec-187 class split moved
+  them into a sibling class from their only caller
+  (`NKGAccelTraversal.BFSJson`) — calling a `[Private]` method cross-class
+  throws `<PRIVATE METHOD>`, which corrupts the connection's protocol state.
+  Modifier removed; both are legitimately cross-class APIs.
+- fix(ObjectScript): `NKGAccelTraversal.BFSJson` updated for a paired fix in
+  `arno`'s `kg_bfs_global` FFI entry point — that function returned its full
+  BFS result via a single `$ZF(-5, ...)` call with no length check, throwing
+  `<MAX $ZF STRING>` on medium-scale graphs (every sibling FFI function in
+  arno's `kg_ffi.rs` already chunks via `IRIS_MAXSTRLEN` + `write_result_chunks`
+  — this one was the outlier). `kg_bfs_global` gained a `resultGlobal`
+  parameter and now returns `"CHUNKED:BFS:{n}"` for oversized results;
+  `BFSJson` detects the sentinel and reassembles from
+  `^ArnoKG("bfs_result", 1..n)`. Requires a matching `libarno_callout.so`
+  rebuild — arity change, deploy together.
+- fix(harness): `scripts/enterprise-container.sh` now also copies
+  `libarno_callout.so` to `/usr/irissys/mgr/` (the ObjectScript `Load()`
+  methods' default parameter path) in addition to `/tmp/` (the path this
+  script's own explicit `Load()` calls use) — several e2e tests and benchmarks
+  call `Load()` with no argument or a literal `/usr/irissys/mgr/...` path and
+  silently got "library not found" without this. Also added a localhost
+  connection fallback (matching `tests/conftest.py`'s existing pattern) to the
+  `up` flow's Python snippets, which previously only tried the container IP
+  and had no recourse on macOS Docker Desktop/OrbStack.
+- test: several test files with a hardcoded, wrong `/usr/irissys/mgr/...` Arno
+  lib path literal (or none) switched to the `ARNO_LIB` env-var pattern
+  (default unchanged) already used in `test_lazy_node_resolution.py`.
+- docs: harness-wide `embedding_dimension` default aligned to 768 (matching
+  `schema.py`'s own default) across `conftest.py` and both container scripts,
+  consistent with what most of the e2e/integration suite already assumed.
+
+### v2.4.4 (2026-07-04)
+
+**Embedding-write dimension recheck fix + by-label lookup primitive**
+
+Both items were filed as upstream reports from a consumer session (productivity-framework
+spec 066) after live investigation; addressed here.
+
+- fix: `_get_embedding_dimension()` (`_engine/embeddings.py`) queried
+  `%Dictionary.CompiledProperty` for the embedding dimension on every `store_embedding`
+  call, even when the caller already provided `embedding_dimension` at construction.
+  That query contends for the target class's `Class-Changed_Timestamp`, and under
+  concurrent writers (a normal ingestion pipeline) can raise `SQLCODE -150` (Optimistic
+  concurrency locking failed), degrading to a silently-dropped embedding write. Now
+  checks the already-known instance value first; DB detection only runs when the
+  dimension is truly unset, and its result is cached onto the instance so subsequent
+  calls also skip the query.
+- feat: `get_node_ids_by_label(label)` / `get_nodes_by_label(label)` — a JOIN-free
+  by-label lookup primitive on `IRISGraphEngine`, alongside `get_nodes`/`nodes_exist`/
+  `count_nodes`. Mirrors Neo4j's `NodeByLabelScan`: label-membership lookup is a
+  distinct, common access pattern that deserves a direct `rdf_labels` scan rather than
+  routing through the Cypher `MATCH` translator's multi-table JOIN, which can hit the
+  IRIS `%qaqpre` compiler fault on some builds/instances (confirmed instance-specific,
+  not a universal ivg defect — see project memory `qaqpre_fetch_first_join_crash`).
+
 ### v2.4.3 (2026-06-30)
 
 **Workaround for IRIS %qaqpre SIGSEGV on FETCH FIRST + JOIN**

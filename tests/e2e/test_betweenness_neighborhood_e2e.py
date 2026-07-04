@@ -1,6 +1,9 @@
 """Spec 173 e2e tests — BetweennessNeighborhood."""
+import os
 import pytest
 import networkx as nx
+
+ARNO_LIB = os.environ.get("ARNO_LIB", "/usr/irissys/mgr/libarno_callout.so")
 
 
 @pytest.fixture(scope="module")
@@ -14,7 +17,7 @@ def karate_engine(iris_connection):
     engine = IRISGraphEngine(conn)
     iris_obj = _iris.createIRIS(conn)
     iris_obj.classMethodVoid("Graph.KG.NKGAccel", "Unload")
-    iris_obj.classMethodValue("Graph.KG.NKGAccel", "Load", "/usr/irissys/mgr/libarno_callout.so")
+    iris_obj.classMethodValue("Graph.KG.NKGAccel", "Load", ARNO_LIB)
     iris_obj.classMethodValue("%SYSTEM.OBJ", "Compile", "Graph.KG.Traversal", "cuk-d")
     iris_obj.classMethodValue("%SYSTEM.OBJ", "Compile", "Graph.KG.Edge", "cuk-d")
     iris_obj.classMethodValue("%SYSTEM.OBJ", "Compile", "Graph.KG.EdgeScan", "cuk-d")

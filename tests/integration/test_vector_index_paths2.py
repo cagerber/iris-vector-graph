@@ -18,6 +18,7 @@ All against live ivg-iris with embeddings stored.
 import hashlib
 import pytest
 from iris_vector_graph.engine import IRISGraphEngine
+from iris_vector_graph.schema import GraphSchema
 from iris_vector_graph.result import IVGResult
 
 
@@ -33,8 +34,11 @@ def _make_vec(seed: str, dim=128):
 
 @pytest.fixture
 def vec_eng(iris_connection, iris_master_cleanup):
-    """Engine with 6 nodes + embeddings."""
-    eng = IRISGraphEngine(iris_connection, embedding_dimension=128)
+    """Engine with 6 nodes + embeddings, at the live container's dimension."""
+    # Detect the live table's actual dimension instead of hardcoding 128 — a
+    # mismatch here poisons the shared session connection for every other test.
+    dim = GraphSchema.get_embedding_dimension(iris_connection.cursor()) or 128
+    eng = IRISGraphEngine(iris_connection, embedding_dimension=dim)
     eng.initialize_schema(auto_deploy_objectscript=False)
     for i in range(6):
         eng.create_node(f"vi2_{i}", labels=["Cat" if i < 3 else "Dog"],
@@ -44,7 +48,7 @@ def vec_eng(iris_connection, iris_master_cleanup):
 
     # Store embeddings
     for i in range(6):
-        eng.store_embedding(f"vi2_{i}", _make_vec(f"vi2_{i}"))
+        eng.store_embedding(f"vi2_{i}", _make_vec(f"vi2_{i}", dim=dim))
 
     eng.sync()
     return eng
@@ -129,7 +133,7 @@ class TestVectorSearchLabelFilter:
 
     def test_vector_search_with_label_cat(self, vec_eng):
         """vector_search filters to Cat-labeled nodes."""
-        query_vec = _make_vec("vi2_0")
+        query_vec = _make_vec("vi2_0", dim=vec_eng.embedding_dimension)
         try:
             result = vec_eng.vector_search(query_vec, k=3, label="Cat")
             assert result is not None
@@ -143,7 +147,7 @@ class TestVectorSearchLabelFilter:
 
     def test_vector_search_with_label_dog(self, vec_eng):
         """vector_search filters to Dog-labeled nodes."""
-        query_vec = _make_vec("vi2_3")
+        query_vec = _make_vec("vi2_3", dim=vec_eng.embedding_dimension)
         try:
             result = vec_eng.vector_search(query_vec, k=3, label="Dog")
             assert result is not None
@@ -152,7 +156,7 @@ class TestVectorSearchLabelFilter:
 
     def test_kg_knn_vec_with_label_filter_via_store(self, vec_eng):
         """_kg_KNN_VEC_client_side label filter path."""
-        query_vec = _make_vec("vi2_0")
+        query_vec = _make_vec("vi2_0", dim=vec_eng.embedding_dimension)
         result = vec_eng._store._kg_KNN_VEC_client_side(
             query_vector=query_vec, k=3, label_filter="Cat"
         )
@@ -167,7 +171,7 @@ class TestSearchNodesByVector:
 
     def test_search_nodes_returns_ranked_results(self, vec_eng):
         """search_nodes_by_vector finds nearest neighbors by cosine similarity."""
-        query_vec = _make_vec("vi2_0")
+        query_vec = _make_vec("vi2_0", dim=vec_eng.embedding_dimension)
         try:
             result = vec_eng.search_nodes_by_vector(query_vec, k=3)
             assert result is not None
@@ -181,9 +185,10 @@ class TestSearchNodesByVector:
 
     def test_search_nodes_empty_for_no_embeddings(self, iris_connection, iris_master_cleanup):
         """search_nodes_by_vector with no embeddings returns empty."""
-        eng = IRISGraphEngine(iris_connection, embedding_dimension=128)
+        dim = GraphSchema.get_embedding_dimension(iris_connection.cursor()) or 128
+        eng = IRISGraphEngine(iris_connection, embedding_dimension=dim)
         eng.initialize_schema(auto_deploy_objectscript=False)
-        query_vec = [0.1] * 128
+        query_vec = [0.1] * dim
         try:
             result = eng.search_nodes_by_vector(query_vec, k=5)
             # No embeddings → empty result
@@ -201,7 +206,7 @@ class TestEdgeVectorSearch:
 
     def test_edge_vector_search_empty_table(self, vec_eng):
         """edge_vector_search on empty kg_EdgeEmbeddings returns empty."""
-        query_vec = _make_vec("vi2_0")
+        query_vec = _make_vec("vi2_0", dim=vec_eng.embedding_dimension)
         try:
             result = vec_eng.edge_vector_search(query_vec, k=3)
             assert result is not None
@@ -246,7 +251,7 @@ class TestVecIndexDirect:
 
     def test_vec_insert_with_embedding(self, vec_eng):
         """vec_insert stores a vector embedding in the VecIndex format."""
-        vec = _make_vec("vi2_0")
+        vec = _make_vec("vi2_0", dim=vec_eng.embedding_dimension)
         try:
             result = vec_eng.vec_insert("vi2_0", vec, index_name="hnsw_node_embeddings")
             assert result is not None
@@ -263,7 +268,7 @@ class TestVecIndexDirect:
 
     def test_vec_search_after_embedding(self, vec_eng):
         """vec_search finds nearest neighbors from stored embeddings."""
-        query_vec = _make_vec("vi2_0")
+        query_vec = _make_vec("vi2_0", dim=vec_eng.embedding_dimension)
         try:
             result = vec_eng.vec_search("hnsw_node_embeddings", query_vec, k=3)
             assert isinstance(result, list)

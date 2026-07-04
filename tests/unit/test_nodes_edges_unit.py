@@ -61,6 +61,53 @@ class TestCountNodes:
 
 
 # ---------------------------------------------------------------------------
+# get_node_ids_by_label / get_nodes_by_label
+# ---------------------------------------------------------------------------
+
+class TestGetNodesByLabel:
+    """A JOIN-free by-label lookup (mirrors Neo4j's NodeByLabelScan) that avoids
+    routing through the Cypher MATCH translator's multi-table JOIN, which can
+    trigger an IRIS %qaqpre compiler fault on some builds/instances."""
+
+    def test_get_node_ids_by_label_queries_rdf_labels_only(self):
+        eng, conn, cursor = _make_eng()
+        cursor.fetchall.return_value = [("gene:TP53",), ("gene:BRCA1",)]
+        result = eng.get_node_ids_by_label("Gene")
+        assert result == ["gene:TP53", "gene:BRCA1"]
+        sql = cursor.execute.call_args[0][0]
+        assert "rdf_labels" in sql
+        assert "JOIN" not in sql.upper()
+        assert cursor.execute.call_args[0][1] == ["Gene"]
+
+    def test_get_node_ids_by_label_empty(self):
+        eng, conn, cursor = _make_eng()
+        cursor.fetchall.return_value = []
+        assert eng.get_node_ids_by_label("Nonexistent") == []
+
+    def test_get_node_ids_by_label_skips_falsy_rows(self):
+        eng, conn, cursor = _make_eng()
+        cursor.fetchall.return_value = [("a",), (None,), ("",)]
+        assert eng.get_node_ids_by_label("Gene") == ["a"]
+
+    def test_get_nodes_by_label_hydrates_via_get_nodes(self):
+        eng, conn, cursor = _make_eng()
+        with patch.object(eng, "get_node_ids_by_label", return_value=["n1", "n2"]) as mock_ids:
+            with patch.object(eng, "get_nodes", return_value=[{"id": "n1"}, {"id": "n2"}]) as mock_get:
+                result = eng.get_nodes_by_label("Person")
+        mock_ids.assert_called_once_with("Person")
+        mock_get.assert_called_once_with(["n1", "n2"])
+        assert result == [{"id": "n1"}, {"id": "n2"}]
+
+    def test_get_nodes_by_label_empty_skips_get_nodes(self):
+        eng, conn, cursor = _make_eng()
+        with patch.object(eng, "get_node_ids_by_label", return_value=[]):
+            with patch.object(eng, "get_nodes") as mock_get:
+                result = eng.get_nodes_by_label("Nonexistent")
+        mock_get.assert_not_called()
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
 # _bulk_load_drifted
 # ---------------------------------------------------------------------------
 

@@ -24,6 +24,7 @@ import json
 import hashlib
 import pytest
 from iris_vector_graph.engine import IRISGraphEngine
+from iris_vector_graph.schema import GraphSchema
 from iris_vector_graph.result import IVGResult
 
 
@@ -39,8 +40,11 @@ def _make_vec(seed: str, dim=128):
 
 @pytest.fixture
 def graph_with_embeddings(iris_connection, iris_master_cleanup):
-    """10-node ring graph with embeddings stored."""
-    eng = IRISGraphEngine(iris_connection, embedding_dimension=128)
+    """10-node ring graph with embeddings stored at the live container's dimension."""
+    # Detect the live table's actual dimension instead of hardcoding 128 — a
+    # mismatch here poisons the shared session connection for every other test.
+    dim = GraphSchema.get_embedding_dimension(iris_connection.cursor()) or 128
+    eng = IRISGraphEngine(iris_connection, embedding_dimension=dim)
     for i in range(10):
         eng.create_node(f"ab_{i}", labels=["N"], properties={"val": str(i)})
     for i in range(9):
@@ -50,9 +54,10 @@ def graph_with_embeddings(iris_connection, iris_master_cleanup):
 
     # Store embeddings
     for i in range(10):
-        eng.store_embedding(f"ab_{i}", _make_vec(f"ab_{i}"))
+        eng.store_embedding(f"ab_{i}", _make_vec(f"ab_{i}", dim=dim))
 
     eng.sync()
+    eng._vec_dim = dim
     return eng
 
 
@@ -217,7 +222,7 @@ class TestStoreKnnVec:
     def test_knn_vec_with_embeddings(self, graph_with_embeddings):
         """execute_knn_vec with embeddings stored routes through ObjectScript."""
         eng = graph_with_embeddings
-        query_vec = _make_vec("ab_0")
+        query_vec = _make_vec("ab_0", dim=eng._vec_dim)
         result = eng._store.execute_knn_vec(
             query_vector=query_vec, k=3, label_filter=None
         )
@@ -225,7 +230,7 @@ class TestStoreKnnVec:
 
     def test_knn_vec_with_label_filter(self, graph_with_embeddings):
         eng = graph_with_embeddings
-        query_vec = _make_vec("ab_0")
+        query_vec = _make_vec("ab_0", dim=eng._vec_dim)
         result = eng._store.execute_knn_vec(
             query_vector=query_vec, k=3, label_filter="N"
         )

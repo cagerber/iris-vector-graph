@@ -1,6 +1,12 @@
 services:
+  # NOTE: image pulled from docker.iscinternal.com (InterSystems-internal registry,
+  # requires VPN access) — the prior containers.intersystems.com tag
+  # (2026.2.0AI.161.0) was removed from that registry and no longer resolves.
+  # External contributors without ISC VPN access will need to substitute an
+  # available irishealth AI-build tag from a registry they can reach, or use
+  # scripts/test-container.sh (Community Edition, no VPN required) instead.
   iris-enterprise:
-    image: containers.intersystems.com/intersystems/irishealth:2026.2.0AI.161.0
+    image: docker.iscinternal.com/docker-intersystems/intersystems/irishealth:2026.3.0AI.113.0-linux-arm64v8
     container_name: ivg-iris-enterprise
     ports:
       - "31972:1972"

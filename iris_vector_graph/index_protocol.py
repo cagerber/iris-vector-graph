@@ -25,7 +25,9 @@ _BUILD = {
     "fulltext": lambda e, name, kw: e._build_fulltext_index(name, **kw),
     "multivector": lambda e, name, kw: e._build_multivector_index(name, **kw),
     "neighborhood_vector": lambda e, name, kw: e._build_neighborhood_index(name, **kw),
-    "hnsw": lambda e, name, kw: {"type": "hnsw", "available": e._probe_native_vec()},
+    "hnsw": lambda e, name, kw: {
+        "type": "hnsw", "available": e._probe_native_vec(), "rows": e.embedding_count(),
+    },
 }
 _SEARCH = {
     "vector": lambda e, name, q, k, kw: e._search_vector_index(name, q, k, **kw),
@@ -53,12 +55,14 @@ _INFO = {
     "fulltext": lambda e, name: e.bm25_info(name),
     "multivector": lambda e, name: e.plaid_info(name),
     "neighborhood_vector": lambda e, name: e._neighborhood_index_info(name),
-    "hnsw": lambda e, name: {"type": "hnsw", "available": e._probe_native_vec()},
+    "hnsw": lambda e, name: {
+        "type": "hnsw", "available": e._probe_native_vec(), "rows": e.embedding_count(),
+    },
 }
 
 
 def _rows_of(info: dict) -> int:
-    for key in ("rows", "count", "num_vectors", "indexed", "n_docs", "size", "total"):
+    for key in ("rows", "count", "num_vectors", "indexed", "n_docs", "size", "total", "N"):
         if key in info:
             try:
                 return int(info[key])

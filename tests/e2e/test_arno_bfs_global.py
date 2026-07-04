@@ -96,9 +96,12 @@ class TestArnoBFSGlobal:
 
     def test_sc004_fallback_on_no_arno(self, arno_setup):
         conn, o, eng, seed = arno_setup
-        with open("iris_src/src/Graph/KG/NKGAccel.cls") as f:
+        # BFSJson's no-arno fallback lives in NKGAccelTraversal.cls (spec 187
+        # split NKGAccel.cls into sibling classes); it calls the OS BFS
+        # fallback defined in Traversal.cls/TraversalBFS.cls.
+        with open("iris_src/src/Graph/KG/NKGAccelTraversal.cls") as f:
             cls_src = f.read()
-        assert "BFSFastJsonSorted" in cls_src, "Fallback must exist in NKGAccel.cls"
+        assert "BFSFastJsonSorted" in cls_src, "Fallback must exist in NKGAccelTraversal.cls"
 
     def test_sc005_execute_cypher_routes_through_arno(self, arno_setup):
         conn, o, eng, seed = arno_setup

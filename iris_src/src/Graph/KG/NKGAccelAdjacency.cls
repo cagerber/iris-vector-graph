@@ -236,7 +236,7 @@ ClassMethod ExportAdjacencyFromSeed(seed As %String, maxHops As %Integer = 4, pr
     Kill ^||seedBFS
     Return result
 }
-ClassMethod ExportAdjacencyWithPreds(requiredPreds As %List = "") As %String [ Private ]
+ClassMethod ExportAdjacencyWithPreds(requiredPreds As %List = "") As %String
 {
     Set hasGuard = (requiredPreds '= "") && ($ListLength(requiredPreds) > 0)
     Set result = "", chunk = "", chunkNum = 0
@@ -282,7 +282,7 @@ ClassMethod ExportAdjacencyWithPreds(requiredPreds As %List = "") As %String [ P
     }
     Return result
 }
-ClassMethod StoreLargeOut(tag As %String, json As %String) As %String [ Private ]
+ClassMethod StoreLargeOut(tag As %String, json As %String) As %String
 {
     If $Length(json) <= 9000 { Return json }
     Kill ^||LargeOut(tag)

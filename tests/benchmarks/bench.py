@@ -24,6 +24,7 @@ IRIS_PORT = int(os.environ.get("IRIS_PORT", "1972"))
 IRIS_NS   = os.environ.get("IRIS_NAMESPACE", "USER")
 IRIS_USER = os.environ.get("IRIS_USERNAME", "_SYSTEM")
 IRIS_PASS = os.environ.get("IRIS_PASSWORD", "SYS")
+ARNO_LIB  = os.environ.get("ARNO_LIB", "/usr/irissys/mgr/libarno_callout.so")
 
 
 def connect_iris():
@@ -195,7 +196,7 @@ def main():
             print(f"  Load complete: ^KG built in {load_info['kg_build_ms']}ms, ^NKG: {load_info['nkg_build_ms']}ms")
             try:
                 iris_obj.classMethodVoid("Graph.KG.NKGAccel", "ResetCache")
-                iris_obj.classMethodValue("Graph.KG.NKGAccel", "Load", "/usr/irissys/mgr/libarno_callout.so")
+                iris_obj.classMethodValue("Graph.KG.NKGAccel", "Load", ARNO_LIB)
                 iris_obj.classMethodVoid("Graph.KG.NKGAccel", "InvalidateAdjCache")
             except Exception:
                 pass
@@ -204,7 +205,7 @@ def main():
             try:
                 iris_obj.classMethodValue("Graph.KG.Traversal", "BuildNKG")
                 iris_obj.classMethodVoid("Graph.KG.NKGAccel", "ResetCache")
-                iris_obj.classMethodValue("Graph.KG.NKGAccel", "Load", "/usr/irissys/mgr/libarno_callout.so")
+                iris_obj.classMethodValue("Graph.KG.NKGAccel", "Load", ARNO_LIB)
                 print("  ^NKG rebuilt, arno reloaded")
             except Exception as e:
                 print(f"  NKG rebuild skipped: {e}")

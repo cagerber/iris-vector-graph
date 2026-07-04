@@ -1,6 +1,6 @@
 # iris-vector-graph
 
-**Knowledge graph engine for InterSystems IRIS** — openCypher queries, temporal property graph, vector search, and graph analytics.
+**Turn InterSystems IRIS into a graph + vector database** — openCypher queries, HNSW/BM25 hybrid search, temporal property graph, RDF/SHACL/PROV-O semantic layer, and Neo4j Bolt protocol compatibility.
 
 [![PyPI](https://img.shields.io/pypi/v/iris-vector-graph)](https://pypi.org/project/iris-vector-graph/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)

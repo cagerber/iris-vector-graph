@@ -16,6 +16,7 @@ import hashlib
 import pytest
 import json
 from iris_vector_graph.engine import IRISGraphEngine
+from iris_vector_graph.schema import GraphSchema
 from iris_vector_graph.result import IVGResult
 
 
@@ -32,7 +33,12 @@ def _make_vec(seed: str, dim=128):
 @pytest.fixture
 def vec_graph_eng(iris_connection, iris_master_cleanup):
     """Engine with 8 nodes, edges, and embeddings stored."""
-    eng = IRISGraphEngine(iris_connection, embedding_dimension=128)
+    # Detect the live container's actual kg_NodeEmbeddings dimension instead of
+    # hardcoding 128 — initialize_schema() no-ops if the table already exists
+    # at a different dimension, and a mismatched store_embedding() poisons the
+    # shared session connection for every other test relying on it.
+    dim = GraphSchema.get_embedding_dimension(iris_connection.cursor()) or 128
+    eng = IRISGraphEngine(iris_connection, embedding_dimension=dim)
     eng.initialize_schema(auto_deploy_objectscript=False)
     for i in range(8):
         eng.create_node(f"vg_{i}", labels=["Doc"], properties={"text": f"topic {i}"})
@@ -41,9 +47,9 @@ def vec_graph_eng(iris_connection, iris_master_cleanup):
     eng.create_edge("vg_7", "R", "vg_0")
     eng.create_edge("vg_0", "R", "vg_4")  # spoke
 
-    # Store 128-dim embeddings
+    # Store embeddings at the detected dimension
     for i in range(8):
-        eng.store_embedding(f"vg_{i}", _make_vec(f"vg_{i}"))
+        eng.store_embedding(f"vg_{i}", _make_vec(f"vg_{i}", dim=dim))
 
     eng.sync()
     return eng
@@ -57,7 +63,7 @@ class TestVectorGraphSearch:
 
     def test_vgs_returns_list(self, vec_graph_eng):
         """kg_VECTOR_GRAPH_SEARCH combines vector search + graph expansion."""
-        query_vec = json.dumps(_make_vec("vg_0"))
+        query_vec = json.dumps(_make_vec("vg_0", dim=vec_graph_eng.embedding_dimension))
         try:
             result = vec_graph_eng.kg_VECTOR_GRAPH_SEARCH(
                 query_vector=query_vec, k=3, expansion_depth=1
@@ -68,7 +74,7 @@ class TestVectorGraphSearch:
 
     def test_vgs_with_query_text(self, vec_graph_eng):
         """kg_VECTOR_GRAPH_SEARCH with query_text triggers BM25 text path."""
-        query_vec = json.dumps(_make_vec("vg_0"))
+        query_vec = json.dumps(_make_vec("vg_0", dim=vec_graph_eng.embedding_dimension))
         try:
             result = vec_graph_eng.kg_VECTOR_GRAPH_SEARCH(
                 query_vector=query_vec, k=3, query_text="topic 0"
@@ -80,7 +86,7 @@ class TestVectorGraphSearch:
     def test_vgs_no_vector_results_empty(self, vec_graph_eng):
         """kg_VECTOR_GRAPH_SEARCH with zero vector results returns []."""
         # Use a vector far from all stored embeddings
-        zero_vec = json.dumps([0.0] * 128)
+        zero_vec = json.dumps([0.0] * vec_graph_eng.embedding_dimension)
         try:
             result = vec_graph_eng.kg_VECTOR_GRAPH_SEARCH(
                 query_vector=zero_vec, k=0  # k=0 → empty
@@ -98,7 +104,7 @@ class TestMultiVectorSearchWithData:
 
     def test_multi_vector_search_rrf_fusion(self, vec_graph_eng):
         """multi_vector_search with multiple sources + RRF fusion."""
-        query_vec = _make_vec("vg_0")
+        query_vec = _make_vec("vg_0", dim=vec_graph_eng.embedding_dimension)
         sources = [
             {
                 "table": "Graph_KG.kg_NodeEmbeddings",
@@ -119,7 +125,7 @@ class TestMultiVectorSearchWithData:
 
     def test_multi_vector_search_non_rrf_fusion(self, vec_graph_eng):
         """multi_vector_search with non-RRF fusion (linear merge path)."""
-        query_vec = _make_vec("vg_0")
+        query_vec = _make_vec("vg_0", dim=vec_graph_eng.embedding_dimension)
         sources = [{"table": "Graph_KG.kg_NodeEmbeddings", "id_col": "id", "vec_col": "emb"}]
         try:
             result = vec_graph_eng.multi_vector_search(
@@ -141,7 +147,8 @@ class TestEmbedNodesCallable:
 
     def test_embed_nodes_with_label(self, vec_graph_eng):
         """embed_nodes with label filter and callable embedder."""
-        vec_graph_eng.embedder = lambda text: [0.1] * 128
+        dim = vec_graph_eng.embedding_dimension
+        vec_graph_eng.embedder = lambda text: [0.1] * dim
         try:
             from iris_vector_graph.embed_selector import EmbedSelector
             sel = EmbedSelector(label="Doc", missing_only=False)
@@ -152,13 +159,14 @@ class TestEmbedNodesCallable:
 
     def test_embed_nodes_missing_only(self, iris_connection, iris_master_cleanup):
         """embed_nodes missing_only=True only embeds unembedded nodes."""
-        eng = IRISGraphEngine(iris_connection, embedding_dimension=128)
+        dim = GraphSchema.get_embedding_dimension(iris_connection.cursor()) or 128
+        eng = IRISGraphEngine(iris_connection, embedding_dimension=dim)
         eng.initialize_schema(auto_deploy_objectscript=False)
         for i in range(3):
             eng.create_node(f"emn_{i}", labels=["X"])
         # Store embedding for just one
-        eng.store_embedding("emn_0", [0.1] * 128)
-        eng.embedder = lambda t: [0.2] * 128
+        eng.store_embedding("emn_0", [0.1] * dim)
+        eng.embedder = lambda t: [0.2] * dim
 
         try:
             from iris_vector_graph.embed_selector import EmbedSelector
@@ -185,7 +193,7 @@ class TestStoreEdgeEmbedding:
             pass
 
         try:
-            emb = [0.15] * 128
+            emb = [0.15] * vec_graph_eng.embedding_dimension
             result = vec_graph_eng.store_edge(
                 {
                     "source_id": "vg_0", "predicate": "R", "target_id": "vg_1",

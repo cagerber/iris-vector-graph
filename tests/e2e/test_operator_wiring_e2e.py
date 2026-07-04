@@ -161,7 +161,13 @@ class TestKgKNNVECE2E:
     @pytest.fixture(autouse=True)
     def setup(self, iris_connection):
         from iris_vector_graph.engine import IRISGraphEngine
-        self.engine = IRISGraphEngine(iris_connection, embedding_dimension=768)
+        from iris_vector_graph.schema import GraphSchema
+        # Detect the live table's actual dimension (ivg's own primitive) instead
+        # of hardcoding 768 — a mismatch here poisons the shared connection for
+        # every other test relying on this fixture.
+        dim = GraphSchema.get_embedding_dimension(iris_connection.cursor()) or 768
+        self.engine = IRISGraphEngine(iris_connection, embedding_dimension=dim)
+        self.dim = dim
         self.prefix = f"VEC_{uuid.uuid4().hex[:6]}_"
         self._insert_embeddings()
         yield
@@ -173,14 +179,14 @@ class TestKgKNNVECE2E:
         for i in range(5):
             nid = f"{self.prefix}N{i}"
             self.engine.create_node(nid)
-            vec = rng.normal(0, 1, 768).tolist()
+            vec = rng.normal(0, 1, self.dim).tolist()
             self.engine.store_embedding(nid, vec)
 
     def test_returns_results(self):
         import numpy as np
         from iris_vector_graph.operators import IRISGraphOperators
         ops = IRISGraphOperators(self.engine.conn)
-        query = json.dumps(np.random.default_rng(42).normal(0, 1, 768).tolist())
+        query = json.dumps(np.random.default_rng(42).normal(0, 1, self.dim).tolist())
         results = ops.kg_KNN_VEC(query, k=3)
         assert len(results) > 0
         prefixed = [nid for nid, _ in results if nid.startswith(self.prefix)]
@@ -201,7 +207,7 @@ class TestKgKNNVECE2E:
         import numpy as np
         from iris_vector_graph.operators import IRISGraphOperators
         ops = IRISGraphOperators(self.engine.conn)
-        query = json.dumps(np.random.default_rng(99).normal(0, 1, 768).tolist())
+        query = json.dumps(np.random.default_rng(99).normal(0, 1, self.dim).tolist())
         with caplog.at_level(logging.WARNING, logger="iris_vector_graph.operators"):
             ops.kg_KNN_VEC(query, k=3)
         fallbacks = [r for r in caplog.records if "fallback" in r.message.lower() or "falling back" in r.message.lower()]
@@ -280,7 +286,10 @@ class TestVectorGraphSearchE2E:
     @pytest.fixture(autouse=True)
     def setup(self, iris_connection):
         from iris_vector_graph.engine import IRISGraphEngine
-        self.engine = IRISGraphEngine(iris_connection)
+        from iris_vector_graph.schema import GraphSchema
+        dim = GraphSchema.get_embedding_dimension(iris_connection.cursor()) or 768
+        self.engine = IRISGraphEngine(iris_connection, embedding_dimension=dim)
+        self.dim = dim
         self.prefix = f"VGS_{uuid.uuid4().hex[:6]}_"
         self._insert_graph_with_embeddings()
         yield
@@ -293,7 +302,7 @@ class TestVectorGraphSearchE2E:
             nid = f"{self.prefix}{suffix}"
             self.engine.create_node(nid)
             if suffix in ("A", "B"):
-                vec = rng.normal(0, 1, 768).tolist()
+                vec = rng.normal(0, 1, self.dim).tolist()
                 self.engine.store_embedding(nid, vec)
         for s, o in [("A", "C"), ("A", "D"), ("B", "E")]:
             sid, oid = f"{self.prefix}{s}", f"{self.prefix}{o}"
@@ -303,7 +312,7 @@ class TestVectorGraphSearchE2E:
         import numpy as np
         from iris_vector_graph.operators import IRISGraphOperators
         ops = IRISGraphOperators(self.engine.conn)
-        query = json.dumps(np.random.default_rng(42).normal(0, 1, 768).tolist())
+        query = json.dumps(np.random.default_rng(42).normal(0, 1, self.dim).tolist())
         results = ops.kg_VECTOR_GRAPH_SEARCH(
             query_vector=query, k_vector=2, k_final=10,
             expansion_depth=1, min_confidence=0.0)

@@ -372,6 +372,43 @@ class NodesEdgesMixin:
             return 0
 
 
+    def get_node_ids_by_label(self, label: str) -> List[str]:
+        """
+        Return all node IDs with the given label via a direct rdf_labels scan.
+
+        Mirrors Neo4j's NodeByLabelScan: label-membership lookup is a distinct,
+        common-enough access pattern to warrant its own primitive rather than
+        going through the Cypher MATCH translator, whose generated multi-table
+        JOIN can hit the IRIS %qaqpre compiler fault on some builds/instances.
+
+        Args:
+            label: Label to filter by.
+
+        Returns:
+            List of node IDs (empty list if none match).
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(f"SELECT s FROM {_table('rdf_labels')} WHERE label = ?", [label])
+        return [row[0] for row in cursor.fetchall() if row and row[0]]
+
+
+    def get_nodes_by_label(self, label: str) -> List[Dict[str, Any]]:
+        """
+        Return hydrated nodes (id, labels, properties) with the given label.
+
+        Equivalent to get_node_ids_by_label + get_nodes, avoiding the JOIN-based
+        Cypher MATCH translation path.
+
+        Args:
+            label: Label to filter by.
+
+        Returns:
+            List of node dicts (see get_nodes), empty list if none match.
+        """
+        ids = self.get_node_ids_by_label(label)
+        return self.get_nodes(ids) if ids else []
+
+
     def create_node(
         self, node_id: str, labels: List[str] = None, properties: Dict[str, Any] = None,
         graph: Optional[str] = None,

@@ -46,7 +46,9 @@ from iris_devtester import IRISContainer
 c = IRISContainer.attach('$CONTAINER')
 conn = c.get_connection()
 from iris_vector_graph import IRISGraphEngine
-IRISGraphEngine(conn, embedding_dimension=128).initialize_schema()
+# 768 matches schema.py's own default (get_base_schema_sql) and what most of
+# the e2e/integration suite assumes for kg_NodeEmbeddings.
+IRISGraphEngine(conn, embedding_dimension=768).initialize_schema()
 print('✓ schema initialized')
 " 2>&1 | grep -E 'schema initialized|ERROR|CRITICAL' | grep -v 'Embedding dimension'
     echo "Recompiling Graph.KG.* after container start..."

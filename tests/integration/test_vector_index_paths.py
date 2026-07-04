@@ -15,17 +15,22 @@ Requires: ivg-iris with embeddings stored (128-dim).
 import json
 import pytest
 from iris_vector_graph.engine import IRISGraphEngine
+from iris_vector_graph.schema import GraphSchema
 from iris_vector_graph.result import IVGResult
 
 
 @pytest.fixture
 def vec_eng(iris_connection, iris_master_cleanup):
-    """Engine with 6 nodes and 128-dim embeddings stored."""
+    """Engine with 6 nodes and embeddings stored at the live container's dimension."""
     import hashlib
-    eng = IRISGraphEngine(iris_connection, embedding_dimension=128)
+    # Detect the live table's actual dimension instead of hardcoding 128 —
+    # a mismatch here poisons the shared session connection for every other
+    # test relying on it.
+    dim = GraphSchema.get_embedding_dimension(iris_connection.cursor()) or 128
+    eng = IRISGraphEngine(iris_connection, embedding_dimension=dim)
     eng.initialize_schema(auto_deploy_objectscript=False)
 
-    def make_vec(seed: str, dim=128):
+    def make_vec(seed: str, dim=dim):
         h = hashlib.md5(seed.encode()).digest()
         raw = []
         while len(raw) < dim:
@@ -183,9 +188,10 @@ class TestKNNVecClientSide:
 
     def test_kg_knn_vec_client_side_empty_returns_empty(self, iris_connection, iris_master_cleanup):
         """No embeddings stored → returns empty."""
-        eng = IRISGraphEngine(iris_connection, embedding_dimension=128)
+        dim = GraphSchema.get_embedding_dimension(iris_connection.cursor()) or 128
+        eng = IRISGraphEngine(iris_connection, embedding_dimension=dim)
         eng.initialize_schema(auto_deploy_objectscript=False)
-        query_vec = [0.1] * 128
+        query_vec = [0.1] * dim
         result = eng._store._kg_KNN_VEC_client_side(query_vec, k=5, label_filter=None)
         assert isinstance(result, IVGResult)
         assert len(result.rows) == 0

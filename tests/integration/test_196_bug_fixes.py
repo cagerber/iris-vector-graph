@@ -15,11 +15,15 @@ All tests run against live ivg-iris. No mocking.
 """
 import pytest
 from iris_vector_graph.engine import IRISGraphEngine
+from iris_vector_graph.schema import GraphSchema
 
 
 @pytest.fixture
 def engine(iris_connection, iris_master_cleanup):
-    eng = IRISGraphEngine(iris_connection, embedding_dimension=128)
+    # Detect the live table's actual dimension instead of hardcoding 128 — a
+    # mismatch here poisons the shared session connection for every other test.
+    dim = GraphSchema.get_embedding_dimension(iris_connection.cursor()) or 128
+    eng = IRISGraphEngine(iris_connection, embedding_dimension=dim)
     return eng
 
 
@@ -118,8 +122,8 @@ class TestKgSubgraphEmbeddings:
         engine.create_edge("emb_sub_a", "R", "emb_sub_b")
         engine.sync()
 
-        # Store a real embedding
-        dim = 128
+        # Store a real embedding at the engine's already-detected dimension
+        dim = engine.embedding_dimension
         h = hashlib.md5(b"emb_sub_a").digest()
         raw = []
         while len(raw) < dim:
@@ -127,7 +131,6 @@ class TestKgSubgraphEmbeddings:
         vec = raw[:dim]
         norm = sum(x**2 for x in vec) ** 0.5
         vec = [x / norm for x in vec]
-        engine.embedding_dimension = dim
         engine.store_embedding("emb_sub_a", vec)
 
         result = engine.kg_SUBGRAPH(

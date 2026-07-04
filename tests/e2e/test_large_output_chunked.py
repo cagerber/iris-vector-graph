@@ -11,6 +11,7 @@ IRIS_USER = os.environ.get("IRIS_USERNAME", "_SYSTEM")
 IRIS_PASS = os.environ.get("IRIS_PASSWORD", "SYS")
 
 SKIP_LARGE_OUT = os.environ.get("SKIP_ARNO_TESTS", "false").lower() == "true"
+ARNO_LIB = os.environ.get("ARNO_LIB", "/usr/irissys/mgr/libarno_callout.so")
 skip_reason = "SKIP_ARNO_TESTS=true or enterprise container unavailable"
 
 
@@ -48,7 +49,7 @@ def kill_arno_cache(o):
     except Exception:
         pass
     try:
-        o.classMethodValue("Graph.KG.NKGAccel", "Load", "/usr/irissys/mgr/libarno_callout.so")
+        o.classMethodValue("Graph.KG.NKGAccel", "Load", ARNO_LIB)
     except Exception:
         pass
 
@@ -66,7 +67,7 @@ class TestLargeOutputChunked:
         seed = graph_seed
         o.classMethodVoid("Graph.KG.NKGAccel", "ResetCache")
         try:
-            o.classMethodValue("Graph.KG.NKGAccel", "Load", "/usr/irissys/mgr/libarno_callout.so")
+            o.classMethodValue("Graph.KG.NKGAccel", "Load", ARNO_LIB)
         except Exception:
             pass
         try:
@@ -149,7 +150,7 @@ class TestLargeOutputChunked:
 
             o1.classMethodVoid("Graph.KG.NKGAccel", "ResetCache")
             try:
-                o1.classMethodValue("Graph.KG.NKGAccel", "Load", "/usr/irissys/mgr/libarno_callout.so")
+                o1.classMethodValue("Graph.KG.NKGAccel", "Load", ARNO_LIB)
             except Exception:
                 pass
             raw1 = str(o1.classMethodValue("Graph.KG.NKGAccel", "BFSJson", seed, "[]", 3, 0))
@@ -172,7 +173,7 @@ class TestLargeOutputChunked:
         seed = graph_seed
         o.classMethodVoid("Graph.KG.NKGAccel", "ResetCache")
         try:
-            o.classMethodValue("Graph.KG.NKGAccel", "Load", "/usr/irissys/mgr/libarno_callout.so")
+            o.classMethodValue("Graph.KG.NKGAccel", "Load", ARNO_LIB)
         except Exception:
             pass
         try:
