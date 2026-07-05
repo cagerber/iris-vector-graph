@@ -231,6 +231,43 @@ class TemporalMixin:
         )
         return json.loads(str(result))
 
+    def get_window_sources(
+        self,
+        predicate: str,
+        ts_start: int,
+        ts_end: int,
+    ) -> list[str]:
+        """Return distinct source node IDs with at least one edge for a
+        predicate over a time window, without materializing per-edge JSON.
+
+        Unlike ``get_edges_in_window`` (which returns every matching edge —
+        source, target, timestamp, weight — and requires the caller to
+        de-duplicate sources in Python), this walks ``^KG("tout")`` only down
+        to the source level per timestamp bucket and returns each matching
+        source once. Use this when you only need "which sources fired this
+        predicate in this window" (e.g. fleet/tenant enumeration) and would
+        otherwise be discarding target/timestamp/weight from a full window
+        scan.
+
+        Args:
+            predicate: Edge type to filter on. Empty string matches any
+                predicate (fastest — skips the per-source predicate check).
+            ts_start: Window start as Unix timestamp (inclusive).
+            ts_end: Window end as Unix timestamp (inclusive).
+
+        Returns:
+            list[str]: Distinct source node IDs, each returned once even if
+                they have multiple matching edges in the window.
+        """
+        result = self._iris_obj().classMethodValue(
+            "Graph.KG.TemporalIndex",
+            "QueryWindowSources",
+            predicate,
+            ts_start,
+            ts_end,
+        )
+        return json.loads(str(result))
+
     def get_distinct_count(
         self,
         source: str,

@@ -164,6 +164,38 @@ ClassMethod QueryWindow(source As %String, predicate As %String, tsStart As %Int
 	Return result _ "]"
 }
 
+ClassMethod QueryWindowSources(predicate As %String, tsStart As %Integer, tsEnd As %Integer) As %String
+{
+	Set tsStart = +tsStart
+	Set tsEnd = +tsEnd
+	Kill dedup
+	Set ts = tsStart - 1
+	While 1 {
+		Set ts = $Order(^KG("tout", ts))
+		If ts = "" Quit
+		If ts > tsEnd Quit
+		Set s = ""
+		While 1 {
+			Set s = $Order(^KG("tout", ts, s))
+			If s = "" Quit
+			If predicate = "" {
+				Set dedup(s) = 1
+			} Else {
+				If $Data(^KG("tout", ts, s, predicate)) Set dedup(s) = 1
+			}
+		}
+	}
+	Set result = "[", first = 1, src = ""
+	For {
+		Set src = $Order(dedup(src))
+		Quit:(src = "")
+		If 'first { Set result = result _ "," }
+		Set first = 0
+		Set result = result _ """" _ src _ """"
+	}
+	Return result _ "]"
+}
+
 ClassMethod GetVelocity(nodeId As %String, windowSec As %Integer = 300) As %Integer
 {
 	Set now = $ZTimeStamp

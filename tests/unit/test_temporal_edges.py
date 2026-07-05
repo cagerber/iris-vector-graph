@@ -312,6 +312,33 @@ class TestTemporalPreAggUnit:
         result = engine.get_bucket_group_targets("Rtn:A:P:proc", "CALLED_BY", 0, 9999)
         assert result == []
 
+    # ── get_window_sources unit tests ─────────────────────────────────
+    def test_get_window_sources_returns_list(self):
+        """get_window_sources parses JSON array of distinct source IDs."""
+        engine, mock = self._make_engine()
+        mock.classMethodValue.return_value = '["QG:A:P:g1","QG:B:P:g2"]'
+        result = engine.get_window_sources("COST_ON", 0, 9999)
+        assert isinstance(result, list)
+        assert set(result) == {"QG:A:P:g1", "QG:B:P:g2"}
+
+    def test_get_window_sources_empty(self):
+        engine, mock = self._make_engine()
+        mock.classMethodValue.return_value = '[]'
+        result = engine.get_window_sources("COST_ON", 0, 9999)
+        assert result == []
+
+    def test_get_window_sources_calls_correct_classmethod(self):
+        """Verifies dispatch to QueryWindowSources with (predicate, tsStart, tsEnd)."""
+        engine, mock = self._make_engine()
+        mock.classMethodValue.return_value = '[]'
+        engine.get_window_sources("COST_ON", 100, 200)
+        args = mock.classMethodValue.call_args[0]
+        assert args[0] == "Graph.KG.TemporalIndex"
+        assert args[1] == "QueryWindowSources"
+        assert args[2] == "COST_ON"
+        assert args[3] == 100
+        assert args[4] == 200
+
     # ── ENH-3: docstring test ────────────────────────────────────────
     def test_get_bucket_groups_docstring(self):
         """get_bucket_groups has a docstring documenting all return keys."""
@@ -587,6 +614,55 @@ class TestTemporalAPIGapsE2E:
         targets = self.engine.get_bucket_group_targets(
             f"{self.PREFIX}:ow", "CALLED_BY", now - 100, now + 100)
         assert targets == []
+
+    # ── get_window_sources ─────────────────────────────────────────────
+    def test_get_window_sources_returns_distinct_sources(self):
+        """get_window_sources returns each source once, filtered by predicate."""
+        now = int(time.time())
+        self.engine.bulk_create_edges_temporal([
+            {"s": f"{self.PREFIX}:src1", "p": "COST_ON",
+             "o": "Date:d1", "ts": now, "w": 1.0},
+            {"s": f"{self.PREFIX}:src1", "p": "COST_ON",
+             "o": "Date:d2", "ts": now + 1, "w": 2.0},
+            {"s": f"{self.PREFIX}:src2", "p": "COST_ON",
+             "o": "Date:d1", "ts": now + 2, "w": 1.0},
+            {"s": f"{self.PREFIX}:src3", "p": "OTHER_PRED",
+             "o": "Date:d1", "ts": now + 3, "w": 1.0},
+        ])
+        sources = self.engine.get_window_sources("COST_ON", now - 10, now + 100)
+        assert isinstance(sources, list)
+        assert set(sources) == {f"{self.PREFIX}:src1", f"{self.PREFIX}:src2"}
+        assert sources.count(f"{self.PREFIX}:src1") == 1
+
+    def test_get_window_sources_empty_predicate_matches_any(self):
+        """Empty predicate string matches sources regardless of edge type."""
+        now = int(time.time())
+        self.engine.bulk_create_edges_temporal([
+            {"s": f"{self.PREFIX}:anyp", "p": "SOME_PRED",
+             "o": "Date:d1", "ts": now, "w": 1.0},
+        ])
+        sources = self.engine.get_window_sources("", now - 10, now + 100)
+        assert f"{self.PREFIX}:anyp" in sources
+
+    def test_get_window_sources_empty_when_outside_window(self):
+        """No sources returned when all edges are outside the time window."""
+        now = int(time.time())
+        self.engine.bulk_create_edges_temporal([
+            {"s": f"{self.PREFIX}:ows", "p": "COST_ON",
+             "o": "Date:d1", "ts": now + 10000, "w": 1.0},
+        ])
+        sources = self.engine.get_window_sources("COST_ON", now - 100, now + 100)
+        assert sources == []
+
+    def test_get_window_sources_respects_predicate_filter(self):
+        """A source with only non-matching-predicate edges is excluded."""
+        now = int(time.time())
+        self.engine.bulk_create_edges_temporal([
+            {"s": f"{self.PREFIX}:wrongpred", "p": "LATENCY_ON",
+             "o": "Date:d1", "ts": now, "w": 1.0},
+        ])
+        sources = self.engine.get_window_sources("COST_ON", now - 10, now + 100)
+        assert f"{self.PREFIX}:wrongpred" not in sources
 
     def test_purge_before_removes_old_edges(self):
         now = int(time.time())

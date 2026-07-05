@@ -1,5 +1,25 @@
 # Changelog
 
+### v2.4.6 (2026-07-04)
+
+**`get_window_sources()` — streaming-friendly source enumeration over a temporal window**
+
+Enhancement request from a consumer session (opsreview): `get_edges_in_window`
+materializes every matching edge (source, target, timestamp, weight) even when
+the caller only needs the set of distinct sources that fired a predicate in a
+window (e.g. fleet/tenant enumeration) — discarding target/timestamp/weight
+after the fact. Filed as a genuine API gap, not a workaround.
+
+- feat: `get_window_sources(predicate, ts_start, ts_end)` — new `IRISGraphEngine`
+  method + `Graph.KG.TemporalIndex.QueryWindowSources` ObjectScript primitive.
+  Walks `^KG("tout")` only down to the source level per timestamp bucket
+  (skipping predicate/target/weight extraction entirely) and returns each
+  matching source once. Empty `predicate` matches any edge type. Mirrors the
+  existing `GetBucketGroupTargets`/`get_bucket_group_targets` convention
+  (distinct-value enumeration over `^KG`, JSON array return, empty-predicate
+  wildcard) but at the source level across the whole window rather than the
+  target level for one fixed source.
+
 ### v2.4.5 (2026-07-04)
 
 **Test-suite dimension hardcodes, index_protocol row-count bugs, ObjectScript
