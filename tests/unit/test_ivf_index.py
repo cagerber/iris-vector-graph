@@ -175,6 +175,46 @@ class TestIVFIndexUnit:
         with pytest.raises(ValueError, match="ivg.ivf.search"):
             translate_to_sql(parsed, {})
 
+    def test_ivf_build_uses_schema_prefix(self):
+        """ivf_build must respect schema prefix — bug: was hardcoding Graph_KG."""
+        from iris_vector_graph.cypher.translator import set_schema_prefix, get_schema_prefix
+
+        orig_prefix = get_schema_prefix()
+        set_schema_prefix("MySchema")
+        try:
+            engine = _make_engine()
+            iris_mock = MagicMock()
+            iris_mock.classMethodValue.return_value = '{"nlist":2,"dim":3,"metric":"cosine","indexed":2}'
+            engine._iris_obj = lambda: iris_mock
+
+            captured_sqls = []
+
+            def mock_cursor():
+                c = MagicMock()
+                def capture_execute(sql, *args, **kw):
+                    captured_sqls.append(sql)
+                c.execute.side_effect = capture_execute
+                c.fetchall.return_value = [
+                    ("n1", _encode_vec([0.1, 0.2, 0.3])),
+                    ("n2", _encode_vec([0.4, 0.5, 0.6])),
+                ]
+                return c
+
+            engine.conn.cursor.side_effect = mock_cursor
+
+            engine.ivf_build("test_schema", nlist=2)
+        finally:
+            set_schema_prefix(orig_prefix)
+
+        assert captured_sqls, "ivf_build must execute a SELECT"
+        for sql in captured_sqls:
+            assert "Graph_KG.kg_NodeEmbeddings" not in sql, (
+                f"ivf_build hardcoded Graph_KG schema prefix; got: {sql}"
+            )
+            assert "MySchema.kg_NodeEmbeddings" in sql, (
+                f"ivf_build must use schema prefix; got: {sql}"
+            )
+
 
 @pytest.mark.skipif(SKIP_IRIS_TESTS, reason="SKIP_IRIS_TESTS=true")
 @pytest.mark.requires_clean_isolation

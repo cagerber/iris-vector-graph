@@ -685,9 +685,13 @@ class VectorMixin:
 
         try:
             for idx_name in self._index_registry:
-                if self._index_registry[idx_name] == "ivf":
+                idx_type = self._index_registry[idx_name]
+                if idx_type == "ivf":
                     raw = self.ivf_search(idx_name, vec_list, k=k1)
                     vec_results = [(r["id"], float(r.get("score", 0))) for r in raw]
+                    break
+                if idx_type == "hnsw":
+                    vec_results = self.kg_KNN_VEC(query_vector, k=k1)
                     break
             for idx_name in self._index_registry:
                 if self._index_registry[idx_name] == "bm25":
@@ -1003,19 +1007,20 @@ class VectorMixin:
         import struct
 
         cursor = self.conn.cursor()
+        emb_table = _table("kg_NodeEmbeddings")
         if node_ids is not None:
             if not node_ids:
                 raise ValueError("ivf_build: node_ids list is empty")
             placeholders = ",".join(["?"] * len(node_ids))
             cursor.execute(
-                f"SELECT id, emb FROM Graph_KG.kg_NodeEmbeddings WHERE id IN ({placeholders})",
+                f"SELECT id, emb FROM {emb_table} WHERE id IN ({placeholders})",
                 node_ids,
             )
         else:
-            cursor.execute("SELECT id, emb FROM Graph_KG.kg_NodeEmbeddings")
+            cursor.execute(f"SELECT id, emb FROM {emb_table}")
         rows = cursor.fetchall()
         if not rows:
-            raise ValueError("ivf_build: no vectors found in kg_NodeEmbeddings")
+            raise ValueError(f"ivf_build: no vectors found in {emb_table}")
 
         node_ids = []
         vecs = []

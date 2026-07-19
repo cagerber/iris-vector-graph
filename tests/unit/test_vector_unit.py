@@ -785,6 +785,30 @@ class TestKgRRFFuse:
         assert isinstance(result, list)
         assert all(len(r) == 4 for r in result)
 
+    def test_fuse_hnsw_uses_kg_knn_vec(self):
+        """kg_RRF_FUSE with only hnsw registered must use kg_KNN_VEC, not return []."""
+        eng, conn, cursor = _make_eng()
+        eng._index_registry = {"hnsw": "hnsw", "bm1": "bm25"}
+
+        with patch.object(eng, "kg_KNN_VEC", return_value=[("n1", 0.9), ("n2", 0.7)]) as knn_mock:
+            with patch.object(eng, "bm25_search", return_value=[("n1", 0.8), ("n2", 0.6)]):
+                result = eng.kg_RRF_FUSE(5, 10, 10, 60, "[1,0,0,0]", "query")
+
+        knn_mock.assert_called_once()
+        assert isinstance(result, list)
+        assert len(result) > 0, "kg_RRF_FUSE with hnsw+bm25 must not return []"
+
+    def test_fuse_hnsw_only_returns_results(self):
+        """kg_RRF_FUSE with hnsw+no bm25 must still return vector results."""
+        eng, conn, cursor = _make_eng()
+        eng._index_registry = {"hnsw": "hnsw"}
+
+        with patch.object(eng, "kg_KNN_VEC", return_value=[("n1", 0.9), ("n2", 0.7)]):
+            result = eng.kg_RRF_FUSE(5, 10, 10, 60, "[1,0,0,0]", "")
+
+        assert isinstance(result, list)
+        assert len(result) > 0, "kg_RRF_FUSE with hnsw-only must not return []"
+
 
 # ---------------------------------------------------------------------------
 # kg_VECTOR_GRAPH_SEARCH: expansion + text path (lines 750, 754-760)

@@ -1,5 +1,15 @@
 # Changelog
 
+### v2.4.8 (2026-07-19)
+
+**Fix: `kg_RRF_FUSE` now uses HNSW leg when no IVF index registered; `ivf_build` respects schema prefix**
+
+- fix(`_engine/vector.py`): `kg_RRF_FUSE` only looped for `"ivf"` type indexes — on Community Edition (or any deployment without a built IVF index) both `vec_results` and `txt_results` stayed empty and the method returned `[]`. Now falls through to `kg_KNN_VEC` when registry contains `"hnsw"` but no `"ivf"`. Reported from hipporag2-pipeline session.
+- fix(`_engine/vector.py`): `ivf_build` hardcoded `Graph_KG.kg_NodeEmbeddings` in both SELECT paths (line 1011, 1015), ignoring the `set_schema_prefix()` global. Now uses `_table("kg_NodeEmbeddings")` consistently with every other query in the mixin.
+- test: `TestKgRRFFuse.test_fuse_hnsw_uses_kg_knn_vec` — assert `kg_KNN_VEC` is called when only hnsw is registered
+- test: `TestKgRRFFuse.test_fuse_hnsw_only_returns_results` — assert non-empty result with hnsw-only registry
+- test: `TestIVFIndexUnit.test_ivf_build_uses_schema_prefix` — assert SELECT uses schema prefix, not hardcoded `Graph_KG`
+
 ### v2.4.7 (2026-07-19)
 
 **BM25 correctness + performance fixes — stopwords, delete, score-sort overflow, vocab_size, batch build**
