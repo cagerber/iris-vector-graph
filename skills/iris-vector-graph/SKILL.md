@@ -1,3 +1,11 @@
+---
+name: iris-vector-graph
+description: IVG — openCypher + temporal property graph + hybrid vector search on IRIS. Covers IRISGraphEngine API, temporal edge queries, HNSW/BM25 retrieval, RDF/SHACL, and Arno acceleration.
+managed_by: iris-vector-graph
+source: intersystems-community/iris-vector-graph
+tags: [iris, graph, cypher, temporal, vector, rdf, shacl]
+---
+
 # iris-vector-graph (IVG)
 
 ## What It Is

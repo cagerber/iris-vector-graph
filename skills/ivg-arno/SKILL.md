@@ -1,3 +1,11 @@
+---
+name: ivg-arno
+description: Arno (libarno_callout.so) Rust acceleration for IVG — BFS, Leiden community detection, PPR. Load when working on large-graph operations with ivg-iris-enterprise container.
+managed_by: iris-vector-graph
+source: intersystems-community/iris-vector-graph
+tags: [iris, graph, arno, rust, bfs, ppr, performance]
+---
+
 # ivg-arno — Arno Rust Acceleration for IVG
 
 ## What It Is
