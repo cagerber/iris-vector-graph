@@ -2,13 +2,43 @@
 
 ### v2.4.8 (2026-07-19)
 
-**Fix: `kg_RRF_FUSE` now uses HNSW leg when no IVF index registered; `ivf_build` respects schema prefix**
+**Fix: `kg_RRF_FUSE` HNSW fallback + `ivf_build` schema prefix; E2E test coverage for both containers; agent skills**
 
-- fix(`_engine/vector.py`): `kg_RRF_FUSE` only looped for `"ivf"` type indexes — on Community Edition (or any deployment without a built IVF index) both `vec_results` and `txt_results` stayed empty and the method returned `[]`. Now falls through to `kg_KNN_VEC` when registry contains `"hnsw"` but no `"ivf"`. Reported from hipporag2-pipeline session.
-- fix(`_engine/vector.py`): `ivf_build` hardcoded `Graph_KG.kg_NodeEmbeddings` in both SELECT paths (line 1011, 1015), ignoring the `set_schema_prefix()` global. Now uses `_table("kg_NodeEmbeddings")` consistently with every other query in the mixin.
-- test: `TestKgRRFFuse.test_fuse_hnsw_uses_kg_knn_vec` — assert `kg_KNN_VEC` is called when only hnsw is registered
-- test: `TestKgRRFFuse.test_fuse_hnsw_only_returns_results` — assert non-empty result with hnsw-only registry
-- test: `TestIVFIndexUnit.test_ivf_build_uses_schema_prefix` — assert SELECT uses schema prefix, not hardcoded `Graph_KG`
+#### Bug fixes
+
+- fix(`_engine/vector.py`): `kg_RRF_FUSE` only looped for `"ivf"` type indexes — on
+  Community Edition (or any deployment without a built IVF index) both `vec_results`
+  and `txt_results` stayed empty and the method returned `[]`. Now falls through to
+  `kg_KNN_VEC` when registry contains `"hnsw"` but no `"ivf"`. Reported from
+  hipporag2-pipeline cross-session analysis.
+- fix(`_engine/vector.py`): `ivf_build` hardcoded `Graph_KG.kg_NodeEmbeddings` in both
+  SELECT paths, ignoring `set_schema_prefix()`. Now uses `_table("kg_NodeEmbeddings")`
+  consistently with every other query in the mixin.
+
+#### Tests
+
+- test(unit): `TestKgRRFFuse.test_fuse_hnsw_uses_kg_knn_vec` — `kg_KNN_VEC` called when
+  only hnsw is registered
+- test(unit): `TestKgRRFFuse.test_fuse_hnsw_only_returns_results` — non-empty result
+  with hnsw-only registry
+- test(unit): `TestIVFIndexUnit.test_ivf_build_uses_schema_prefix` — SELECT uses schema
+  prefix, not hardcoded `Graph_KG`
+- test(E2E community): `TestRRFFuseCommunityE2E` (3 tests) — regression pins for the
+  HNSW fallback fix on `ivg-iris`; covers HNSW-only, self-retrieval, HNSW+BM25 fusion
+- test(E2E enterprise): `TestRRFFuseEnterpriseE2E` (4 tests) — IVF+BM25 full RRF path
+  on `ivg-iris-enterprise`; covers fused results, IVF self-retrieval, schema prefix
+  round-trip, BM25 search
+
+#### Agent / developer experience
+
+- docs: `skills/iris-vector-graph/SKILL.md` — IVG agent skill: API quickstart, key
+  globals (`^KG("tout"/"tin"/"tagg")`), container setup, common gotchas
+- docs: `skills/ivg-arno/SKILL.md` — Arno acceleration skill: when it matters, how to
+  enable, ASQ vs Cypher, fixture patterns, deploy commands
+- docs(`AGENTS.md`): added `## AI Agent Workflows` section — query, temporal, SHACL,
+  Leiden patterns; companion tools (iad MCP); skill file pointers
+- docs(`README.md`): added `## AI Agent Development` section linking iad and skill files
+- build(`pyproject.toml`): `[project.optional-dependencies] ai = ["iris-agentic-dev>=1.0"]`
 
 ### v2.4.7 (2026-07-19)
 

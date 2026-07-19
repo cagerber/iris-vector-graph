@@ -105,7 +105,7 @@ and [docs/performance/GRAPH_ALGORITHMS.md](docs/performance/GRAPH_ALGORITHMS.md)
 
 ## Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    iris-vector-graph  v2.1.0                        │
 ├─────────────────────────────────────────────────────────────────────┤
@@ -198,6 +198,29 @@ reference, SHACL shape writing, PROV-O vocabulary mapping, and integration patte
 | [Graph Algorithms](docs/performance/GRAPH_ALGORITHMS.md) | Centrality and community detection benchmark details        |
 | [Semantic Layer](docs/SEMANTIC_LAYER.md)                 | RDF export, SHACL validation, PROV-O provenance             |
 | [Changelog](CHANGELOG.md)                                | Full version history                                        |
+
+---
+
+## AI Agent Development
+
+When building agents that use IVG as a knowledge graph backend, install the
+[iris-agentic-dev](https://github.com/intersystems-community/iris-agentic-dev) MCP
+toolkit for ObjectScript compilation, global inspection, and IRIS method invocation
+from your agent's tool loop:
+
+```bash
+pip install iris-agentic-dev
+```
+
+This gives your agent `iris_compile`, `iris_execute`, `iris_global`, and related tools
+that work alongside IVG's Python API.
+
+Skill files with agent-oriented quickstarts:
+
+- [`skills/iris-vector-graph/SKILL.md`](skills/iris-vector-graph/SKILL.md) — IVG API,
+  temporal edges, SHACL, globals, container setup, common gotchas
+- [`skills/ivg-arno/SKILL.md`](skills/ivg-arno/SKILL.md) — Arno Rust acceleration,
+  BFS at scale, enterprise container, ASQ query syntax
 
 ---
 

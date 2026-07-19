@@ -469,3 +469,135 @@ class TestIVFIndexE2E:
         assert "node" in result["columns"] or "score" in result["columns"]
         assert len(result.get("rows", [])) > 0
         self._cleanup_nodes(node_ids)
+
+
+@pytest.mark.skipif(SKIP_IRIS_TESTS, reason="SKIP_IRIS_TESTS=true")
+@pytest.mark.requires_clean_isolation
+class TestRRFFuseCommunityE2E:
+    """kg_RRF_FUSE on Community container: HNSW-only registry must return results.
+
+    Community Edition has no ^IVF global after a fresh start.  The fixed code
+    falls back to kg_KNN_VEC; the bug returned [] every time.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, iris_master_cleanup, iris_connection):
+        import uuid
+        from iris_vector_graph.engine import IRISGraphEngine
+
+        self.conn = iris_connection
+        self.engine = IRISGraphEngine(iris_connection, embedding_dimension=4)
+        self.engine.initialize_schema()
+        self._run = uuid.uuid4().hex[:8]
+
+        cursor = iris_connection.cursor()
+        self._nodes = []
+        import random, math
+        rng = random.Random(99)
+        for i in range(6):
+            nid = f"rrf_ce_{i}_{self._run}"
+            vec = [rng.gauss(0, 1) for _ in range(4)]
+            norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+            vec = [x / norm for x in vec]
+            try:
+                cursor.execute("INSERT INTO Graph_KG.nodes (node_id) VALUES (?)", [nid])
+            except Exception:
+                pass
+            try:
+                cursor.execute(
+                    "INSERT INTO Graph_KG.kg_NodeEmbeddings (id, emb) VALUES (?, TO_VECTOR(?, DOUBLE))",
+                    [nid, ",".join(str(v) for v in vec)],
+                )
+            except Exception:
+                pass
+            self._nodes.append((nid, vec))
+        try:
+            iris_connection.commit()
+        except Exception:
+            pass
+        yield
+        cursor2 = iris_connection.cursor()
+        for nid, _ in self._nodes:
+            try:
+                cursor2.execute("DELETE FROM Graph_KG.kg_NodeEmbeddings WHERE id = ?", [nid])
+            except Exception:
+                pass
+        try:
+            iris_connection.commit()
+        except Exception:
+            pass
+
+    def test_hnsw_only_registry_returns_results(self):
+        """Regression: kg_RRF_FUSE with hnsw-only registry was returning [] (bug fix v2.4.8)."""
+        import json
+        assert "hnsw" in self.engine._index_registry, (
+            "Expected hnsw in registry on community container"
+        )
+        query_vec = self._nodes[0][1]
+        result = self.engine.kg_RRF_FUSE(
+            k=5, k1=5, k2=5, c=60,
+            query_vector=json.dumps(query_vec),
+            query_text="",
+        )
+        assert isinstance(result, list)
+        assert len(result) > 0, (
+            "kg_RRF_FUSE with hnsw-only registry must not return [] — "
+            "was a bug before v2.4.8"
+        )
+        assert all(len(r) == 4 for r in result)
+
+    def test_hnsw_bm25_rrf_returns_fused_results(self):
+        """kg_RRF_FUSE with hnsw + bm25: both legs must contribute to fusion."""
+        import json
+        from iris_vector_graph._engine.vector import _table
+
+        # Build a BM25 index over node text
+        idx_bm25 = f"rrf_bm25_{self._run}"
+        cursor = self.conn.cursor()
+        # Insert docs into Graph_KG.docs for BM25 build
+        for nid, _ in self._nodes:
+            try:
+                cursor.execute(
+                    "INSERT INTO Graph_KG.docs (node_id, text) VALUES (?, ?)",
+                    [nid, f"medical term cancer biology {nid}"],
+                )
+            except Exception:
+                try:
+                    cursor.execute(
+                        "UPDATE Graph_KG.docs SET text = ? WHERE node_id = ?",
+                        [f"medical term cancer biology {nid}", nid],
+                    )
+                except Exception:
+                    pass
+        try:
+            self.conn.commit()
+        except Exception:
+            pass
+
+        # Check if BM25 ObjectScript class is available
+        try:
+            self.engine.bm25_build(idx_bm25, "node_id, text")
+        except Exception as e:
+            if "CLASS DOES NOT EXIST" in str(e).upper() or "not exist" in str(e).lower():
+                pytest.skip("Graph.KG.BM25Index not available on this container")
+            raise
+
+        try:
+            assert "hnsw" in self.engine._index_registry
+            assert idx_bm25 in self.engine._index_registry
+
+            query_vec = self._nodes[0][1]
+            result = self.engine.kg_RRF_FUSE(
+                k=5, k1=5, k2=5, c=60,
+                query_vector=json.dumps(query_vec),
+                query_text="cancer",
+            )
+            assert len(result) > 0
+            # At least one node should appear in both legs (they all have "cancer" in text)
+            node_ids = {r[0] for r in result}
+            assert node_ids.issubset({nid for nid, _ in self._nodes} | set())
+        finally:
+            try:
+                self.engine.bm25_drop(idx_bm25)
+            except Exception:
+                pass
