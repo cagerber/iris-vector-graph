@@ -2,3 +2,6 @@
 ModifyService:Name=%Service_CallIn,Enabled=1,AutheEnabled=48
 ModifyUser:Name=_SYSTEM,ChangePassword=0,PasswordNeverExpires=1
 ModifyUser:Name=SuperUser,ChangePassword=0,PasswordNeverExpires=1
+
+[Databases]
+USER=/usr/irissys/mgr/user/

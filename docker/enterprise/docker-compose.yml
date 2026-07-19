@@ -17,7 +17,7 @@ services:
       - ./iris.key:/usr/irissys/mgr/iris.key:ro
       - ./merge.cpf:/home/irisowner/merge.cpf:ro
       - ./libarno_callout.so:/tmp/libarno_callout.so:ro
-      - ivg_enterprise_data:/home/irisowner/irisdata
+      - ../../iris_src/src:/usr/irissys/mgr/user/ivg_src:ro
     healthcheck:
       test: ["CMD", "/usr/irissys/bin/iris", "session", "iris", "-U%SYS", "Write 1"]
       interval: 15s
@@ -26,6 +26,3 @@ services:
       start_period: 60s
     stdin_open: true
     tty: true
-
-volumes:
-  ivg_enterprise_data: {}

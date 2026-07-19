@@ -66,57 +66,13 @@ from iris_vector_graph import IRISGraphEngine
 IRISGraphEngine(conn, embedding_dimension=768).initialize_schema()
 print('✓ schema initialized')
 " 2>&1 | grep -E 'schema initialized|ERROR|CRITICAL' | grep -v 'Embedding dimension'
-    echo "Deploying and compiling ObjectScript..."
-    "$0" compile-all 2>&1 | grep -v '^$' | grep -iE 'ERROR|Finish' | grep -v '%AI\|Graph.KG.Meta\|User.PageRankEmbed\|TestEdge' | head -5 || true
-    docker exec -i "$CONTAINER" iris session IRIS -U USER <<'OSEOF' > /dev/null 2>&1 || true
-Do $system.OBJ.Delete("Graph.KG.funckgDegreeCentrality","-d")
-Do $system.OBJ.Load("/tmp/src/Graph/KG/Centrality.cls","ck")
-H
-OSEOF
-    for _cls in Graph.KG.ArnoAccel Graph.KG.TraversalBuild Graph.KG.TraversalBFS Graph.KG.TraversalPaths Graph.KG.TraversalKHop Graph.KG.Traversal Graph.KG.NKGAccelLoader Graph.KG.NKGAccelAdjacency Graph.KG.NKGAccelTraversal Graph.KG.NKGAccelCentrality Graph.KG.NKGAccel; do
-      "$0" compile "$_cls" > /dev/null 2>&1 || true
-    done
-    echo "Loading libarno_callout.so..."
-    # NKGAccel/NKGAccelLoader.Load's ObjectScript default parameter is
-    # /usr/irissys/mgr/libarno_callout.so (not /tmp/) — several e2e tests and
-    # benchmarks call Load() with that literal or no argument at all, relying
-    # on the default. Copy it there too so those callers don't need to know
-    # about /tmp/ at all; /tmp/ remains the explicit path used by this script.
-    docker exec "$CONTAINER" cp /tmp/libarno_callout.so /usr/irissys/mgr/libarno_callout.so
-    python3 -c "
-import subprocess, iris, json
-ip = subprocess.run(['docker','inspect','$CONTAINER','--format',
-    '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'],
-    capture_output=True, text=True).stdout.strip()
-conn = None
-if ip:
-    try:
-        conn = iris.connect(hostname=ip, port=1972, namespace='USER', username='_SYSTEM', password='SYS')
-    except Exception:
-        conn = None
-if conn is None:
-    # Container IP not routable from host (macOS Docker Desktop/OrbStack) —
-    # fall back to the published port on localhost, same as tests/conftest.py.
-    try:
-        conn = iris.connect(hostname='localhost', port=31972, namespace='USER', username='_SYSTEM', password='SYS')
-    except Exception:
-        from iris_devtester import IRISContainer as C
-        c = C.attach('$CONTAINER'); c._connection = None; conn = c.get_connection()
-irisobj = iris.createIRIS(conn)
-# Load via ArnoAccel (rzf-style, sets rust_callout capability)
-r1 = irisobj.classMethodValue('Graph.KG.ArnoAccel', 'Load', '/tmp/libarno_callout.so')
-# Also load via NKGAccelLoader for legacy compat
-irisobj.classMethodValue('Graph.KG.NKGAccelLoader', 'Load', '/tmp/libarno_callout.so')
-# Verify rust_callout is now True
-caps = json.loads(str(irisobj.classMethodValue('Graph.KG.NKGAccel', 'Capabilities')))
-if caps.get('rust_callout'):
-    print('✓ libarno_callout.so loaded (rust_callout=True, bfs=True)')
-elif r1:
-    print('⚠ libarno_callout.so loaded but rust_callout=False (capabilities:', caps.get('rust_callout'), ')')
-else:
-    print('✗ libarno_callout.so load FAILED — check /tmp/libarno_callout.so exists in container')
-    exit(1)
-" 2>&1 | grep -vE 'swigvarlink|IVG setup|Deprecat'
+    echo "Deploying and compiling ObjectScript via TCP..."
+    # The HealthShare enterprise image has a dual-database split: iris session -U USER
+    # routes ^%Dictionary* globals to IRISSYS while TCP connections use the USER IRIS.DAT.
+    # Classes must be deployed via TCP to be visible to test connections on port 31972.
+    "$0" tcp-deploy 2>&1 | grep -iE 'ERROR|deployed|failed'
+    echo "Loading libarno_callout.so via TCP..."
+    "$0" tcp-load-arno 2>&1 | grep -iE 'ERROR|loaded|failed'
     "$(dirname "$0")/install-embedded-deps.sh" "$CONTAINER" || true
     echo "✓ $CONTAINER ready (Enterprise + Arno)"
     ;;
@@ -169,20 +125,119 @@ except Exception as e:
     cls="${2:-}"
     if [ -z "$cls" ]; then echo "Usage: $0 compile <ClassName>"; exit 1; fi
     echo -n "Compiling $cls... "
-    docker exec -i "$CONTAINER" iris session IRIS -U USER \
-      "##class(%SYSTEM.OBJ).Load(\"/tmp/src/$(echo "$cls" | tr '.' '/').cls\",\"ck\")" \
-      2>/dev/null | grep -iE 'ERROR|Load finished' | head -1
+    cls_path="/tmp/src/$(echo "$cls" | tr '.' '/').cls"
+    docker exec "$CONTAINER" /usr/irissys/bin/irispython -c \
+      "import iris; r=iris.cls('%SYSTEM.OBJ').Load('${cls_path}','ck'); print(r)" \
+      2>&1 | grep -iE 'ERROR|Load finished|error #' | head -3
     ;;
 
   compile-all)
     echo "Compiling all Graph.KG.* classes..."
-    docker exec -i "$CONTAINER" iris session IRIS -U USER \
-      'Do $system.OBJ.LoadDir("/tmp/src","ck",.err,1)' \
-      2>/dev/null | grep -iE 'ERROR|Load finished|Detected' | grep -v 'Warning'
+    # Use irispython (embedded Python) — it writes to the same database that
+    # iris_devtester/external connections see. The old "iris session -U USER '...'"
+    # form compiled into a different namespace mapping and changes were not visible
+    # to external connections.
+    docker exec "$CONTAINER" /usr/irissys/bin/irispython - << 'PYEOF' 2>&1 \
+      | grep -iE 'ERROR|Compiling class|Detected|LoadDir|error #' | grep -v 'Warning\|PageRankEmbed\|Graph.KG.Edge'
+import iris
+result = iris.cls("%SYSTEM.OBJ").LoadDir("/tmp/src", "ck", None, 1)
+print("LoadDir:", result)
+PYEOF
+    ;;
+
+  tcp-deploy)
+    # Deploy all ObjectScript classes via TCP connection so they are visible to
+    # TCP test connections (port 31972). The HealthShare enterprise image routes
+    # ^%Dictionary* globals differently for iris session vs TCP, so classes must
+    # be compiled via TCP to be seen by external iris.connect() calls.
+    python3 - << 'PYEOF'
+import iris, os, glob, sys
+
+port = int(os.environ.get("IVG_PORT", "31972"))
+container = os.environ.get("IVG_ARNO_CONTAINER", "ivg-iris-enterprise")
+
+try:
+    conn = iris.connect(hostname="localhost", port=port, namespace="USER",
+                        username="_SYSTEM", password="SYS")
+except Exception as e:
+    print(f"TCP connect failed (port {port}): {e}", file=sys.stderr)
+    sys.exit(1)
+
+irisobj = iris.createIRIS(conn)
+cls_files = sorted(glob.glob("iris_src/src/**/*.cls", recursive=True))
+print(f"Deploying {len(cls_files)} classes via TCP write+compile...")
+
+errors = []
+for cls_file in cls_files:
+    with open(cls_file, "r") as f:
+        content = f.read()
+    rel = os.path.relpath(cls_file, "iris_src/src").replace(os.sep, "/")
+    dest = f"/tmp/tcpsrc/{rel}"
+    parent = os.path.dirname(dest)
+    irisobj.classMethodValue("%File", "CreateDirectoryChain", parent)
+    stream = irisobj.classMethodObject("%Stream.FileCharacter", "%New")
+    stream.invokeVoid("LinkToFile", dest)
+    for line in content.split("\n"):
+        stream.invokeVoid("WriteLine", line)
+    stream.invokeVoid("%Save")
+    result = irisobj.classMethodValue("%SYSTEM.OBJ", "Load", dest, "ck-d")
+    if not result:
+        errors.append(cls_file)
+        print(f"  ERROR: {cls_file}")
+
+if errors:
+    print(f"tcp-deploy: {len(errors)} compile error(s)")
+    sys.exit(1)
+else:
+    print(f"✓ tcp-deploy: {len(cls_files)} classes deployed and compiled")
+conn.close()
+PYEOF
+    ;;
+
+  tcp-load-arno)
+    # Load libarno_callout.so via TCP — the .so is a Docker volume mount not
+    # visible to TCP IRIS sessions, so we write it via TCP's %Stream.FileBinary.
+    python3 - << 'PYEOF'
+import iris, os, json, sys
+
+port = int(os.environ.get("IVG_PORT", "31972"))
+so_path = "docker/enterprise/libarno_callout.so"
+
+if not os.path.exists(so_path):
+    print(f"tcp-load-arno: {so_path} not found", file=sys.stderr)
+    sys.exit(1)
+
+conn = iris.connect(hostname="localhost", port=port, namespace="USER",
+                    username="_SYSTEM", password="SYS")
+irisobj = iris.createIRIS(conn)
+
+with open(so_path, "rb") as f:
+    so_data = f.read()
+
+stream = irisobj.classMethodObject("%Stream.FileBinary", "%New")
+stream.invokeVoid("LinkToFile", "/tmp/libarno_tcp.so")
+chunk_size = 32768
+for i in range(0, len(so_data), chunk_size):
+    stream.invokeVoid("Write", so_data[i:i+chunk_size])
+stream.invokeVoid("%Save")
+
+r1 = irisobj.classMethodValue("Graph.KG.ArnoAccel", "Load", "/tmp/libarno_tcp.so")
+irisobj.classMethodValue("Graph.KG.NKGAccelLoader", "Load", "/tmp/libarno_tcp.so")
+caps_str = irisobj.classMethodValue("Graph.KG.NKGAccel", "Capabilities")
+caps = json.loads(str(caps_str))
+if caps.get("rust_callout"):
+    print("✓ tcp-load-arno: libarno_callout.so loaded (rust_callout=True)")
+elif r1:
+    print(f"⚠ tcp-load-arno: loaded but rust_callout=False: {caps}")
+else:
+    print("✗ tcp-load-arno: load FAILED", file=sys.stderr)
+    sys.exit(1)
+conn.close()
+PYEOF
     ;;
 
   *)
-    echo "Usage: $0 {up|down|status|deploy|compile <cls>|compile-all}"
+    echo "Usage: $0 {up|down|status|deploy|compile <cls>|compile-all|tcp-deploy|tcp-load-arno}"
     exit 1
     ;;
 esac
