@@ -82,85 +82,71 @@ ClassMethod Build(name As %String, propsCSV As %String, k1 As %Double = 1.5, b A
 {
     Kill ^BM25Idx(name)
 
-    Set N = 0
-    Set totalLen = 0
+    // Build an IN-list literal from propsCSV for the single batch query.
+    // e.g. "name,definition" → "'name','definition'"
+    Set inList = ""
+    Set nProps = $LENGTH(propsCSV, ",")
+    For pi = 1:1:nProps {
+        Set propKey = $ZSTRIP($PIECE(propsCSV, ",", pi), "<>W")
+        If propKey = "" Continue
+        Set escaped = $Replace(propKey, "'", "''")
+        Set inList = inList _ $Select(inList="":"", 1:",") _ "'" _ escaped _ "'"
+    }
+    If inList = "" Return "{""indexed"":0,""avgdl"":0,""vocab_size"":0}"
 
-    Set sql = "SELECT node_id FROM Graph_KG.nodes"
+    // One query fetches all (node_id, val) pairs for the requested properties.
+    // Ordered by node_id so we can accumulate per-doc by scanning in sequence.
+    Set sql = "SELECT n.node_id, p.val FROM Graph_KG.nodes n "
+            _ "LEFT JOIN Graph_KG.rdf_props p ON p.s = n.node_id AND p.key IN ("_inList_") "
+            _ "ORDER BY n.node_id"
     Set stmt = ##class(%SQL.Statement).%New()
     Do stmt.%Prepare(sql)
     Set rs = stmt.%Execute()
 
+    Set N = 0
+    Set totalLen = 0
+    Set curDoc = ""
+    Set docText = ""
+
     While rs.%Next() {
         Set docId = rs.%Get("node_id")
+        Set val = rs.%GetData(2)  // p.val (NULL when no matching prop row)
 
-        Set docText = ""
-        Set nProps = $LENGTH(propsCSV, ",")
-        For pi = 1:1:nProps {
-            Set propKey = $PIECE(propsCSV, ",", pi)
-            Set propKey = $ZSTRIP(propKey, "<>W")
-            If propKey = "" Continue
-            Set pSql = "SELECT val FROM Graph_KG.rdf_props WHERE s = ? AND key = ?"
-            Set pStmt = ##class(%SQL.Statement).%New()
-            Do pStmt.%Prepare(pSql)
-            Set pRs = pStmt.%Execute(docId, propKey)
-            While pRs.%Next() {
-                Set docText = docText_" "_pRs.%Get("val")
+        If docId '= curDoc {
+            // Flush previous doc
+            If curDoc '= "" {
+                Do ..IndexDoc(name, curDoc, docText, .N, .totalLen)
             }
+            Set curDoc = docId
+            Set docText = $Select(val="":"", 1:val)
+        } Else {
+            If val '= "" Set docText = docText _ " " _ val
         }
-
-        Set tokens = ..Tokenize(docText)
-        Set docLen = $LISTLENGTH(tokens)
-        If docLen = 0 Continue
-
-        Kill tfMap
-        Set tIdx = 0
-        While $LISTNEXT(tokens, tIdx, tok) {
-            If tok = "" Continue
-            Set tfMap(tok) = $Get(tfMap(tok), 0) + 1
-        }
-
-        Set tok = ""
-        For { 
-            Set tok = $Order(tfMap(tok))
-            Quit:tok=""
-            Set ^BM25Idx(name, "tf", tok, docId) = tfMap(tok)
-        }
-
-        Set ^BM25Idx(name, "len", docId) = docLen
-        Set N = N + 1
-        Set totalLen = totalLen + docLen
+    }
+    // Flush last doc
+    If curDoc '= "" {
+        Do ..IndexDoc(name, curDoc, docText, .N, .totalLen)
     }
 
-    // Compute and store IDF for all terms
+    // Compute IDF for all terms from accumulated tf subscripts
     Set avgdl = $Select(N > 0: totalLen / N, 1: 0)
     Set vocabSize = 0
     Set term = ""
     For {
-        Set term = $Order(^BM25Idx(name, "idf", term))
-        Quit:term=""
-        Kill ^BM25Idx(name, "idf", term)
-    }
-
-    // Compute IDF from df (document frequency) via tf subscripts
-    Set term = ""
-    For {
         Set term = $Order(^BM25Idx(name, "tf", term))
         Quit:term=""
-        // Count df = number of docs containing this term
         Set df = 0
-        Set docId = ""
+        Set d = ""
         For {
-            Set docId = $Order(^BM25Idx(name, "tf", term, docId))
-            Quit:docId=""
+            Set d = $Order(^BM25Idx(name, "tf", term, d))
+            Quit:d=""
             Set df = df + 1
         }
-        // Robertson IDF: log((N - df + 0.5) / (df + 0.5) + 1)
         Set idf = $ZLN((N - df + 0.5) / (df + 0.5) + 1)
         Set ^BM25Idx(name, "idf", term) = idf
         Set vocabSize = vocabSize + 1
     }
 
-    // Store config
     Set ^BM25Idx(name, "cfg", "N") = N
     Set ^BM25Idx(name, "cfg", "avgdl") = avgdl
     Set ^BM25Idx(name, "cfg", "k1") = k1
@@ -168,6 +154,29 @@ ClassMethod Build(name As %String, propsCSV As %String, k1 As %Double = 1.5, b A
     Set ^BM25Idx(name, "cfg", "vocab_size") = vocabSize
 
     Return "{""indexed"":"_N_",""avgdl"":"_avgdl_",""vocab_size"":"_vocabSize_"}"
+}
+
+// Accumulate tf and length for one document — shared by Build batch loop.
+ClassMethod IndexDoc(name As %String, docId As %String, docText As %String, ByRef N As %Integer, ByRef totalLen As %Integer) [ Private ]
+{
+    Set tokens = ..Tokenize(docText)
+    Set docLen = $LISTLENGTH(tokens)
+    If docLen = 0 Return
+    Kill tfMap
+    Set tIdx = 0
+    While $LISTNEXT(tokens, tIdx, tok) {
+        If tok = "" Continue
+        Set tfMap(tok) = $Get(tfMap(tok), 0) + 1
+    }
+    Set tok = ""
+    For {
+        Set tok = $Order(tfMap(tok))
+        Quit:tok=""
+        Set ^BM25Idx(name, "tf", tok, docId) = tfMap(tok)
+    }
+    Set ^BM25Idx(name, "len", docId) = docLen
+    Set N = N + 1
+    Set totalLen = totalLen + docLen
 }
 
 // ================================================================

@@ -2,9 +2,9 @@
 
 ### v2.4.7 (2026-07-19)
 
-**BM25 correctness fixes — stopwords, delete, score-sort overflow, vocab_size bug**
+**BM25 correctness + performance fixes — stopwords, delete, score-sort overflow, vocab_size, batch build**
 
-Five bugs fixed in `Graph.KG.BM25Index`:
+Six bugs/gaps fixed in `Graph.KG.BM25Index`:
 
 - fix: `Tokenize` now filters common English stopwords ("the", "and", "is", etc.)
   via a process-global `^BM25Idx("__stop__")` register, reducing IDF noise from
@@ -24,6 +24,12 @@ Five bugs fixed in `Graph.KG.BM25Index`:
   Fixed by checking `$Data` before the `Set`.
 - fix: `Tokenize` fallback branch had no stopword filtering; now shares the same
   filter regardless of whether `%iFind.Utils` is available.
+- perf: `Build` previously issued N×P sequential `%SQL.Statement` executions
+  (one per node per property) — O(N×P) round-trips to the SQL engine. Replaced
+  with a single `SELECT n.node_id, p.val FROM nodes LEFT JOIN rdf_props ... IN (...) ORDER BY node_id`
+  batch query; ObjectScript accumulates per-doc text by scanning the ordered
+  result set. For 10k nodes × 2 props this reduces ~20,000 queries to 1.
+  Extracted `IndexDoc` private helper (shared by Build's accumulator loop).
 
 ### v2.4.6 (2026-07-04)
 

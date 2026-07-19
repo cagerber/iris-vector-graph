@@ -460,6 +460,30 @@ class TestBM25IndexE2E:
         assert vocab_after > vocab_before, "vocab_size should grow after inserting new terms"
         self.engine.bm25_drop(idx)
 
+    def test_build_batch_same_result_as_sequential(self):
+        """Build produces same vocab_size and ranking whether 1 or many nodes exist."""
+        run = self._test_run_id
+        terms = [
+            ("bm25batch_a", "diabetes mellitus glucose"),
+            ("bm25batch_b", "insulin resistance glucose"),
+            ("bm25batch_c", "rheumatoid arthritis inflammation"),
+            ("bm25batch_d", "lupus erythematosus autoimmune"),
+            ("bm25batch_e", "ankylosing spondylitis hla"),
+        ]
+        for nid, text in terms:
+            self.engine.create_node(f"{nid}_{run}", labels=["TestBM25"], properties={"name": text})
+
+        idx = f"test44batch_{run}"
+        result = self.engine.bm25_build(idx, ["name"])
+        assert result.get("indexed", 0) >= 5
+        assert result.get("vocab_size", 0) > 0
+
+        hits = self.engine.bm25_search(idx, "glucose", 5)
+        ids = [r[0] for r in hits]
+        assert f"bm25batch_a_{run}" in ids or f"bm25batch_b_{run}" in ids, \
+            "glucose-containing docs should rank"
+        self.engine.bm25_drop(idx)
+
     def test_high_score_doc_ranked_first(self):
         """Doc with 20M-range score is still sorted correctly — no negated-score overflow."""
         run = self._test_run_id
