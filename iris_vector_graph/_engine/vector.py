@@ -956,6 +956,12 @@ class VectorMixin:
             "Graph.KG.BM25Index", "Insert", name, doc_id, text
         )
         return bool(int(str(result)))
+    def bm25_delete(self, name: str, doc_id: str) -> bool:
+        result = self._iris_obj().classMethodValue(
+            "Graph.KG.BM25Index", "Delete", name, doc_id
+        )
+        return bool(int(str(result)))
+
     def bm25_drop(self, name: str) -> None:
         self._iris_obj().classMethodVoid("Graph.KG.BM25Index", "Drop", name)
     def bm25_info(self, name: str) -> dict:

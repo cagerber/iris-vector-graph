@@ -215,6 +215,31 @@ class TestBM25IndexUnit:
         context = TranslationContext()
         translate_procedure_call(proc, context)
 
+    def test_bm25_delete_calls_classmethod(self):
+        """bm25_delete calls Graph.KG.BM25Index.Delete with correct args."""
+        engine = _make_engine()
+        iris_mock = MagicMock()
+        iris_mock.classMethodValue.return_value = "1"
+        engine._iris_obj = lambda: iris_mock
+
+        engine.bm25_delete("idx", "doc1")
+
+        calls = iris_mock.classMethodValue.call_args_list
+        del_calls = [c for c in calls if len(c.args) > 1 and c.args[1] == "Delete"]
+        assert del_calls, "Delete classMethod not called"
+        assert del_calls[0].args[2] == "idx"
+        assert del_calls[0].args[3] == "doc1"
+
+    def test_bm25_delete_missing_doc_returns_false(self):
+        """bm25_delete returns False when doc not in index."""
+        engine = _make_engine()
+        iris_mock = MagicMock()
+        iris_mock.classMethodValue.return_value = "0"
+        engine._iris_obj = lambda: iris_mock
+
+        result = engine.bm25_delete("idx", "nonexistent_doc")
+        assert result is False
+
     # T041 ─────────────────────────────────────────────────────────
     def test_ivg_bm25_search_yields_node_score(self):
         """ivg.bm25.search registers variable_aliases for node and score."""
@@ -396,6 +421,60 @@ class TestBM25IndexE2E:
 
         results_after = self.engine.bm25_search(idx, "some", 3)
         assert results_after == []
+
+    def test_delete_removes_doc(self):
+        """After bm25_delete, doc is no longer findable."""
+        run = self._test_run_id
+        node_id = f"bm25del_{run}"
+        unique = f"deletemeterm{run}"
+        self.engine.create_node(node_id, labels=["TestBM25"], properties={"name": unique})
+        idx = f"test44del_{run}"
+        self.engine.bm25_build(idx, ["name"])
+
+        results_before = self.engine.bm25_search(idx, unique, 5)
+        assert any(r[0] == node_id for r in results_before), "doc should be findable before delete"
+
+        ok = self.engine.bm25_delete(idx, node_id)
+        assert ok is True
+
+        results_after = self.engine.bm25_search(idx, unique, 5)
+        ids_after = [r[0] for r in results_after]
+        assert node_id not in ids_after, "deleted doc should not appear in search results"
+        self.engine.bm25_drop(idx)
+
+    def test_insert_vocab_size_grows(self):
+        """Inserting a doc with new terms increments vocab_size."""
+        run = self._test_run_id
+        self._create_node_with_name(f"bm25vocab_{run}", "some baseline text")
+        idx = f"test44vocab_{run}"
+        self.engine.bm25_build(idx, ["name"])
+
+        info_before = self.engine.bm25_info(idx)
+        vocab_before = info_before.get("vocab_size", 0)
+
+        unique_term = f"xquorumzyx{run}"
+        self.engine.bm25_insert(idx, f"vocabdoc_{run}", f"{unique_term} word")
+
+        info_after = self.engine.bm25_info(idx)
+        vocab_after = info_after.get("vocab_size", 0)
+        assert vocab_after > vocab_before, "vocab_size should grow after inserting new terms"
+        self.engine.bm25_drop(idx)
+
+    def test_high_score_doc_ranked_first(self):
+        """Doc with 20M-range score is still sorted correctly — no negated-score overflow."""
+        run = self._test_run_id
+        for i in range(50):
+            self.engine.create_node(
+                f"bm25overflow_{run}_{i}", labels=["TestBM25"],
+                properties={"name": " ".join([f"rare{run}term"] * 20)}
+            )
+        idx = f"test44overflow_{run}"
+        self.engine.bm25_build(idx, ["name"])
+        results = self.engine.bm25_search(idx, f"rare{run}term", 5)
+        assert results, "should get results on saturated-term query"
+        scores = [s for _, s in results]
+        assert scores == sorted(scores, reverse=True), "results must be descending by score"
+        self.engine.bm25_drop(idx)
 
     # T035 ─────────────────────────────────────────────────────────
     def test_kgtxt_returns_bm25_scores_not_like_scores(self):

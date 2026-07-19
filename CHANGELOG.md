@@ -1,5 +1,30 @@
 # Changelog
 
+### v2.4.7 (2026-07-19)
+
+**BM25 correctness fixes — stopwords, delete, score-sort overflow, vocab_size bug**
+
+Five bugs fixed in `Graph.KG.BM25Index`:
+
+- fix: `Tokenize` now filters common English stopwords ("the", "and", "is", etc.)
+  via a process-global `^BM25Idx("__stop__")` register, reducing IDF noise from
+  high-frequency function words that carry no retrieval signal.
+- feat: new `Delete(name, docId)` ObjectScript method + `bm25_delete(name, doc_id)`
+  Python wrapper — removes a single document from an index, recomputes IDF only
+  for affected terms, decrements vocab_size when terms drop to df=0, and updates
+  avgdl. Previously the only way to remove a doc was to `Drop` the whole index
+  and rebuild.
+- fix: score-sort overflow — the previous "10M offset negation" subscript trick
+  (`10000000 - score`) produced wrong descending order whenever a BM25 score
+  exceeded 10M (e.g. many-doc indexes with saturated query terms). Fixed by
+  scaling to a 12-decimal integer key and using `$Order(..., -1)` native descending
+  iteration instead.
+- fix: `Insert` vocab_size increment dead code — `$Data` check fired *after* the
+  IDF `Set`, so the condition was always false and vocab_size never grew on insert.
+  Fixed by checking `$Data` before the `Set`.
+- fix: `Tokenize` fallback branch had no stopword filtering; now shares the same
+  filter regardless of whether `%iFind.Utils` is available.
+
 ### v2.4.6 (2026-07-04)
 
 **`get_window_sources()` — streaming-friendly source enumeration over a temporal window**
