@@ -408,6 +408,198 @@ class NodesEdgesMixin:
         ids = self.get_node_ids_by_label(label)
         return self.get_nodes(ids) if ids else []
 
+    # ------------------------------------------------------------------
+    # Property-side primitives (v2.5.0)
+    # Single-table scans over rdf_props / nodes only — no JOIN, no FETCH FIRST.
+    # ------------------------------------------------------------------
+
+    def get_node_ids_by_property(
+        self,
+        key: str,
+        val: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[str]:
+        """Subject ids carrying property `key`, optionally filtered to `= val`.
+
+        Direct mirror of get_node_ids_by_label for the property dimension.
+        Single-table scan; no JOIN; uses TOP n (never FETCH FIRST).
+
+        Args:
+            key: Property name.
+            val: Optional exact value filter.  None means "carries the key at all".
+            limit: Cap on returned rows.  Non-positive means no limit.
+
+        Returns:
+            List of node ids.
+        """
+        top = f"TOP {int(limit)} " if limit and int(limit) > 0 else ""
+        sql = f'SELECT {top}s FROM {_table("rdf_props")} WHERE "key" = ?'
+        params: List[Any] = [key]
+        if val is not None:
+            sql += " AND val = ?"
+            params.append(val)
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql, params)
+            return [row[0] for row in cursor.fetchall() if row and row[0]]
+        except Exception as e:
+            logger.error("get_node_ids_by_property(%s) failed: %s", key, e)
+            return []
+        finally:
+            cursor.close()
+
+    def get_nodes_by_property(
+        self,
+        key: str,
+        val: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Hydrated nodes carrying property `key` (optionally `= val`).
+
+        Equivalent to get_node_ids_by_property + get_nodes.
+        """
+        ids = self.get_node_ids_by_property(key, val=val, limit=limit)
+        return self.get_nodes(ids) if ids else []
+
+    def get_property_pairs(self, key: str) -> List[tuple]:
+        """(subject, value) pairs for every row under property `key`.
+
+        Returns one pair per subject (the schema enforces PK on (s, key)).
+        Useful when you need both the subject id and the value in one pass
+        without hydrating full nodes via get_nodes.
+        """
+        sql = f'SELECT s, val FROM {_table("rdf_props")} WHERE "key" = ?'
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql, [key])
+            return [(row[0], row[1]) for row in cursor.fetchall() if row and row[0]]
+        except Exception as e:
+            logger.error("get_property_pairs(%s) failed: %s", key, e)
+            return []
+        finally:
+            cursor.close()
+
+    def get_property_values(self, key: str) -> List[str]:
+        """Every value stored under property `key`, across all subjects.
+
+        Value-side scan without subject context: use to seed dedup sets in one
+        pass over large property populations (e.g. all source_urls).
+        """
+        sql = f'SELECT val FROM {_table("rdf_props")} WHERE "key" = ?'
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql, [key])
+            return [row[0] for row in cursor.fetchall() if row and row[0]]
+        except Exception as e:
+            logger.error("get_property_values(%s) failed: %s", key, e)
+            return []
+        finally:
+            cursor.close()
+
+    def property_value_exists(self, key: str, like: str) -> bool:
+        """True if any row under `key` has a value matching SQL LIKE `like`.
+
+        TOP 1 probe — never FETCH FIRST (SIGSEGV on IRIS AI builds, DP-451209).
+        """
+        sql = f'SELECT TOP 1 1 FROM {_table("rdf_props")} WHERE "key" = ? AND val LIKE ?'
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql, [key, like])
+            return cursor.fetchone() is not None
+        except Exception as e:
+            logger.error("property_value_exists(%s LIKE %s) failed: %s", key, like, e)
+            return False
+        finally:
+            cursor.close()
+
+    def get_property_pairs_like(
+        self,
+        key: str,
+        like: str,
+        limit: Optional[int] = None,
+    ) -> List[tuple]:
+        """(subject, value) pairs under `key` whose value matches SQL LIKE `like`.
+
+        Keyword-search primitive: bounded LIKE probe beats hydrating all nodes.
+        `limit` non-positive means no cap.
+        """
+        top = f"TOP {int(limit)} " if limit and int(limit) > 0 else ""
+        sql = (
+            f'SELECT {top}s, val FROM {_table("rdf_props")} '
+            f'WHERE "key" = ? AND val LIKE ?'
+        )
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql, [key, like])
+            return [(row[0], row[1]) for row in cursor.fetchall() if row and row[0]]
+        except Exception as e:
+            logger.error("get_property_pairs_like(%s LIKE %s) failed: %s", key, like, e)
+            return []
+        finally:
+            cursor.close()
+
+    def get_json_field_values(self, key: str, field: str) -> List[str]:
+        """Values of one JSON `field` inside every `key` blob, extracted server-side.
+
+        Uses $PIECE extraction to avoid moving multi-MB JSON blobs to Python.
+        """
+        sql = (
+            f"SELECT $PIECE($PIECE(val, '\"{field}\": \"', 2), '\"', 1) "
+            f'FROM {_table("rdf_props")} WHERE "key" = ? AND val LIKE ?'
+        )
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql, [key, f"%{field}%"])
+            return [row[0] for row in cursor.fetchall() if row and row[0]]
+        except Exception as e:
+            logger.error("get_json_field_values(%s.%s) failed: %s", key, field, e)
+            return []
+        finally:
+            cursor.close()
+
+    def get_node_ids_like(self, pattern: str) -> List[str]:
+        """Node ids matching a SQL LIKE `pattern`.
+
+        Used for test-fixture cleanup (ids like `test-run-1234:%`) and for
+        producing the id list that bulk_delete_nodes requires.
+        """
+        sql = f"SELECT node_id FROM {_table('nodes')} WHERE node_id LIKE ?"
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql, [pattern])
+            return [row[0] for row in cursor.fetchall() if row and row[0]]
+        except Exception as e:
+            logger.error("get_node_ids_like(%s) failed: %s", pattern, e)
+            return []
+        finally:
+            cursor.close()
+
+    def count_subjects_with_property(
+        self,
+        key: str,
+        val: Optional[str] = None,
+    ) -> int:
+        """COUNT(*) of subjects carrying `key` (optionally `= val`).
+
+        Does not hydrate nodes — pure count for cardinality estimates.
+        """
+        sql = f'SELECT COUNT(*) FROM {_table("rdf_props")} WHERE "key" = ?'
+        params: List[Any] = [key]
+        if val is not None:
+            sql += " AND val = ?"
+            params.append(val)
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            return int(row[0]) if row and row[0] else 0
+        except Exception as e:
+            logger.error(
+                "count_subjects_with_property(%s=%s) failed: %s", key, val, e
+            )
+            return 0
+        finally:
+            cursor.close()
 
     def create_node(
         self, node_id: str, labels: List[str] = None, properties: Dict[str, Any] = None,
