@@ -1,5 +1,40 @@
 # Changelog
 
+### v2.5.0 (2026-07-29)
+
+**Property-side read primitives — 9 new methods mirroring get_node_ids_by_label**
+
+#### New primitives (`_engine/nodes_edges.py`)
+
+All use single-table scans with `TOP n` (never `FETCH FIRST`, never JOIN) against
+`Graph_KG.rdf_props` or `Graph_KG.nodes`:
+
+- `get_node_ids_by_property(key, val=None, limit=None)` — subject ids carrying a
+  property key, optionally filtered to an exact value
+- `get_nodes_by_property(key, val=None, limit=None)` — hydrated nodes, delegates to
+  `get_node_ids_by_property` + `get_nodes`
+- `get_property_pairs(key)` → `list[tuple[str,str]]` — `(subject, value)` pairs for
+  every row under a key
+- `get_property_values(key)` → `list[str]` — every value stored under a key, all
+  subjects; for seeding dedup sets without hydrating nodes
+- `property_value_exists(key, like)` → `bool` — `TOP 1` probe; does any value under
+  `key` match `LIKE like`
+- `get_property_pairs_like(key, like, limit=None)` → `list[tuple[str,str]]` — keyword
+  search primitive; `(subject, value)` pairs matching a LIKE pattern
+- `get_json_field_values(key, field)` → `list[str]` — server-side `$PIECE` extraction
+  of a JSON field from all values of a property key
+- `get_node_ids_like(pattern)` → `list[str]` — node ids matching a SQL LIKE pattern;
+  feeds `bulk_delete_nodes` for test-fixture cleanup
+- `count_subjects_with_property(key, val=None)` → `int` — `COUNT(*)` without hydrating
+
+#### Tests
+
+- 32 unit tests (mock connection, no container) — all access patterns, limit/TOP
+  handling, None filtering, error resilience
+- 15 integration tests (ivg-iris community container) — live round-trip verification
+
+---
+
 ### v2.4.8 (2026-07-19)
 
 **Fix: `kg_RRF_FUSE` HNSW fallback + `ivf_build` schema prefix; E2E test coverage for both containers; agent skills**
