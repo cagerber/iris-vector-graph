@@ -102,7 +102,7 @@ def get_schema_prefix() -> str:
     return _schema_prefix
 
 
-def _table(name: str) -> str:
+def _table(name: str, prefix: Optional[str] = None) -> str:
     """Return fully qualified table name with schema prefix if configured.
 
     Security: Validates name against VALID_GRAPH_TABLES allowlist to prevent
@@ -110,6 +110,8 @@ def _table(name: str) -> str:
 
     Args:
         name: Table name (must be in VALID_GRAPH_TABLES)
+        prefix: Override the module-level prefix. Pass engine._schema_prefix
+                to get per-instance isolation instead of the process global.
 
     Returns:
         Schema-qualified table name (e.g., "Graph_KG.nodes")
@@ -117,11 +119,10 @@ def _table(name: str) -> str:
     Raises:
         ValueError: If name is not in the allowlist
     """
-    # Validate against allowlist - raises ValueError if invalid
     validate_table_name(name)
-
-    if _schema_prefix:
-        return f"{_schema_prefix}.{name}"
+    p = prefix if prefix is not None else _schema_prefix
+    if p:
+        return f"{p}.{name}"
     return name
 
 

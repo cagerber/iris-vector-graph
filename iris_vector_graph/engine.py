@@ -121,6 +121,7 @@ class IRISGraphEngine(RdfExportMixin, ShaclMixin, ProvMixin, TemporalMixin, Snap
         use_iris_embedding: bool = False,
         vector_dtype: str = "DOUBLE",
         store=None,
+        schema_prefix: str = "Graph_KG",
     ):
         self.conn = connection
         if hasattr(connection, "prepare") and not hasattr(connection, "cursor"):
@@ -133,7 +134,10 @@ class IRISGraphEngine(RdfExportMixin, ShaclMixin, ProvMixin, TemporalMixin, Snap
         self._embed_fn = embed_fn
         self._use_iris_embedding = use_iris_embedding
         self.vector_dtype = vector_dtype.upper()
-        set_schema_prefix("Graph_KG")
+        self._schema_prefix = schema_prefix
+        # Keep the module global in sync for code that still uses the free
+        # _table() / get_schema_prefix() directly (e.g. the Cypher translator).
+        set_schema_prefix(schema_prefix)
         self._embedding_function_available: Optional[bool] = None
         self._native_vec_available: Optional[bool] = None
         self.capabilities: IRISCapabilities = IRISCapabilities()
@@ -157,6 +161,10 @@ class IRISGraphEngine(RdfExportMixin, ShaclMixin, ProvMixin, TemporalMixin, Snap
         self._store_capabilities = self._store.capabilities()
         logger.debug("IRISGraphEngine initialized (dim=%s dtype=%s)",
                      embedding_dimension or "auto", self.vector_dtype)
+
+    def _t(self, name: str) -> str:
+        """Per-instance table qualifier — use this instead of the free _table() in all mixin code."""
+        return _table(name, prefix=self._schema_prefix)
 
     @classmethod
     def from_connect(

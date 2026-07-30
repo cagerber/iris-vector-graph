@@ -6,7 +6,6 @@ from iris_vector_graph.status import (
     ObjectScriptStatus, ArnoStatus, IndexInventory,
 )
 from iris_vector_graph.result import IVGResult
-from iris_vector_graph.cypher.translator import _table
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +89,7 @@ class AdminMixin:
         # HNSW vector index on kg_NodeEmbeddings
         hnsw_count = 0
         try:
-            cursor.execute(f"SELECT COUNT(*) FROM {_table('kg_NodeEmbeddings_optimized')}")
+            cursor.execute(f"SELECT COUNT(*) FROM {self._t('kg_NodeEmbeddings_optimized')}")
             r = cursor.fetchone()
             hnsw_count = int(r[0]) if r else 0
         except Exception:
@@ -100,13 +99,13 @@ class AdminMixin:
             "ONLINE" if hnsw_count > 0 else "BUILDING",
         ])
 
-        for (name,) in _try(f"SELECT DISTINCT name FROM {_table('kg_IVFMeta')}"):
+        for (name,) in _try(f"SELECT DISTINCT name FROM {self._t('kg_IVFMeta')}"):
             rows.append([name, "VECTOR(IVF)", "NODE", ["*"], ["emb"], "ONLINE"])
 
-        for (name,) in _try(f"SELECT DISTINCT name FROM {_table('kg_BM25Meta')}"):
+        for (name,) in _try(f"SELECT DISTINCT name FROM {self._t('kg_BM25Meta')}"):
             rows.append([name, "FULLTEXT(BM25)", "NODE", ["*"], ["*"], "ONLINE"])
 
-        for (idx_name,) in _try(f"SELECT DISTINCT idx_name FROM {_table('kg_PlaidMeta')}"):
+        for (idx_name,) in _try(f"SELECT DISTINCT idx_name FROM {self._t('kg_PlaidMeta')}"):
             rows.append([idx_name, "VECTOR(PLAID)", "NODE", ["*"], ["emb"], "ONLINE"])
 
         try:
@@ -172,12 +171,12 @@ class AdminMixin:
                 return 0
 
         tables = TableCounts(
-            nodes=_count(f"SELECT COUNT(*) FROM {_table('nodes')}"),
-            edges=_count(f"SELECT COUNT(*) FROM {_table('rdf_edges')}"),
-            labels=_count(f"SELECT COUNT(*) FROM {_table('rdf_labels')}"),
-            props=_count(f"SELECT COUNT(*) FROM {_table('rdf_props')}"),
-            node_embeddings=_count(f"SELECT COUNT(*) FROM {_table('kg_NodeEmbeddings')}"),
-            edge_embeddings=_count(f"SELECT COUNT(*) FROM {_table('kg_EdgeEmbeddings')}"),
+            nodes=_count(f"SELECT COUNT(*) FROM {self._t('nodes')}"),
+            edges=_count(f"SELECT COUNT(*) FROM {self._t('rdf_edges')}"),
+            labels=_count(f"SELECT COUNT(*) FROM {self._t('rdf_labels')}"),
+            props=_count(f"SELECT COUNT(*) FROM {self._t('rdf_props')}"),
+            node_embeddings=_count(f"SELECT COUNT(*) FROM {self._t('kg_NodeEmbeddings')}"),
+            edge_embeddings=_count(f"SELECT COUNT(*) FROM {self._t('kg_EdgeEmbeddings')}"),
         )
 
         kg_count = 0
@@ -215,7 +214,7 @@ class AdminMixin:
             if kg_pred:
                 try:
                     cursor.execute(
-                        f"SELECT COUNT(*) FROM {_table('rdf_edges')} WHERE p = ?",
+                        f"SELECT COUNT(*) FROM {self._t('rdf_edges')} WHERE p = ?",
                         [kg_pred],
                     )
                     row = cursor.fetchone()
@@ -265,7 +264,7 @@ class AdminMixin:
             capabilities=dict(self._arno_capabilities),
         )
 
-        hnsw_built = _count(f"SELECT COUNT(*) FROM {_table('kg_NodeEmbeddings_optimized')}") > 0
+        hnsw_built = _count(f"SELECT COUNT(*) FROM {self._t('kg_NodeEmbeddings_optimized')}") > 0
 
         def _list_index(sql):
             try:
@@ -274,9 +273,9 @@ class AdminMixin:
             except Exception:
                 return []
 
-        ivf = _list_index(f"SELECT DISTINCT name FROM {_table('kg_IVFMeta')}")
-        bm25 = _list_index(f"SELECT DISTINCT name FROM {_table('kg_BM25Meta')}")
-        plaid = _list_index(f"SELECT DISTINCT idx_name FROM {_table('kg_PlaidMeta')}")
+        ivf = _list_index(f"SELECT DISTINCT name FROM {self._t('kg_IVFMeta')}")
+        bm25 = _list_index(f"SELECT DISTINCT name FROM {self._t('kg_BM25Meta')}")
+        plaid = _list_index(f"SELECT DISTINCT idx_name FROM {self._t('kg_PlaidMeta')}")
 
         indexes = IndexInventory(
             hnsw_built=hnsw_built,
@@ -335,7 +334,7 @@ class AdminMixin:
 
         cursor = self.conn.cursor()
         try:
-            cursor.execute(f"SELECT COUNT(*) FROM {_table('rdf_edges')}")
+            cursor.execute(f"SELECT COUNT(*) FROM {self._t('rdf_edges')}")
             row = cursor.fetchone()
             sql_edges = int(row[0]) if row else 0
         except Exception as e:

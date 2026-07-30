@@ -3,7 +3,6 @@ import json
 import logging
 
 from iris_vector_graph.schema import GraphSchema
-from iris_vector_graph.cypher.translator import _table
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +137,7 @@ class EmbeddingsMixin:
         try:
             cursor.execute(
                 "SELECT TOP 1 VECTOR_COSINE(emb, TO_VECTOR('[0]', DOUBLE)) "
-                f"FROM {_table('kg_NodeEmbeddings')} WHERE 1=0"
+                f"FROM {self._t('kg_NodeEmbeddings')} WHERE 1=0"
             )
             self._native_vec_available = True
         except Exception as e:
@@ -201,12 +200,12 @@ class EmbeddingsMixin:
 
         try:
             cursor.execute(
-                f"DELETE FROM {_table('kg_NodeEmbeddings')} WHERE id = ?", [node_id]
+                f"DELETE FROM {self._t('kg_NodeEmbeddings')} WHERE id = ?", [node_id]
             )
         except Exception:
             pass
         cursor.execute(
-            f"INSERT INTO {_table('kg_NodeEmbeddings')} (id, emb, metadata) VALUES (?, TO_VECTOR('{emb_str}', {self.vector_dtype}), ?)",
+            f"INSERT INTO {self._t('kg_NodeEmbeddings')} (id, emb, metadata) VALUES (?, TO_VECTOR('{emb_str}', {self.vector_dtype}), ?)",
             [node_id, meta_json],
         )
         self.conn.commit()
@@ -250,12 +249,12 @@ class EmbeddingsMixin:
 
                 try:
                     cursor.execute(
-                        f"DELETE FROM {_table('kg_NodeEmbeddings')} WHERE id = ?", [node_id]
+                        f"DELETE FROM {self._t('kg_NodeEmbeddings')} WHERE id = ?", [node_id]
                     )
                 except Exception:
                     pass
                 cursor.execute(
-            f"INSERT INTO {_table('kg_NodeEmbeddings')} (id, emb, metadata) VALUES (?, TO_VECTOR('{emb_str}', {_dtype}), ?)",
+            f"INSERT INTO {self._t('kg_NodeEmbeddings')} (id, emb, metadata) VALUES (?, TO_VECTOR('{emb_str}', {_dtype}), ?)",
                     [node_id, meta_json],
                 )
             cursor.execute("COMMIT")
@@ -278,7 +277,6 @@ class EmbeddingsMixin:
         missing_only: bool = False,
     ) -> dict:
         from iris_vector_graph.embed_selector import EmbedSelector, build_node_where
-        from iris_vector_graph.cypher import get_schema_prefix
         from iris_vector_graph.engine import _load_sentence_transformer, _is_sentence_transformer
 
         sel = EmbedSelector(
@@ -287,7 +285,7 @@ class EmbeddingsMixin:
             exclude_pattern=exclude_pattern,
             missing_only=missing_only,
         )
-        where = build_node_where(sel, schema_prefix=get_schema_prefix())
+        where = build_node_where(sel, schema_prefix=self._schema_prefix)
 
         orig_embedder = self.embedder
         if model is not None:
@@ -300,12 +298,12 @@ class EmbeddingsMixin:
             cursor = self.conn.cursor()
 
             where_clause = f"WHERE {where}" if where else ""
-            cursor.execute(f"SELECT node_id FROM {_table('nodes')} {where_clause}")
+            cursor.execute(f"SELECT node_id FROM {self._t('nodes')} {where_clause}")
             all_node_ids = [row[0] for row in cursor.fetchall()]
             n_total = len(all_node_ids)
 
             if not force and not missing_only:
-                cursor.execute(f"SELECT id FROM {_table('kg_NodeEmbeddings')}")
+                cursor.execute(f"SELECT id FROM {self._t('kg_NodeEmbeddings')}")
                 already_embedded = {row[0] for row in cursor.fetchall()}
                 to_embed = [nid for nid in all_node_ids if nid not in already_embedded]
             else:
@@ -319,7 +317,7 @@ class EmbeddingsMixin:
 
                 placeholders = ", ".join("?" * len(batch_ids))
                 cursor.execute(
-                    f'SELECT s, "key", val FROM {_table("rdf_props")} WHERE s IN ({placeholders})',
+                    f'SELECT s, "key", val FROM {self._t("rdf_props")} WHERE s IN ({placeholders})',
                     batch_ids,
                 )
                 props_by_node: Dict[str, Dict[str, Any]] = {}
@@ -394,7 +392,7 @@ class EmbeddingsMixin:
                     del_placeholders = ", ".join("?" * len(ids_to_delete))
                     try:
                         cursor.execute(
-                            f"DELETE FROM {_table('kg_NodeEmbeddings')} WHERE id IN ({del_placeholders})",
+                            f"DELETE FROM {self._t('kg_NodeEmbeddings')} WHERE id IN ({del_placeholders})",
                             ids_to_delete,
                         )
                     except Exception:
@@ -402,7 +400,7 @@ class EmbeddingsMixin:
                     for node_id, emb_str in insert_params:
                         try:
                             cursor.execute(
-                                f"INSERT INTO {_table('kg_NodeEmbeddings')} (id, emb) VALUES (?, TO_VECTOR('{emb_str}', {self.vector_dtype}))",
+                                f"INSERT INTO {self._t('kg_NodeEmbeddings')} (id, emb) VALUES (?, TO_VECTOR('{emb_str}', {self.vector_dtype}))",
                                 [node_id],
                             )
                             embedded += 1
@@ -443,7 +441,6 @@ class EmbeddingsMixin:
         missing_only: bool = False,
     ) -> dict:
         from iris_vector_graph.embed_selector import EmbedSelector, build_edge_where
-        from iris_vector_graph.cypher import get_schema_prefix
         from iris_vector_graph.engine import _load_sentence_transformer, _is_sentence_transformer
 
         sel = EmbedSelector(
@@ -453,7 +450,7 @@ class EmbeddingsMixin:
             exclude_pattern=exclude_pattern,
             missing_only=missing_only,
         )
-        where = build_edge_where(sel, schema_prefix=get_schema_prefix())
+        where = build_edge_where(sel, schema_prefix=self._schema_prefix)
 
         orig_embedder = self.embedder
         if model is not None:
@@ -467,14 +464,14 @@ class EmbeddingsMixin:
 
             where_clause = f"WHERE {where}" if where else ""
             cursor.execute(
-                f"SELECT s, p, o_id FROM {_table('rdf_edges')} {where_clause}"
+                f"SELECT s, p, o_id FROM {self._t('rdf_edges')} {where_clause}"
             )
             all_edges = [(row[0], row[1], row[2]) for row in cursor.fetchall()]
             n_total = len(all_edges)
 
             if not force:
                 cursor.execute(
-                    f"SELECT s, p, o_id FROM {_table('kg_EdgeEmbeddings')}"
+                    f"SELECT s, p, o_id FROM {self._t('kg_EdgeEmbeddings')}"
                 )
                 already_embedded = {
                     (row[0], row[1], row[2]) for row in cursor.fetchall()
@@ -555,7 +552,7 @@ class EmbeddingsMixin:
                         for s, p, o_id in del_params:
                             try:
                                 cursor.execute(
-                                    f"DELETE FROM {_table('kg_EdgeEmbeddings')} "
+                                    f"DELETE FROM {self._t('kg_EdgeEmbeddings')} "
                                     "WHERE s=? AND p=? AND o_id=?",
                                     [s, p, o_id],
                                 )
@@ -566,7 +563,7 @@ class EmbeddingsMixin:
                     for s, p, o_id, emb_str in insert_params:
                         try:
                             cursor.execute(
-                                f"INSERT INTO {_table('kg_EdgeEmbeddings')} "
+                                f"INSERT INTO {self._t('kg_EdgeEmbeddings')} "
                                 f"(s, p, o_id, emb) VALUES (?, ?, ?, TO_VECTOR('{emb_str}', {self.vector_dtype}))",
                                 [s, p, o_id],
                             )
@@ -611,7 +608,7 @@ class EmbeddingsMixin:
         """
         cursor = self.conn.cursor()
         cursor.execute(
-            f"SELECT id, emb, metadata FROM {_table('kg_NodeEmbeddings')} WHERE id = ?",
+            f"SELECT id, emb, metadata FROM {self._t('kg_NodeEmbeddings')} WHERE id = ?",
             [node_id],
         )
         row = cursor.fetchone()
@@ -644,7 +641,7 @@ class EmbeddingsMixin:
         cursor = self.conn.cursor()
         placeholders = ",".join(["?"] * len(node_ids))
         cursor.execute(
-            f"SELECT id, emb, metadata FROM {_table('kg_NodeEmbeddings')} WHERE id IN ({placeholders})",
+            f"SELECT id, emb, metadata FROM {self._t('kg_NodeEmbeddings')} WHERE id IN ({placeholders})",
             node_ids,
         )
 
@@ -790,10 +787,10 @@ class EmbeddingsMixin:
         cursor = self.conn.cursor()
         try:
             cursor.execute(
-                f"DELETE FROM {_table('kg_NodeEmbeddings')} WHERE id=?", [node_id]
+                f"DELETE FROM {self._t('kg_NodeEmbeddings')} WHERE id=?", [node_id]
             )
             cursor.execute(
-                f"INSERT INTO {_table('kg_NodeEmbeddings')} (id, emb) "
+                f"INSERT INTO {self._t('kg_NodeEmbeddings')} (id, emb) "
                 f"VALUES (?, TO_VECTOR('{emb_str}', {self.vector_dtype}))",
                 [node_id],
             )
@@ -839,7 +836,7 @@ class EmbeddingsMixin:
     def embedding_count(self) -> int:
         cursor = self.conn.cursor()
         try:
-            cursor.execute(f"SELECT COUNT(*) FROM {_table('kg_NodeEmbeddings')}")
+            cursor.execute(f"SELECT COUNT(*) FROM {self._t('kg_NodeEmbeddings')}")
             row = cursor.fetchone()
             return int(row[0]) if row else 0
         except Exception:

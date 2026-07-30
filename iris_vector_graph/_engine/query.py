@@ -4,7 +4,7 @@ import re
 from typing import Dict, Any, List, Optional, Tuple
 
 from iris_vector_graph.cypher.parser import parse_query
-from iris_vector_graph.cypher.translator import translate_to_sql, _table
+from iris_vector_graph.cypher.translator import translate_to_sql
 from iris_vector_graph.result import IVGResult
 from iris_vector_graph._validate import CypherInput, KHop2Input
 

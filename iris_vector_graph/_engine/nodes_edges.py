@@ -3,7 +3,6 @@ import logging
 from typing import Dict, Any, Optional, List
 
 from iris_vector_graph.schema import GraphSchema
-from iris_vector_graph.cypher.translator import _table
 from iris_vector_graph._validate import NodeIdInput, EdgeInput
 
 logger = logging.getLogger(__name__)
@@ -127,7 +126,7 @@ class NodesEdgesMixin:
         cursor = self.conn.cursor()
         try:
             cursor.execute(
-                f"SELECT COUNT(*) FROM {_table('nodes')} WHERE node_id = ?", [node_id]
+                f"SELECT COUNT(*) FROM {self._t('nodes')} WHERE node_id = ?", [node_id]
             )
             result = cursor.fetchone()
             if not result or result[0] == 0:
@@ -175,13 +174,13 @@ class NodesEdgesMixin:
                 # Fall back to matching by (s, o) only when p is the sentinel.
                 if p == "R":
                     cursor.execute(
-                        f"SELECT qualifiers FROM {_table('rdf_edges')} "
+                        f"SELECT qualifiers FROM {self._t('rdf_edges')} "
                         "WHERE s=? AND o_id=?",
                         [s, o],
                     )
                 else:
                     cursor.execute(
-                        f"SELECT qualifiers FROM {_table('rdf_edges')} "
+                        f"SELECT qualifiers FROM {self._t('rdf_edges')} "
                         "WHERE s=? AND p=? AND o_id=?",
                         [s, p, o],
                     )
@@ -237,7 +236,7 @@ class NodesEdgesMixin:
                 placeholders = ",".join(["?"] * len(chunk))
 
                 cursor.execute(
-                    f"SELECT s, label FROM {_table('rdf_labels')} WHERE s IN ({placeholders})",
+                    f"SELECT s, label FROM {self._t('rdf_labels')} WHERE s IN ({placeholders})",
                     chunk,
                 )
                 for s, label in cursor.fetchall():
@@ -245,7 +244,7 @@ class NodesEdgesMixin:
                         node_map[s]["labels"].append(label)
 
                 cursor.execute(
-                    f'SELECT s, "key", val FROM {_table("rdf_props")} WHERE s IN ({placeholders})',
+                    f'SELECT s, "key", val FROM {self._t("rdf_props")} WHERE s IN ({placeholders})',
                     chunk,
                 )
                 _STRUCTURAL_KEYS = ("id", "labels")
@@ -278,7 +277,7 @@ class NodesEdgesMixin:
                     chunk = empty_nids[i : i + _IN_CHUNK]
                     e_placeholders = ",".join(["?"] * len(chunk))
                     cursor.execute(
-                        f"SELECT node_id FROM {_table('nodes')} WHERE node_id IN ({e_placeholders})",
+                        f"SELECT node_id FROM {self._t('nodes')} WHERE node_id IN ({e_placeholders})",
                         chunk,
                     )
                     existing_empty.update(row[0] for row in cursor.fetchall())
@@ -388,7 +387,7 @@ class NodesEdgesMixin:
             List of node IDs (empty list if none match).
         """
         cursor = self.conn.cursor()
-        cursor.execute(f"SELECT s FROM {_table('rdf_labels')} WHERE label = ?", [label])
+        cursor.execute(f"SELECT s FROM {self._t('rdf_labels')} WHERE label = ?", [label])
         return [row[0] for row in cursor.fetchall() if row and row[0]]
 
 
@@ -433,7 +432,7 @@ class NodesEdgesMixin:
             List of node ids.
         """
         top = f"TOP {int(limit)} " if limit and int(limit) > 0 else ""
-        sql = f'SELECT {top}s FROM {_table("rdf_props")} WHERE "key" = ?'
+        sql = f'SELECT {top}s FROM {self._t("rdf_props")} WHERE "key" = ?'
         params: List[Any] = [key]
         if val is not None:
             sql += " AND val = ?"
@@ -468,7 +467,7 @@ class NodesEdgesMixin:
         Useful when you need both the subject id and the value in one pass
         without hydrating full nodes via get_nodes.
         """
-        sql = f'SELECT s, val FROM {_table("rdf_props")} WHERE "key" = ?'
+        sql = f'SELECT s, val FROM {self._t("rdf_props")} WHERE "key" = ?'
         cursor = self.conn.cursor()
         try:
             cursor.execute(sql, [key])
@@ -485,7 +484,7 @@ class NodesEdgesMixin:
         Value-side scan without subject context: use to seed dedup sets in one
         pass over large property populations (e.g. all source_urls).
         """
-        sql = f'SELECT val FROM {_table("rdf_props")} WHERE "key" = ?'
+        sql = f'SELECT val FROM {self._t("rdf_props")} WHERE "key" = ?'
         cursor = self.conn.cursor()
         try:
             cursor.execute(sql, [key])
@@ -501,7 +500,7 @@ class NodesEdgesMixin:
 
         TOP 1 probe — never FETCH FIRST (SIGSEGV on IRIS AI builds, DP-451209).
         """
-        sql = f'SELECT TOP 1 1 FROM {_table("rdf_props")} WHERE "key" = ? AND val LIKE ?'
+        sql = f'SELECT TOP 1 1 FROM {self._t("rdf_props")} WHERE "key" = ? AND val LIKE ?'
         cursor = self.conn.cursor()
         try:
             cursor.execute(sql, [key, like])
@@ -525,7 +524,7 @@ class NodesEdgesMixin:
         """
         top = f"TOP {int(limit)} " if limit and int(limit) > 0 else ""
         sql = (
-            f'SELECT {top}s, val FROM {_table("rdf_props")} '
+            f'SELECT {top}s, val FROM {self._t("rdf_props")} '
             f'WHERE "key" = ? AND val LIKE ?'
         )
         cursor = self.conn.cursor()
@@ -545,7 +544,7 @@ class NodesEdgesMixin:
         """
         sql = (
             f"SELECT $PIECE($PIECE(val, '\"{field}\": \"', 2), '\"', 1) "
-            f'FROM {_table("rdf_props")} WHERE "key" = ? AND val LIKE ?'
+            f'FROM {self._t("rdf_props")} WHERE "key" = ? AND val LIKE ?'
         )
         cursor = self.conn.cursor()
         try:
@@ -563,7 +562,7 @@ class NodesEdgesMixin:
         Used for test-fixture cleanup (ids like `test-run-1234:%`) and for
         producing the id list that bulk_delete_nodes requires.
         """
-        sql = f"SELECT node_id FROM {_table('nodes')} WHERE node_id LIKE ?"
+        sql = f"SELECT node_id FROM {self._t('nodes')} WHERE node_id LIKE ?"
         cursor = self.conn.cursor()
         try:
             cursor.execute(sql, [pattern])
@@ -583,7 +582,7 @@ class NodesEdgesMixin:
 
         Does not hydrate nodes — pure count for cardinality estimates.
         """
-        sql = f'SELECT COUNT(*) FROM {_table("rdf_props")} WHERE "key" = ?'
+        sql = f'SELECT COUNT(*) FROM {self._t("rdf_props")} WHERE "key" = ?'
         params: List[Any] = [key]
         if val is not None:
             sql += " AND val = ?"
@@ -626,13 +625,13 @@ class NodesEdgesMixin:
             cursor.execute("START TRANSACTION")
 
             cursor.execute(
-                f"INSERT INTO {_table('nodes')} (node_id) VALUES (?)", [node_id]
+                f"INSERT INTO {self._t('nodes')} (node_id) VALUES (?)", [node_id]
             )
 
             if labels:
                 label_data = [[node_id, label] for label in labels]
                 cursor.executemany(
-                    f"INSERT INTO {_table('rdf_labels')} (s, label) VALUES (?, ?)",
+                    f"INSERT INTO {self._t('rdf_labels')} (s, label) VALUES (?, ?)",
                     label_data,
                 )
 
@@ -649,7 +648,7 @@ class NodesEdgesMixin:
                 val_str = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
                 prop_data.append([node_id, k, val_str, node_id, k])
 
-            prop_sql = f'INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = ? AND "key" = ?)'
+            prop_sql = f'INSERT INTO {self._t("rdf_props")} (s, "key", val) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM {self._t("rdf_props")} WHERE s = ? AND "key" = ?)'
             cursor.executemany(prop_sql, prop_data)
 
             cursor.execute("COMMIT")
@@ -700,12 +699,12 @@ class NodesEdgesMixin:
             qual_json = json.dumps(qualifiers) if qualifiers else None
             if graph:
                 cursor.execute(
-                    f"INSERT INTO {_table('rdf_edges')} (s, p, o_id, qualifiers, graph_id) VALUES (?, ?, ?, ?, ?)",
+                    f"INSERT INTO {self._t('rdf_edges')} (s, p, o_id, qualifiers, graph_id) VALUES (?, ?, ?, ?, ?)",
                     [source_id, predicate, target_id, qual_json, graph],
                 )
             else:
                 cursor.execute(
-                    f"INSERT INTO {_table('rdf_edges')} (s, p, o_id, qualifiers) VALUES (?, ?, ?, ?)",
+                    f"INSERT INTO {self._t('rdf_edges')} (s, p, o_id, qualifiers) VALUES (?, ?, ?, ?)",
                     [source_id, predicate, target_id, qual_json],
                 )
             self.conn.commit()
@@ -769,7 +768,7 @@ class NodesEdgesMixin:
         cursor = self.conn.cursor()
         try:
             cursor.execute(
-                f"DELETE FROM {_table('rdf_edges')} WHERE s = ? AND p = ? AND o_id = ?",
+                f"DELETE FROM {self._t('rdf_edges')} WHERE s = ? AND p = ? AND o_id = ?",
                 [source_id, predicate, target_id],
             )
             self.conn.commit()
@@ -1083,40 +1082,40 @@ class NodesEdgesMixin:
         cursor = self.conn.cursor()
         try:
             cursor.execute(
-                f"DELETE FROM {_table('kg_NodeEmbeddings')} WHERE id = ?", [node_id]
+                f"DELETE FROM {self._t('kg_NodeEmbeddings')} WHERE id = ?", [node_id]
             )
             cursor.execute(
-                f"SELECT edge_id FROM {_table('rdf_edges')} WHERE s = ? OR o_id = ?",
+                f"SELECT edge_id FROM {self._t('rdf_edges')} WHERE s = ? OR o_id = ?",
                 [node_id, node_id],
             )
             edge_ids = [row[0] for row in cursor.fetchall()]
             for eid in edge_ids:
                 cursor.execute(
-                    f"SELECT reifier_id FROM {_table('rdf_reifications')} WHERE edge_id = ?",
+                    f"SELECT reifier_id FROM {self._t('rdf_reifications')} WHERE edge_id = ?",
                     [eid],
                 )
                 for (reif_id,) in cursor.fetchall():
                     cursor.execute(
-                        f"DELETE FROM {_table('rdf_reifications')} WHERE reifier_id = ?",
+                        f"DELETE FROM {self._t('rdf_reifications')} WHERE reifier_id = ?",
                         [reif_id],
                     )
                     cursor.execute(
-                        f"DELETE FROM {_table('rdf_props')} WHERE s = ?", [reif_id]
+                        f"DELETE FROM {self._t('rdf_props')} WHERE s = ?", [reif_id]
                     )
                     cursor.execute(
-                        f"DELETE FROM {_table('rdf_labels')} WHERE s = ?", [reif_id]
+                        f"DELETE FROM {self._t('rdf_labels')} WHERE s = ?", [reif_id]
                     )
                     cursor.execute(
-                        f"DELETE FROM {_table('nodes')} WHERE node_id = ?", [reif_id]
+                        f"DELETE FROM {self._t('nodes')} WHERE node_id = ?", [reif_id]
                     )
             cursor.execute(
-                f"DELETE FROM {_table('rdf_edges')} WHERE s = ? OR o_id = ?",
+                f"DELETE FROM {self._t('rdf_edges')} WHERE s = ? OR o_id = ?",
                 [node_id, node_id],
             )
-            cursor.execute(f"DELETE FROM {_table('rdf_labels')} WHERE s = ?", [node_id])
-            cursor.execute(f"DELETE FROM {_table('rdf_props')} WHERE s = ?", [node_id])
+            cursor.execute(f"DELETE FROM {self._t('rdf_labels')} WHERE s = ?", [node_id])
+            cursor.execute(f"DELETE FROM {self._t('rdf_props')} WHERE s = ?", [node_id])
             cursor.execute(
-                f"DELETE FROM {_table('nodes')} WHERE node_id = ?", [node_id]
+                f"DELETE FROM {self._t('nodes')} WHERE node_id = ?", [node_id]
             )
             self.conn.commit()
             # BYPASS: edge rows removed from SQL but ^KG/^NKG still hold them.
@@ -1138,21 +1137,21 @@ class NodesEdgesMixin:
             cursor = self.conn.cursor()
             try:
                 cursor.execute(
-                    f"DELETE FROM {_table('rdf_reifications')} WHERE edge_id IN "
-                    f"(SELECT edge_id FROM {_table('rdf_edges')} WHERE s IN ({phs}) OR o_id IN ({phs}))",
+                    f"DELETE FROM {self._t('rdf_reifications')} WHERE edge_id IN "
+                    f"(SELECT edge_id FROM {self._t('rdf_edges')} WHERE s IN ({phs}) OR o_id IN ({phs}))",
                     batch + batch,
                 )
                 cursor.execute(
-                    f"DELETE FROM {_table('kg_NodeEmbeddings')} WHERE id IN ({phs})", batch
+                    f"DELETE FROM {self._t('kg_NodeEmbeddings')} WHERE id IN ({phs})", batch
                 )
                 cursor.execute(
-                    f"DELETE FROM {_table('rdf_edges')} WHERE s IN ({phs}) OR o_id IN ({phs})",
+                    f"DELETE FROM {self._t('rdf_edges')} WHERE s IN ({phs}) OR o_id IN ({phs})",
                     batch + batch,
                 )
-                cursor.execute(f"DELETE FROM {_table('rdf_labels')} WHERE s IN ({phs})", batch)
-                cursor.execute(f"DELETE FROM {_table('rdf_props')} WHERE s IN ({phs})", batch)
+                cursor.execute(f"DELETE FROM {self._t('rdf_labels')} WHERE s IN ({phs})", batch)
+                cursor.execute(f"DELETE FROM {self._t('rdf_props')} WHERE s IN ({phs})", batch)
                 cursor.execute(
-                    f"DELETE FROM {_table('nodes')} WHERE node_id IN ({phs})", batch
+                    f"DELETE FROM {self._t('nodes')} WHERE node_id IN ({phs})", batch
                 )
                 self.conn.commit()
                 deleted += len(batch)
@@ -1202,7 +1201,7 @@ class NodesEdgesMixin:
         cursor = self.conn.cursor()
         try:
             cursor.execute(
-                f"INSERT INTO {_table('nodes')} (node_id) VALUES (?)", [node_id]
+                f"INSERT INTO {self._t('nodes')} (node_id) VALUES (?)", [node_id]
             )
             self.conn.commit()
         except Exception as e:
@@ -1217,11 +1216,11 @@ class NodesEdgesMixin:
                 cursor2 = self.conn.cursor()
                 try:
                     cursor2.execute(
-                        f"DELETE FROM {_table('rdf_props')} WHERE s = ? AND \"key\" = ?",
+                        f"DELETE FROM {self._t('rdf_props')} WHERE s = ? AND \"key\" = ?",
                         [node_id, k]
                     )
                     cursor2.execute(
-                        f"INSERT INTO {_table('rdf_props')} (s, \"key\", val) VALUES (?, ?, ?)",
+                        f"INSERT INTO {self._t('rdf_props')} (s, \"key\", val) VALUES (?, ?, ?)",
                         [node_id, k, val_str]
                     )
                     self.conn.commit()
@@ -1234,7 +1233,7 @@ class NodesEdgesMixin:
                 cursor3 = self.conn.cursor()
                 try:
                     cursor3.execute(
-                        f"INSERT INTO {_table('rdf_labels')} (s, label) VALUES (?, ?)",
+                        f"INSERT INTO {self._t('rdf_labels')} (s, label) VALUES (?, ?)",
                         [node_id, lbl]
                     )
                     self.conn.commit()
@@ -1255,7 +1254,7 @@ class NodesEdgesMixin:
         try:
             qual_json = json.dumps(qualifiers) if qualifiers else None
             cursor.execute(
-                f"INSERT INTO {_table('rdf_edges')} (s, p, o_id, qualifiers) VALUES (?, ?, ?, ?)",
+                f"INSERT INTO {self._t('rdf_edges')} (s, p, o_id, qualifiers) VALUES (?, ?, ?, ?)",
                 [source_id, predicate, target_id, qual_json],
             )
             self.conn.commit()
@@ -1279,7 +1278,7 @@ class NodesEdgesMixin:
                 phs = ",".join(["?"] * len(batch))
                 try:
                     cursor.execute(
-                        f"SELECT node_id FROM {_table('nodes')} WHERE node_id IN ({phs})",
+                        f"SELECT node_id FROM {self._t('nodes')} WHERE node_id IN ({phs})",
                         batch,
                     )
                     for row in cursor.fetchall():
@@ -1288,7 +1287,7 @@ class NodesEdgesMixin:
                     for nid in batch:
                         try:
                             cursor.execute(
-                                f"SELECT COUNT(*) FROM {_table('nodes')} WHERE node_id = ?",
+                                f"SELECT COUNT(*) FROM {self._t('nodes')} WHERE node_id = ?",
                                 [nid],
                             )
                             row = cursor.fetchone()
