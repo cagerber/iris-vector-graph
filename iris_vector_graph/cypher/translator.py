@@ -353,6 +353,28 @@ class TranslationContext:
     def add_dml(self, sql: str, params: List[Any]):
         self.dml_statements.append((sql, params))
 
+    def build_dml_subquery(self, select_override: str) -> tuple[str, str, List[Any]]:
+        """Build a SELECT subquery for use in DML, returning (cte_prefix, select_sql, params).
+
+        When variable_aliases reference StageN CTEs (set after a WITH clause),
+        cte_prefix is a 'WITH ...' string that must precede the DML verb.
+        Callers assemble as: f"{cte_prefix}{dml_verb} {target} {select_sql}"
+        For DELETE WHERE IN, use: f"{cte_prefix}DELETE FROM t WHERE c IN ({select_sql})"
+        When no stages exist, cte_prefix is empty string.
+        """
+        sql, params = self.build_stage_sql(select_override=select_override)
+        all_ctes = [
+            c
+            for c in getattr(self, "cte_clauses", [])
+            if not any(td in c for td in self.temporal_derived)
+        ] + self.stages
+        if all_ctes:
+            cte_prefix = "WITH " + ",\n".join(all_ctes) + "\n"
+            params = list(self.all_stage_params) + list(params)
+        else:
+            cte_prefix = ""
+        return cte_prefix, sql, params
+
 
 def translate_procedure_call(
     proc: ast.CypherProcedureCall, context: TranslationContext
@@ -1256,20 +1278,74 @@ def _tts_process_parts(cypher_query, context, metadata):
             if isinstance(clause, ast.WhereClause):
                 context.pending_where = clause.expression
                 break
-        for clause in part.clauses:
-            if isinstance(clause, ast.MatchClause):
-                translate_match_clause(clause, context, metadata)
-            elif isinstance(clause, ast.UnwindClause):
-                translate_unwind_clause(clause, context)
-            elif isinstance(clause, ast.SubqueryCall):
-                translate_subquery_call(clause, context, metadata)
-            elif isinstance(clause, ast.ForeachClause):
-                is_transactional = _to_sql_handle_foreach(clause, context, metadata) or is_transactional
-            elif isinstance(clause, ast.UpdatingClause):
-                is_transactional = True
-                translate_updating_clause(clause, context, metadata)
-            elif isinstance(clause, ast.WhereClause):
-                translate_where_clause(clause, context)
+        # Check for UNWIND+UPDATE pattern: when a literal-list UNWIND feeds updating clauses,
+        # expand Python-side (like FOREACH) so each list element gets its own DML set.
+        unwind_clause = next(
+            (c for c in part.clauses if isinstance(c, ast.UnwindClause)), None
+        )
+        has_updating = any(isinstance(c, ast.UpdatingClause) for c in part.clauses)
+        unwind_literals = None
+        if (
+            unwind_clause is not None
+            and has_updating
+            and isinstance(unwind_clause.expression, ast.Literal)
+            and isinstance(unwind_clause.expression.value, list)
+        ):
+            unwind_literals = unwind_clause.expression.value
+        elif (
+            unwind_clause is not None
+            and has_updating
+            and isinstance(unwind_clause.expression, ast.Variable)
+            and unwind_clause.expression.name in context.input_params
+            and isinstance(context.input_params[unwind_clause.expression.name], list)
+        ):
+            unwind_literals = [
+                ast.Literal(v) if not isinstance(v, ast.Literal) else v
+                for v in context.input_params[unwind_clause.expression.name]
+            ]
+
+        if unwind_literals is not None:
+            # UNWIND literal list + updating clauses → expand Python-side, one DML set per element
+            is_transactional = True
+            aliases_before = dict(context.variable_aliases)
+            last_iter_aliases = dict(context.variable_aliases)
+            for item in unwind_literals:
+                item_val = item.value if isinstance(item, ast.Literal) else item
+                # Start each iteration from the pre-loop state so new vars don't accumulate
+                context.variable_aliases = dict(aliases_before)
+                context.variable_aliases[unwind_clause.alias] = "__foreach_literal__"
+                context.foreach_literals = getattr(context, "foreach_literals", {})
+                context.foreach_literals[unwind_clause.alias] = item_val
+                for clause in part.clauses:
+                    if isinstance(clause, ast.UnwindClause):
+                        continue  # handled by foreach expansion above
+                    elif isinstance(clause, ast.UpdatingClause):
+                        translate_updating_clause(clause, context, metadata)
+                    elif isinstance(clause, ast.WhereClause):
+                        translate_where_clause(clause, context)
+                last_iter_aliases = dict(context.variable_aliases)
+            if hasattr(context, "foreach_literals"):
+                context.foreach_literals.pop(unwind_clause.alias, None)
+            # After loop: keep vars created by updating clauses (from last iteration)
+            context.variable_aliases = last_iter_aliases
+            context.variable_aliases.pop(unwind_clause.alias, None)
+            # Still need to add the UNWIND to context for RETURN clause access
+            translate_unwind_clause(unwind_clause, context)
+        else:
+            for clause in part.clauses:
+                if isinstance(clause, ast.MatchClause):
+                    translate_match_clause(clause, context, metadata)
+                elif isinstance(clause, ast.UnwindClause):
+                    translate_unwind_clause(clause, context)
+                elif isinstance(clause, ast.SubqueryCall):
+                    translate_subquery_call(clause, context, metadata)
+                elif isinstance(clause, ast.ForeachClause):
+                    is_transactional = _to_sql_handle_foreach(clause, context, metadata) or is_transactional
+                elif isinstance(clause, ast.UpdatingClause):
+                    is_transactional = True
+                    translate_updating_clause(clause, context, metadata)
+                elif isinstance(clause, ast.WhereClause):
+                    translate_where_clause(clause, context)
         if part.procedure_call is not None:
             translate_procedure_call(part.procedure_call, context)
         if part.with_clause:
@@ -1695,23 +1771,35 @@ def _create_node_literal(node, node_id_expr, context):
         )
     for k, v in node.properties.items():
         val = _create_resolve_prop_value(v, context)
-        context.add_dml(
-            f'INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = ? AND "key" = ?)',
-            [node_id, k, val, node_id, k],
-        )
+        if isinstance(val, ast.Variable):
+            # Property value is a bound stage variable — use SELECT-based INSERT
+            var_alias = context.variable_aliases[val.name]
+            col_expr = f"{var_alias}.{val.name}"
+            cte, sql, p = context.build_dml_subquery(
+                select_override=f"SELECT ?, ?, CAST({col_expr} AS VARCHAR)"
+            )
+            context.add_dml(
+                f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) {sql} WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = ? AND "key" = ?)',
+                [node_id, k] + p + [node_id, k],
+            )
+        else:
+            context.add_dml(
+                f'INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = ? AND "key" = ?)',
+                [node_id, k, val, node_id, k],
+            )
 
 
 def _create_node_from_alias(node, node_id_expr, var_alias, context):
-    sql, p = context.build_stage_sql(
+    cte, sql, p = context.build_dml_subquery(
         select_override=f"SELECT {var_alias}.{node_id_expr.name} AS node_id"
     )
     context.add_dml(
-        f"INSERT INTO {_table('nodes')} (node_id) SELECT t.node_id FROM ({sql}) AS t WHERE NOT EXISTS (SELECT 1 FROM {_table('nodes')} WHERE node_id = t.node_id)",
+        f"{cte}INSERT INTO {_table('nodes')} (node_id) SELECT t.node_id FROM ({sql}) AS t WHERE NOT EXISTS (SELECT 1 FROM {_table('nodes')} WHERE node_id = t.node_id)",
         p,
     )
     for label in node.labels:
         context.add_dml(
-            f"INSERT INTO {_table('rdf_labels')} (s, label) SELECT t.node_id, ? FROM ({sql}) AS t WHERE NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE s = t.node_id AND label = ?)",
+            f"{cte}INSERT INTO {_table('rdf_labels')} (s, label) SELECT t.node_id, ? FROM ({sql}) AS t WHERE NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE s = t.node_id AND label = ?)",
             [label] + p + [label],
         )
 
@@ -1844,11 +1932,11 @@ def _create_clause_relationship_entry(rel, i, pat, context):
             )
         )
         for rt in rel.types:
-            sql, p = context.build_stage_sql(
+            cte, sql, p = context.build_dml_subquery(
                 select_override=f"SELECT {s_expr}, ?, {t_expr}"
             )
             context.add_dml(
-                f"INSERT INTO {_table('rdf_edges')} (s, p, o_id) {sql}",
+                f"{cte}INSERT INTO {_table('rdf_edges')} (s, p, o_id) {sql}",
                 s_p + [rt] + t_p + p,
             )
 
@@ -1889,34 +1977,34 @@ def translate_delete_clause(delete, context, metadata):
         alias = context.variable_aliases.get(var.name)
         if not alias:
             raise SyntaxError(f"Undefined variable: {var.name}")
-        subquery, subparams = context.build_stage_sql(
+        cte, subquery, subparams = context.build_dml_subquery(
             select_override=f"SELECT {alias}.node_id"
         )
         if delete.detach:
             context.add_dml(
-                f"DELETE FROM {_table('rdf_edges')} WHERE s IN ({subquery}) OR o_id IN ({subquery})",
+                f"{cte}DELETE FROM {_table('rdf_edges')} WHERE s IN ({subquery}) OR o_id IN ({subquery})",
                 subparams + subparams,
             )
         elif not alias.startswith("e"):
             # Non-DETACH DELETE: guard against connected nodes (Cypher constraint).
             # Stored as a sentinel SQL so execute_transaction can raise the right error.
             context.add_dml(
-                f"__constraint_check_delete_connected__ SELECT COUNT(*) FROM {_table('rdf_edges')} WHERE s IN ({subquery}) OR o_id IN ({subquery})",
+                f"__constraint_check_delete_connected__ {cte}SELECT COUNT(*) FROM {_table('rdf_edges')} WHERE s IN ({subquery}) OR o_id IN ({subquery})",
                 subparams + subparams,
             )
         if not alias.startswith("e"):
             context.add_dml(
-                f"DELETE FROM {_table('rdf_labels')} WHERE s IN ({subquery})", subparams
+                f"{cte}DELETE FROM {_table('rdf_labels')} WHERE s IN ({subquery})", subparams
             )
             context.add_dml(
-                f"DELETE FROM {_table('rdf_props')} WHERE s IN ({subquery})", subparams
+                f"{cte}DELETE FROM {_table('rdf_props')} WHERE s IN ({subquery})", subparams
             )
             context.add_dml(
-                f"DELETE FROM {_table('kg_NodeEmbeddings')} WHERE id IN ({subquery})",
+                f"{cte}DELETE FROM {_table('kg_NodeEmbeddings')} WHERE id IN ({subquery})",
                 subparams,
             )
             context.add_dml(
-                f"DELETE FROM {_table('nodes')} WHERE node_id IN ({subquery})",
+                f"{cte}DELETE FROM {_table('nodes')} WHERE node_id IN ({subquery})",
                 subparams,
             )
         else:
@@ -1924,17 +2012,17 @@ def translate_delete_clause(delete, context, metadata):
             s_col = "_src" if is_undirected else "s"
             p_col = "_p" if is_undirected else "p"
             o_col = "_dst" if is_undirected else "o_id"
-            subquery_s, subparams_s = context.build_stage_sql(
+            cte_s, subquery_s, subparams_s = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.{s_col}"
             )
-            subquery_p, subparams_p = context.build_stage_sql(
+            cte_p, subquery_p, subparams_p = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.{p_col}"
             )
-            subquery_o, subparams_o = context.build_stage_sql(
+            cte_o, subquery_o, subparams_o = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.{o_col}"
             )
             context.add_dml(
-                f"DELETE FROM {_table('rdf_edges')} WHERE "
+                f"{cte_s}DELETE FROM {_table('rdf_edges')} WHERE "
                 f"s IN ({subquery_s}) AND p IN ({subquery_p}) AND o_id IN ({subquery_o})",
                 subparams_s + subparams_p + subparams_o,
             )
@@ -1985,7 +2073,7 @@ def translate_set_clause(set_cl, context, metadata):
     for item in set_cl.items:
         if isinstance(item.expression, ast.Variable) and getattr(item, "merge", False):
             alias = context.variable_aliases.get(item.expression.name)
-            subquery, subparams = context.build_stage_sql(
+            cte, subquery, subparams = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.node_id"
             )
             val_expr = item.value
@@ -1994,22 +2082,22 @@ def translate_set_clause(set_cl, context, metadata):
                 if isinstance(map_val, dict):
                     for k, v in map_val.items():
                         context.add_dml(
-                            f'UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
+                            f'{cte}UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
                             [v] + subparams + [k],
                         )
                         context.add_dml(
-                            f'INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
+                            f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
                             [k, v] + subparams + [k],
                         )
             elif isinstance(val_expr, ast.MapLiteral):
                 for k, v in val_expr.entries.items():
                     val = v.value if isinstance(v, ast.Literal) else context.input_params.get(v.name) if isinstance(v, ast.Variable) else v
                     context.add_dml(
-                        f'UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
+                        f'{cte}UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
                         [val] + subparams + [k],
                     )
                     context.add_dml(
-                        f'INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
+                        f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
                         [k, val] + subparams + [k],
                     )
         elif isinstance(item.expression, ast.PropertyReference):
@@ -2019,15 +2107,15 @@ def translate_set_clause(set_cl, context, metadata):
                 item.value,
             )
             val = v.value if isinstance(v, ast.Literal) else v
-            subquery, subparams = context.build_stage_sql(
+            cte, subquery, subparams = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.node_id"
             )
             context.add_dml(
-                f'UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
+                f'{cte}UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
                 [val] + subparams + [k],
             )
             context.add_dml(
-                f'INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
+                f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
                 [k, val] + subparams + [k],
             )
         elif isinstance(item.expression, ast.Variable):
@@ -2039,11 +2127,11 @@ def translate_set_clause(set_cl, context, metadata):
                     else item.value
                 ),
             )
-            subquery, subparams = context.build_stage_sql(
+            cte, subquery, subparams = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.node_id"
             )
             context.add_dml(
-                f"INSERT INTO {_table('rdf_labels')} (s, label) SELECT node_id, ? FROM {_table('nodes')} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE s = {_table('nodes')}.node_id AND label = ?)",
+                f"{cte}INSERT INTO {_table('rdf_labels')} (s, label) SELECT node_id, ? FROM {_table('nodes')} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE s = {_table('nodes')}.node_id AND label = ?)",
                 [label] + subparams + [label],
             )
 
@@ -2052,11 +2140,11 @@ def translate_remove_clause(remove, context, metadata):
     for item in remove.items:
         if isinstance(item.expression, ast.Variable) and item.label:
             alias = context.variable_aliases.get(item.expression.name)
-            subquery, subparams = context.build_stage_sql(
+            cte, subquery, subparams = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.node_id"
             )
             context.add_dml(
-                f"DELETE FROM {_table('rdf_labels')} WHERE s IN ({subquery}) AND label = ?",
+                f"{cte}DELETE FROM {_table('rdf_labels')} WHERE s IN ({subquery}) AND label = ?",
                 subparams + [item.label],
             )
         elif isinstance(item.expression, ast.PropertyReference):
@@ -2064,11 +2152,11 @@ def translate_remove_clause(remove, context, metadata):
                 context.variable_aliases.get(item.expression.variable),
                 item.expression.property_name,
             )
-            subquery, subparams = context.build_stage_sql(
+            cte, subquery, subparams = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.node_id"
             )
             context.add_dml(
-                f'DELETE FROM {_table("rdf_props")} WHERE s IN ({subquery}) AND "key" = ?',
+                f'{cte}DELETE FROM {_table("rdf_props")} WHERE s IN ({subquery}) AND "key" = ?',
                 subparams + [k],
             )
 
