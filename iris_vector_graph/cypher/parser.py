@@ -66,6 +66,23 @@ class Parser:
             return True
         return False
 
+    def expect_label(self) -> Token:
+        """Accept an IDENTIFIER or any keyword token as a node/rel label.
+
+        In Cypher, keywords like END, ELSE, NULL, etc. are contextual and valid
+        as label names. Using expect(IDENTIFIER) would reject them.
+        """
+        tok = self.peek()
+        if tok.kind == TokenType.IDENTIFIER or (
+            tok.value and tok.value.replace("_", "").isalnum()
+        ):
+            return self.eat()
+        raise CypherParseError(
+            f"Expected IDENTIFIER, got {tok.kind.value if tok.kind.value else tok.kind}",
+            line=tok.line,
+            column=tok.column,
+        )
+
     def parse_procedure_call(self) -> ast.CypherProcedureCall:
         """Parse CALL ivg.vector.search(args...) YIELD node, score [, ...]"""
         self.expect(TokenType.CALL)
@@ -666,7 +683,7 @@ class Parser:
                 items.append(ast.SetItem(expression=target, value=value, merge=True))
             elif self.matches(TokenType.COLON):
                 # SET n:Label
-                label_tok = self.expect(TokenType.IDENTIFIER)
+                label_tok = self.expect_label()
                 label = label_tok.value if label_tok.value else ""
                 items.append(ast.SetItem(expression=target, value=label))
             else:
@@ -687,7 +704,7 @@ class Parser:
                 )
             if isinstance(target, ast.Variable) and self.peek().kind == TokenType.COLON:
                 self.eat()
-                label_tok = self.expect(TokenType.IDENTIFIER)
+                label_tok = self.expect_label()
                 items.append(ast.RemoveItem(expression=target, label=label_tok.value or ""))
             else:
                 items.append(ast.RemoveItem(expression=target))
@@ -723,7 +740,7 @@ class Parser:
         labels = []
         labels_or = False
         while self.matches(TokenType.COLON):
-            label_tok = self.expect(TokenType.IDENTIFIER)
+            label_tok = self.expect_label()
             if label_tok.value:
                 labels.append(label_tok.value)
             while self.peek().kind == TokenType.PIPE or (
@@ -732,7 +749,7 @@ class Parser:
             ):
                 self.eat()
                 labels_or = True
-                alt_tok = self.expect(TokenType.IDENTIFIER)
+                alt_tok = self.expect_label()
                 if alt_tok.value:
                     labels.append(alt_tok.value)
 
@@ -776,11 +793,11 @@ class Parser:
 
         types = []
         if self.matches(TokenType.COLON):
-            type_tok = self.expect(TokenType.IDENTIFIER)
+            type_tok = self.expect_label()
             if type_tok.value:
                 types.append(type_tok.value)
             while self.matches(TokenType.PIPE):
-                next_type_tok = self.expect(TokenType.IDENTIFIER)
+                next_type_tok = self.expect_label()
                 if next_type_tok.value:
                     types.append(next_type_tok.value)
 
@@ -969,7 +986,7 @@ class Parser:
 
         if isinstance(left, ast.Variable) and self.peek().kind == TokenType.COLON:
             self.eat()
-            label_tok = self.expect(TokenType.IDENTIFIER)
+            label_tok = self.expect_label()
             return ast.LabelPredicate(variable=left.name, label=label_tok.value or "")
 
         # Binary comparisons

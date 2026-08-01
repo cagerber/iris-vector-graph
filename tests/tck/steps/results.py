@@ -4,13 +4,14 @@ import re
 from behave import then, step
 
 from tests.tck.steps.comparison import TCKValue, TCKResultTable
+from iris_vector_graph.cypher.parser import CypherParseError
 
 ERROR_TYPE_MAP: dict[str, tuple[type, ...]] = {
     "TypeError": (TypeError,),
     "ArgumentError": (ValueError,),
     "EntityNotFound": (KeyError,),
     "SemanticError": (Exception,),
-    "SyntaxError": (SyntaxError,),
+    "SyntaxError": (SyntaxError, CypherParseError),
     "ProcedureError": (Exception,),
     "ParameterMissing": (KeyError, TypeError),
     "ConstraintVerificationFailed": (Exception,),

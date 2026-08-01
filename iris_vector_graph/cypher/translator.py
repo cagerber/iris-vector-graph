@@ -1656,7 +1656,19 @@ def _create_node_from_alias(node, node_id_expr, var_alias, context):
 def _create_clause_node_entry(node, context):
     if node.variable and node.variable in context.variable_aliases:
         return
-    node_id_expr = node.properties.get("id") or node.properties.get("node_id")
+    _raw_id = node.properties.get("id") or node.properties.get("node_id")
+    # Only use the id/node_id property as the node identifier when it resolves to a string.
+    # Integer literals are user-defined property values, not IVG node identifiers.
+    node_id_expr = None
+    _id_is_user_property = False
+    if _raw_id is not None:
+        if isinstance(_raw_id, ast.Literal) and isinstance(_raw_id.value, str):
+            node_id_expr = _raw_id
+        elif isinstance(_raw_id, ast.Variable):
+            node_id_expr = _raw_id
+        else:
+            # Integer or other non-string literal: treat as a regular user property
+            _id_is_user_property = True
     if node_id_expr is None:
         import uuid as _uuid
         generated_id = str(_uuid.uuid4())
@@ -1681,6 +1693,11 @@ def _create_clause_node_entry(node, context):
         _create_node_literal(node, node_id_expr, context)
     if node.variable:
         context.register_variable(node.variable)
+        if _id_is_user_property:
+            # Track that this variable uses 'id' as a regular rdf_props entry, not node_id
+            if not hasattr(context, '_id_as_property_vars'):
+                context._id_as_property_vars = set()
+            context._id_as_property_vars.add(node.variable)
         if not context.from_clauses and isinstance(node_id_expr, ast.Literal):
             node_id_val = node_id_expr.value
             alias = context.variable_aliases[node.variable]
@@ -1710,9 +1727,19 @@ def _create_clause_resolve_node_id(id_expr, node, context):
 
 
 def _create_clause_relationship_entry(rel, i, pat, context):
-    source_node, target_node = pat.nodes[i], pat.nodes[i + 1]
+    left_node, right_node = pat.nodes[i], pat.nodes[i + 1]
+    # For INCOMING direction ((:A)<-[:R]-(:B)), the right node is the edge source.
+    if rel.direction == ast.Direction.INCOMING:
+        source_node, target_node = right_node, left_node
+    else:
+        source_node, target_node = left_node, right_node
+
     s_id_expr = source_node.properties.get("id") or source_node.properties.get("node_id")
     t_id_expr = target_node.properties.get("id") or target_node.properties.get("node_id")
+    if s_id_expr is not None and isinstance(s_id_expr, ast.Literal) and not isinstance(s_id_expr.value, str):
+        s_id_expr = None
+    if t_id_expr is not None and isinstance(t_id_expr, ast.Literal) and not isinstance(t_id_expr.value, str):
+        t_id_expr = None
 
     s_id = _create_clause_resolve_node_id(s_id_expr, source_node, context)
     t_id = _create_clause_resolve_node_id(t_id_expr, target_node, context)
@@ -1765,6 +1792,29 @@ def _create_clause_relationship_entry(rel, i, pat, context):
 
 def translate_create_clause(create, context, metadata):
     for pat in create.patterns:
+        # Validate before any DML: VariableAlreadyBound, syntax errors
+        is_relationship_pattern = bool(pat.relationships)
+        for node in pat.nodes:
+            if node.variable and node.variable in context.variable_aliases:
+                # VariableAlreadyBound: re-binding a known variable in CREATE is an error
+                # if it adds new labels/props, or if it appears as a standalone CREATE (no rel).
+                if node.labels or node.properties or not is_relationship_pattern:
+                    raise SyntaxError(
+                        f"VariableAlreadyBound: variable '{node.variable}' already bound"
+                    )
+        for rel in pat.relationships:
+            if rel.variable and rel.variable in context.variable_aliases:
+                raise SyntaxError(
+                    f"VariableAlreadyBound: variable '{rel.variable}' already bound"
+                )
+            if not rel.types:
+                raise SyntaxError("NoSingleRelationshipType: CREATE relationship must have exactly one type")
+            if len(rel.types) > 1:
+                raise SyntaxError("NoSingleRelationshipType: CREATE relationship must have exactly one type")
+            if rel.direction == ast.Direction.BOTH:
+                raise SyntaxError("RequiresDirectedRelationship: CREATE relationship must be directed")
+            if rel.variable_length is not None:
+                raise SyntaxError("CreatingVarLength: variable-length relationships cannot be used in CREATE")
         for node in pat.nodes:
             _create_clause_node_entry(node, context)
         for i, rel in enumerate(pat.relationships):
@@ -2209,6 +2259,39 @@ def translate_subquery_call(
 
 def translate_node_pattern(node, context, metadata, optional=False):
     if node.variable and node.variable in context.variable_aliases:
+        # Node already registered (e.g. as far-end of a relationship JOIN), but
+        # labels and properties declared on this node pattern still need to be
+        # applied as filter JOINs against the already-registered alias.
+        if node.labels or node.properties:
+            alias = context.variable_aliases[node.variable]
+            jt = "LEFT OUTER JOIN" if optional else "JOIN"
+            for label in node.labels:
+                l_alias = context.next_alias("l")
+                context.join_clauses.append(
+                    f"{jt} {_table('rdf_labels')} {l_alias} ON {l_alias}.s = {alias}.node_id AND {l_alias}.label = {context.add_join_param(label)}"
+                )
+                if not optional:
+                    context.where_conditions.append(f"{l_alias}.s IS NOT NULL")
+            for k, v in node.properties.items():
+                val_sql = translate_expression(v, context, segment="where")
+                if k in ("node_id", "id"):
+                    context.where_conditions.append(f"{alias}.node_id = {val_sql}")
+                else:
+                    if not optional:
+                        context.where_conditions.append(
+                            TranslationContext._structural_guard_sql(alias, k)
+                        )
+                    p_alias = context.next_alias("p")
+                    context.join_clauses.append(
+                        f"{jt} {_table('rdf_props')} {p_alias} "
+                        f'ON {p_alias}.s = {alias}.node_id AND {p_alias}."key" = {context.add_join_param(k)}'
+                    )
+                    if optional:
+                        context.where_conditions.append(
+                            f"({p_alias}.s IS NULL OR {p_alias}.val = {val_sql})"
+                        )
+                    else:
+                        context.where_conditions.append(f"{p_alias}.val = {val_sql}")
         return
     alias = (
         context.register_variable(node.variable)
@@ -3243,7 +3326,10 @@ def _expr_property_reference(expr, context, segment):
     if alias.startswith("e") and not alias.startswith("ES_"):
         return _expr_propref_edge_alias(expr, context, alias)
     if expr.property_name in ("node_id", "id"):
-        return f"{alias}.node_id"
+        # Use node_id shortcut unless this variable's 'id' is a regular user property
+        id_as_prop = getattr(context, '_id_as_property_vars', set())
+        if expr.variable not in id_as_prop:
+            return f"{alias}.node_id"
     if segment == "where":
         context.where_conditions.append(
             TranslationContext._structural_guard_sql(alias, expr.property_name)

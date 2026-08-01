@@ -57,12 +57,36 @@ def step_procedure_exists(context, procedure_sig):
     context.scenario.skip(reason="procedure registration not supported")
 
 
+def _extract_match_bound_vars(query: str) -> set:
+    """Extract variable names bound in MATCH clauses (not in CREATE)."""
+    import re
+    bound = set()
+    in_match = False
+    for line in query.split('\n'):
+        stripped = line.strip().upper()
+        first_word = stripped.split()[0] if stripped.split() else ''
+        if first_word in ('MATCH', 'OPTIONAL'):
+            in_match = True
+        elif first_word in ('CREATE', 'MERGE', 'WITH', 'RETURN', 'WHERE',
+                            'ORDER', 'SKIP', 'LIMIT', 'UNWIND', 'SET',
+                            'DELETE', 'REMOVE', 'CALL', 'UNION'):
+            in_match = False
+        if in_match:
+            # Extract variable names from node patterns: (varname ...) or (varname)
+            for m in re.finditer(r'\(([A-Za-z_][A-Za-z0-9_]*)', line):
+                bound.add(m.group(1))
+    return bound
+
+
 def _inject_label(query: str, label: str) -> str:
     """
     Inject isolation label into ALL node patterns in CREATE/MERGE clauses.
     Injects into every node (including relationship endpoints) since all
     newly created nodes need the label for teardown.
+    Skips MATCH-bound variables used as relationship endpoints in CREATE —
+    they don't create new nodes and adding labels would trigger VariableAlreadyBound.
     """
+    match_bound = _extract_match_bound_vars(query)
     lines = query.split('\n')
     result_lines = []
     in_create = False
@@ -78,13 +102,18 @@ def _inject_label(query: str, label: str) -> str:
             in_create = False
 
         if in_create:
-            line = _inject_all_nodes(line, label)
+            line = _inject_all_nodes(line, label, skip_vars=match_bound)
         result_lines.append(line)
     return '\n'.join(result_lines)
 
 
-def _inject_all_nodes(line: str, label: str) -> str:
-    """Add :<label> to every node pattern in a line."""
+def _inject_all_nodes(line: str, label: str, skip_vars: set = None) -> str:
+    """Add :<label> to every node pattern in a line.
+
+    skip_vars: variable names to skip (e.g. MATCH-bound vars used as CREATE endpoints).
+    """
+    if skip_vars is None:
+        skip_vars = set()
     result = []
     i = 0
     while i < len(line):
@@ -102,8 +131,11 @@ def _inject_all_nodes(line: str, label: str) -> str:
                         break
 
             inner = line[i+1:end]
-            # Only inject if non-empty (skip anonymous nodes with just whitespace)
-            if inner.strip() and label not in inner:
+            # Extract variable name from inner (before first : or {)
+            inner_stripped = inner.strip()
+            var_name = inner_stripped.split(':')[0].split('{')[0].strip() if inner_stripped else ''
+            # Only inject if non-empty, not already labeled, and not a skip_var
+            if inner.strip() and label not in inner and var_name not in skip_vars:
                 inner = _add_label_to_node(inner, label)
             result.append(f"({inner})")
             i = end + 1
