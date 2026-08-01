@@ -287,7 +287,13 @@ class Parser:
         if self.peek().kind == TokenType.STAR:
             self.eat()
             where_clause = self.parse_where_clause()
-            return ast.WithClause(items=[], distinct=False, where_clause=where_clause, star=True)
+            order_by = self.parse_order_by_clause()
+            skip = self.parse_skip()
+            limit = self.parse_limit()
+            return ast.WithClause(
+                items=[], distinct=False, where_clause=where_clause, star=True,
+                order_by_clause=order_by, skip=skip, limit=limit
+            )
 
         distinct = self.matches(TokenType.DISTINCT)
         items = []
@@ -304,8 +310,14 @@ class Parser:
                 break
 
         where_clause = self.parse_where_clause()
+        order_by = self.parse_order_by_clause()
+        skip = self.parse_skip()
+        limit = self.parse_limit()
 
-        return ast.WithClause(items=items, distinct=distinct, where_clause=where_clause)
+        return ast.WithClause(
+            items=items, distinct=distinct, where_clause=where_clause,
+            order_by_clause=order_by, skip=skip, limit=limit
+        )
 
     def parse_query_part(self) -> ast.QueryPart:
         """Parse a single stage of a query (MATCH... UNWIND... WHERE... UPDATE...)"""

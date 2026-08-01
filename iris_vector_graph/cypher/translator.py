@@ -209,6 +209,14 @@ class TranslationContext:
         self.path_edge_aliases: Dict[str, List[str]] = (
             {} if parent is None else parent.path_edge_aliases.copy()
         )
+        # Maps (pattern_id, relationship_index) → SQL alias for capturing anon rels in named paths
+        self.pattern_rel_aliases: Dict[tuple, str] = (
+            {} if parent is None else parent.pattern_rel_aliases.copy()
+        )
+        # Maps relationship object id() → SQL alias for anonymous relationship lookup
+        self.rel_obj_aliases: Dict[int, str] = (
+            {} if parent is None else parent.rel_obj_aliases.copy()
+        )
         self.var_length_paths: List[dict] = (
             [] if parent is None else parent.var_length_paths
         )
@@ -1226,7 +1234,40 @@ def _to_sql_handle_foreach(clause, context: TranslationContext, metadata) -> boo
 
 def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=None) -> None:
     translate_with_clause(part.with_clause, context)
+
+    # Preprocess ORDER BY items for the WITH clause (before build_stage_sql so joins are included)
+    order_by_items = []
+    if part.with_clause.order_by_clause:
+        for item in part.with_clause.order_by_clause.items:
+            try:
+                expr = translate_expression(item.expression, context, segment="where")
+                order_by_items.append(f"{expr} {'ASC' if item.ascending else 'DESC'}")
+            except Exception:
+                pass
+
     sql, stage_params = context.build_stage_sql(part.with_clause.distinct)
+
+    # Apply ORDER BY, SKIP, LIMIT from the WITH clause (if present)
+    if order_by_items or part.with_clause.limit is not None or part.with_clause.skip is not None:
+        # Apply pagination: ORDER BY, SKIP, LIMIT
+        if order_by_items:
+            sql += f"\nORDER BY {', '.join(order_by_items)}"
+
+        # Handle LIMIT and SKIP within the CTE
+        limit = _resolve_pagination_value(part.with_clause.limit, context)
+        skip = _resolve_pagination_value(part.with_clause.skip, context)
+
+        if limit is not None or skip is not None:
+            if limit is not None and skip is not None:
+                # Both SKIP and LIMIT: use OFFSET FETCH
+                sql += f"\nOFFSET {skip} ROWS FETCH FIRST {limit} ROWS ONLY"
+            elif limit is not None:
+                # LIMIT only: use FETCH FIRST
+                sql += f"\nFETCH FIRST {limit} ROWS ONLY"
+            elif skip is not None:
+                # SKIP only: use OFFSET
+                sql += f"\nOFFSET {skip} ROWS"
+
     context.all_stage_params.extend(stage_params)
     context.stages.append(f"Stage{i + 1} AS (\n{sql}\n)")
     context.having_conditions = []
@@ -2546,10 +2587,16 @@ def translate_match_clause(match_clause, context, metadata):
             context.variable_aliases.get(n.variable, f"n{i}")
             for i, n in enumerate(np.pattern.nodes)
         ]
-        edge_aliases = [
-            context.variable_aliases.get(r.variable, f"e{i}")
-            for i, r in enumerate(np.pattern.relationships)
-        ]
+        # For relationships: first try the variable alias, then look up by object id
+        edge_aliases = []
+        for i, r in enumerate(np.pattern.relationships):
+            if r.variable:
+                # Named relationship: use its registered alias
+                alias = context.variable_aliases.get(r.variable, f"e{i}")
+            else:
+                # Anonymous relationship: look up by object id from _trp_setup_aliases tracking
+                alias = context.rel_obj_aliases.get(id(r), f"e{i}")
+            edge_aliases.append(alias)
         context.path_node_aliases[np.variable] = node_aliases
         context.path_edge_aliases[np.variable] = edge_aliases
 
@@ -2976,6 +3023,8 @@ def _trp_setup_aliases(rel, source_node, target_node, context):
         if rel.variable
         else context.next_alias("e")
     )
+    # Track relationship object → SQL alias for named path lookup
+    context.rel_obj_aliases[id(rel)] = edge_alias
     return source_alias, target_alias, edge_alias, is_anon_source, is_new_target, is_unbound_src
 
 
@@ -3534,6 +3583,12 @@ def translate_boolean_expression(expr, context) -> str:
                 return "(1=1)"
             if expr.value is False:
                 return "(1=0)"
+        # When a PropertyReference is used directly in a boolean context,
+        # convert it to a proper boolean comparison. IVG stores booleans as '1'/'0'.
+        if isinstance(expr, ast.PropertyReference):
+            prop_expr = translate_expression(expr, context, segment="where")
+            # Convert VARCHAR '1'/'0' to boolean: property = '1'
+            return f"({prop_expr} = '1')"
         return translate_expression(expr, context, segment="where")
     op = expr.operator
     logical = _boolean_expr_logical(op, expr, context)
@@ -4246,7 +4301,13 @@ def _expr_fn_path_funcs(fn, expr, context):
         return f"JSON_ARRAY({', '.join(f'{a}.node_id' for a in aliases)})"
     else:
         aliases = context.path_edge_aliases[path_var]
-        return f"JSON_ARRAY({', '.join(f'{a}.p' for a in aliases)})"
+        undirected_aliases = getattr(context, "_undirected_aliases", set())
+        rel_refs = []
+        for a in aliases:
+            # Use _p for bidirectional (undirected) edges, p for directed edges
+            col = "_p" if a in undirected_aliases else "p"
+            rel_refs.append(f"{a}.{col}")
+        return f"JSON_ARRAY({', '.join(rel_refs)})"
 
 
 def _expr_fn_vector_ops(fn, args_exprs, args, context):
@@ -4567,7 +4628,13 @@ def translate_return_clause(ret, context):
                 node_aliases = context.path_node_aliases[var_name]
                 edge_aliases = context.path_edge_aliases[var_name]
                 nodes_arr = ", ".join(f"{a}.node_id" for a in node_aliases)
-                rels_arr = ", ".join(f"{a}.p" for a in edge_aliases)
+                # Use _p for bidirectional (undirected) edges, p for directed edges
+                undirected_aliases = getattr(context, "_undirected_aliases", set())
+                rels_parts = []
+                for a in edge_aliases:
+                    col = "_p" if a in undirected_aliases else "p"
+                    rels_parts.append(f"{a}.{col}")
+                rels_arr = ", ".join(rels_parts)
                 json_expr = f"'{{\"nodes\":' || JSON_ARRAY({nodes_arr}) || ',\"rels\":' || JSON_ARRAY({rels_arr}) || '}}'"
                 context.select_items.append(f"{json_expr} AS {_safe_alias(alias)}")
                 continue
@@ -4606,7 +4673,11 @@ def translate_return_clause(ret, context):
             elif isinstance(
                 item.expression, (ast.AggregationFunction, ast.FunctionCall)
             ):
+                # For function calls (e.g., labels(a), count(*)), use cypher_text as the actual column name
+                cypher_text = _expr_to_cypher_text(item.expression)
                 alias = f"{item.expression.function_name}_res"
+                if cypher_text and cypher_text != alias:
+                    context.column_name_map[alias] = cypher_text
             else:
                 cypher_text = _expr_to_cypher_text(item.expression)
                 if cypher_text:

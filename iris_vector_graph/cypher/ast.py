@@ -267,6 +267,9 @@ class WithClause:
     distinct: bool = False
     where_clause: Optional[WhereClause] = None
     star: bool = False
+    order_by_clause: Optional['OrderByClause'] = None
+    skip: Optional[Union[int, 'Variable']] = None
+    limit: Optional[Union[int, 'Variable']] = None
 
 
 @dataclass(slots=True)
