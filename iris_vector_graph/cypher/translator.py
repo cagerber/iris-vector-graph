@@ -3612,16 +3612,29 @@ def _boolean_expr_logical(op, expr, context):
         # Three-value AND: if any operand is definitively false, result is false
         if "(1=0)" in parts:
             return "(1=0)"
-        combined = "(" + " AND ".join(parts) + ")"
-        if has_null:
-            # null AND (all true parts) = null
-            # null AND (any false part) = false — handled above
-            # If all non-null parts are literals that are true, result is null
-            all_true = all(p == "(1=1)" for p in parts)
-            if all_true:
+        # Unwrap nested nullable CASE WHEN parts (produced by inner 3VL AND/OR):
+        # "CASE WHEN NOT (cond) THEN (1=0) ELSE NULL END" means: false if NOT cond, else NULL.
+        # For AND, we need cond to hold (it's already nullable → mark has_null).
+        # "CASE WHEN (cond) THEN (1=1) ELSE NULL END" means: true if cond, else NULL.
+        import re as _re_and
+        unwrapped = []
+        for p in parts:
+            m_not = _re_and.match(r'^CASE WHEN NOT \((.+)\) THEN \(1=0\) ELSE NULL END$', p)
+            if m_not:
+                has_null = True
+                unwrapped.append(m_not.group(1))
+            else:
+                unwrapped.append(p)
+        parts = unwrapped
+        # Simplify: filter out always-true sentinels (they don't affect AND result)
+        non_trivial = [p for p in parts if p != "(1=1)"]
+        if not non_trivial:
+            # All parts are literal true
+            if has_null:
                 return "NULL"
-            # Mixed variable/unknown parts: use CASE WHEN to preserve 3VL without bare NULL
-            # CASE WHEN (parts_false) THEN (1=0) ELSE NULL END
+            return "(1=1)"
+        combined = "(" + " AND ".join(non_trivial) + ")"
+        if has_null:
             return f"CASE WHEN NOT ({combined}) THEN (1=0) ELSE NULL END"
         return combined
     if op == ast.BooleanOperator.OR:
@@ -3645,13 +3658,26 @@ def _boolean_expr_logical(op, expr, context):
             return "NULL" if has_null_or else "(1=0)"
         if "(1=1)" in parts_or:
             return "(1=1)"
-        combined_or = "(" + " OR ".join(parts_or) + ")"
-        if has_null_or:
-            # null OR true = true (handled above); null OR false = null
-            all_false = all(p == "(1=0)" for p in parts_or)
-            if all_false:
+        # Unwrap nested nullable CASE WHEN parts from inner 3VL AND/OR:
+        import re as _re_or
+        unwrapped_or = []
+        for p in parts_or:
+            m_or = _re_or.match(r'^CASE WHEN \((.+)\) THEN \(1=1\) ELSE NULL END$', p)
+            if m_or:
+                has_null_or = True
+                unwrapped_or.append(m_or.group(1))
+            else:
+                unwrapped_or.append(p)
+        parts_or = unwrapped_or
+        # Simplify: filter out always-false sentinels (they don't affect OR result)
+        non_trivial_or = [p for p in parts_or if p != "(1=0)"]
+        if not non_trivial_or:
+            # All parts are literal false
+            if has_null_or:
                 return "NULL"
-            # Mixed: CASE WHEN (any true) THEN (1=1) ELSE NULL END
+            return "(1=0)"
+        combined_or = "(" + " OR ".join(non_trivial_or) + ")"
+        if has_null_or:
             return f"CASE WHEN ({combined_or}) THEN (1=1) ELSE NULL END"
         return combined_or
     if op == ast.BooleanOperator.XOR:
@@ -4755,10 +4781,19 @@ def _expr_boolean(expr, context, segment):
     # the result must also be NULL (Cypher three-valued logic).
     if cond == "NULL":
         return "NULL"
+    # Sentinel booleans from 3VL logic — return as integer literals
+    if cond == "(1=1)":
+        return "1"
+    if cond == "(1=0)":
+        return "0"
     # If translate_boolean_expression already returned a 1/0/NULL CASE expression
-    # (e.g. for IN with null list elements), don't wrap it again.
-    if cond.startswith("CASE WHEN ") and (" THEN 1 ELSE NULL END" in cond or " THEN 1 ELSE 0 END" in cond):
-        return cond
+    # (e.g. for IN with null list elements, or 3VL AND/OR), don't wrap it again.
+    # Also handle 3VL CASE WHEN patterns with (1=0)/(1=1) that need integer normalization.
+    if cond.startswith("CASE WHEN ") and " END" in cond:
+        # Replace (1=0) and (1=1) sentinels with integers in the CASE WHEN body
+        cond = cond.replace("THEN (1=0)", "THEN 0").replace("THEN (1=1)", "THEN 1")
+        if " THEN 1 ELSE NULL END" in cond or " THEN 0 ELSE NULL END" in cond or " THEN 1 ELSE 0 END" in cond:
+            return cond
     return f"CASE WHEN ({cond}) THEN 1 ELSE 0 END"
 
 

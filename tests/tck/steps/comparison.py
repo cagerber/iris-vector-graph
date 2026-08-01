@@ -454,7 +454,9 @@ def normalise_iris_value(iris_val: Any, expected_tck_val: Any) -> Any:
         return float(iris_val)
     if isinstance(expected_tck_val, bool):
         if isinstance(iris_val, str):
-            return iris_val.lower() == "true"
+            return iris_val.lower() in ("true", "1")
+        if isinstance(iris_val, int):
+            return iris_val != 0
         return bool(iris_val)
     if isinstance(expected_tck_val, int) and not isinstance(expected_tck_val, bool):
         if isinstance(iris_val, str):
