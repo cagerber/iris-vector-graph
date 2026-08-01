@@ -3580,6 +3580,12 @@ def _format_invalid_type(operand):
 
 
 
+def _coerce_varchar_boolean_if_needed(operand, translated_sql, context) -> str:
+    if isinstance(operand, ast.Variable) and operand.name in context.scalar_variables:
+        return f"(({translated_sql} = '1' OR {translated_sql} = 'true'))"
+    return translated_sql
+
+
 def _boolean_expr_logical(op, expr, context):
     if op == ast.BooleanOperator.AND:
         # Type validation: AND requires boolean operands
@@ -3595,6 +3601,7 @@ def _boolean_expr_logical(op, expr, context):
             if _is_temporal_ts_condition(o, context):
                 continue
             p = translate_boolean_expression(o, context)
+            p = _coerce_varchar_boolean_if_needed(o, p, context)
             if p == "NULL":
                 has_null = True
             else:
@@ -3629,6 +3636,7 @@ def _boolean_expr_logical(op, expr, context):
         has_null_or = False
         for o in expr.operands:
             p = translate_boolean_expression(o, context)
+            p = _coerce_varchar_boolean_if_needed(o, p, context)
             if p == "NULL":
                 has_null_or = True
             else:
@@ -3656,7 +3664,9 @@ def _boolean_expr_logical(op, expr, context):
             )
         a, b = expr.operands[0], expr.operands[1]
         sa = translate_boolean_expression(a, context)
+        sa = _coerce_varchar_boolean_if_needed(a, sa, context)
         sb = translate_boolean_expression(b, context)
+        sb = _coerce_varchar_boolean_if_needed(b, sb, context)
         if sa == "NULL" or sb == "NULL":
             return "NULL"
         return f"(({sa} AND NOT ({sb})) OR (NOT ({sa}) AND {sb}))"
@@ -3677,7 +3687,9 @@ def _boolean_expr_logical(op, expr, context):
                 and operand.operator == ast.BooleanOperator.NOT
                 and len(operand.operands) == 1):
             return translate_boolean_expression(operand.operands[0], context)
-        return f"NOT ({translate_boolean_expression(operand, context)})"
+        operand_sql = translate_boolean_expression(operand, context)
+        operand_sql = _coerce_varchar_boolean_if_needed(operand, operand_sql, context)
+        return f"NOT ({operand_sql})"
     return None
 
 
@@ -3742,11 +3754,6 @@ def translate_boolean_expression(expr, context) -> str:
             prop_expr = translate_expression(expr, context, segment="where")
             # Convert VARCHAR '1'/'0' to boolean: property = '1'
             return f"({prop_expr} = '1')"
-        # Variable in boolean context — may be VARCHAR 'true'/'false'/'1'/'0' from UNWIND/JSON_TABLE.
-        # Coerce to boolean comparison so IRIS doesn't get CASE WHEN (varchar_col).
-        if isinstance(expr, ast.Variable):
-            var_sql = translate_expression(expr, context, segment="where")
-            return f"({var_sql} IN ('1', 'true', 'TRUE'))"
         return translate_expression(expr, context, segment="where")
     op = expr.operator
     logical = _boolean_expr_logical(op, expr, context)
