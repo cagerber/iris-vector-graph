@@ -87,16 +87,22 @@ def _inject_match_scope(query: str, label: str) -> str:
                             'UNION', 'ORDER', 'SKIP', 'LIMIT'):
             in_match = False
 
-            # Extract variables from WITH clause (e.g., "WITH a, b AS c" binds a, c)
+            # Extract variables from WITH clause.
+            # "WITH a, b AS c" binds: a (passthrough), c (alias). b is expr, not a var.
+            # "WITH n.prop AS p" binds: p only.
             if first_word == 'WITH':
-                # Collect AS aliases and direct variables passed through
-                for m in re.finditer(r'\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)',
-                                     line, re.IGNORECASE):
-                    bound_vars.add(m.group(2))  # AS target is new binding
-                # Also collect non-aliased variables before commas or end of line
-                for m in re.finditer(r'(?:,|\s|^)([A-Za-z_][A-Za-z0-9_]*)(?:\s|,|$)', line):
+                # Collect AS aliases: "expr AS alias" → bind alias
+                has_alias = set()
+                for m in re.finditer(r'\bAS\s+([A-Za-z_][A-Za-z0-9_]*)', line, re.IGNORECASE):
+                    bound_vars.add(m.group(1))
+                    has_alias.add(m.group(1).upper())
+                # Collect bare variable passthroughs: any lone identifier in the WITH list
+                # that is not part of an "expr AS alias" or a property access.
+                # Strategy: strip AS-aliased expressions, then find bare identifiers.
+                without_aliases = re.sub(r'[^,]+\bAS\b[^,]+', '', line, flags=re.IGNORECASE)
+                for m in re.finditer(r'\b([A-Za-z_][A-Za-z0-9_]*)\b', without_aliases):
                     var = m.group(1)
-                    if var.upper() not in ('WITH', 'AS'):
+                    if var.upper() not in ('WITH', 'AS', 'DISTINCT', 'ORDER', 'BY', 'WHERE'):
                         bound_vars.add(var)
 
         if first_word in ('MATCH', 'OPTIONAL'):
