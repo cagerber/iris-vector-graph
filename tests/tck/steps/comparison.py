@@ -97,10 +97,13 @@ class TCKResultTable:
             for row in self.rows
         ]
 
+        # Remap IVG's expanded node columns (var_id, var_labels, var_props) → var
+        remapped_rows = [_remap_node_columns(row, self.columns, actual_columns) for row in actual_rows]
+
         # normalise actual values against expected types
         norm_actual = [
-            _normalise_row(row, expected_rows[i] if i < len(expected_rows) else {}, self.columns)
-            for i, row in enumerate(actual_rows)
+            _normalise_row_with_nodes(row, expected_rows[i] if i < len(expected_rows) else {}, self.columns)
+            for i, row in enumerate(remapped_rows)
         ]
 
         if len(norm_actual) != len(expected_rows):
@@ -129,6 +132,132 @@ class TCKResultTable:
                         f"Full actual (sorted):   {act_sorted}"
                     )
             return None
+
+
+def _remap_node_columns(actual_row: dict, tck_columns: list[str], actual_columns: list[str]) -> dict:
+    """Collapse IVG's var_id/var_labels/var_props triplets into a single 'var' key.
+
+    IVG expands RETURN n into n_id, n_labels, n_props columns.
+    TCK expects a single 'n' column with node pattern notation.
+    This function detects the expansion and collapses it back to a NodeData dict.
+    """
+    result = dict(actual_row)
+    for col in tck_columns:
+        id_key = f"{col}_id"
+        labels_key = f"{col}_labels"
+        props_key = f"{col}_props"
+        if id_key in actual_columns and labels_key in actual_columns and props_key in actual_columns:
+            result[col] = {
+                "_id": actual_row.get(id_key),
+                "_labels": actual_row.get(labels_key),
+                "_props": actual_row.get(props_key),
+            }
+    return result
+
+
+def _parse_node_pattern(s: str) -> dict | None:
+    """Parse TCK node pattern like (:A), (:B {name: 'x'}) into a dict.
+
+    Returns None if s is not a node pattern.
+    """
+    s = s.strip()
+    if not (s.startswith("(") and s.endswith(")")):
+        return None
+    inner = s[1:-1].strip()
+    # inner may be empty, :Label, :Label {props}, var:Label, var {props}
+    labels: list[str] = []
+    props: dict = {}
+    # extract variable name (no colon at start)
+    if inner and not inner.startswith(":"):
+        # variable name up to ':' or ' ' or '{'
+        end = 0
+        while end < len(inner) and inner[end] not in (":", " ", "{"):
+            end += 1
+        inner = inner[end:].lstrip()
+    # extract labels (:A:B...)
+    while inner.startswith(":"):
+        inner = inner[1:]
+        end = 0
+        while end < len(inner) and inner[end] not in (":", " ", "{"):
+            end += 1
+        labels.append(inner[:end])
+        inner = inner[end:].lstrip()
+    # extract props {k: v}
+    if inner.startswith("{") and inner.endswith("}"):
+        props = _parse_tck_value(inner)
+    return {"labels": labels, "props": props}
+
+
+def _node_matches(node_data: dict, pattern: dict, isolation_label: str | None = None) -> bool:
+    """Check if an IVG node data dict matches a TCK node pattern dict."""
+    raw_labels = node_data.get("_labels", "[]")
+    if isinstance(raw_labels, str):
+        import json
+        try:
+            actual_labels_list = json.loads(raw_labels)
+        except (json.JSONDecodeError, ValueError):
+            actual_labels_list = []
+    else:
+        actual_labels_list = list(raw_labels) if raw_labels else []
+
+    # strip isolation label(s) — any TCK_* label
+    actual_labels = {lbl for lbl in actual_labels_list if not lbl.startswith("TCK_")}
+
+    expected_labels = set(pattern["labels"])
+    if not expected_labels.issubset(actual_labels):
+        return False
+
+    expected_props = pattern.get("props") or {}
+    raw_props = node_data.get("_props", "[]")
+    if isinstance(raw_props, str):
+        import json
+        try:
+            props_list = json.loads(raw_props)
+        except (json.JSONDecodeError, ValueError):
+            props_list = []
+    else:
+        props_list = list(raw_props) if raw_props else []
+
+    # props_list is a list of {key, value} dicts (IVG EAV format)
+    actual_props: dict = {}
+    if isinstance(props_list, list):
+        for item in props_list:
+            if isinstance(item, dict) and "key" in item:
+                actual_props[item["key"]] = item.get("value")
+    elif isinstance(props_list, dict):
+        actual_props = props_list
+
+    for k, v in expected_props.items():
+        if actual_props.get(k) != v:
+            # try string/int normalisation
+            av = actual_props.get(k)
+            if isinstance(v, int) and isinstance(av, str):
+                try:
+                    if int(av) == v:
+                        continue
+                except ValueError:
+                    pass
+            if isinstance(v, str) and isinstance(av, (int, float)):
+                if str(av) == v:
+                    continue
+            return False
+    return True
+
+
+def _normalise_row_with_nodes(actual: dict, expected: dict, columns: list[str]) -> dict:
+    """Normalise actual row values, with special handling for node-format TCK cells."""
+    result = {}
+    for col in columns:
+        aval = actual.get(col)
+        eval_ = expected.get(col)
+        if isinstance(eval_, str):
+            pattern = _parse_node_pattern(eval_)
+            if pattern is not None and isinstance(aval, dict) and "_labels" in aval:
+                # Keep node data as-is; comparison is done in _rows_equal
+                result[col] = aval
+                continue
+        result[col] = normalise_iris_value(aval, eval_)
+    return result
 
 
 def _normalise_row(actual: dict, expected: dict, columns: list[str]) -> dict:
@@ -175,6 +304,16 @@ def _rows_equal(exp: dict, act: dict, columns: list[str], list_unordered: bool) 
     for col in columns:
         ev = exp.get(col)
         av = act.get(col)
+        # Node pattern comparison: TCK expects "(:A)" or "(:B {name: 'x'})"
+        if isinstance(ev, str):
+            pattern = _parse_node_pattern(ev)
+            if pattern is not None:
+                if isinstance(av, dict) and "_labels" in av:
+                    if not _node_matches(av, pattern):
+                        return False
+                    continue
+                # av is not a node dict — mismatch
+                return False
         if list_unordered and isinstance(ev, list) and isinstance(av, list):
             if sorted(str(x) for x in ev) != sorted(str(x) for x in av):
                 return False

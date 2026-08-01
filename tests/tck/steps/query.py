@@ -29,12 +29,17 @@ def step_control_query(context, query=None):
     if query is None:
         query = context.text
     query = query.strip()
-    injected = _inject_label(query, context.scenario_label)
+    injected = _inject_match_scope(
+        _inject_label(query, context.scenario_label),
+        context.scenario_label,
+    )
     params = getattr(context, "params", {}) or {}
+    context.last_error = None
     try:
-        context.engine.execute_cypher(injected, params)
-    except Exception:
-        pass
+        context.last_result = context.engine.execute_cypher(injected, params)
+    except Exception as exc:
+        context.last_result = None
+        context.last_error = exc
     context.params = {}
 
 
