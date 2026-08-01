@@ -225,10 +225,16 @@ def _node_matches(node_data: dict, pattern: dict, isolation_label: str | None = 
     else:
         props_list = list(raw_props) if raw_props else []
 
-    # props_list is a list of {key, value} dicts (IVG EAV format)
+    # props_list is a list of {key, value} dicts OR JSON-encoded strings of same
     actual_props: dict = {}
     if isinstance(props_list, list):
         for item in props_list:
+            if isinstance(item, str):
+                import json as _j
+                try:
+                    item = _j.loads(item)
+                except (json.JSONDecodeError, ValueError):
+                    pass
             if isinstance(item, dict) and "key" in item:
                 actual_props[item["key"]] = item.get("value")
     elif isinstance(props_list, dict):

@@ -105,6 +105,17 @@ def _teardown_label(context, label: str):
         context.engine.execute_cypher(
             f"MATCH (n:{label}) DETACH DELETE n", {}
         )
+    # Clean up orphaned nodes (no labels) left by anonymous CREATE endpoints
+    # in main test queries that weren't given the isolation label.
+    with contextlib.suppress(Exception):
+        store = getattr(context.engine, "_store", None)
+        if store and hasattr(store, "conn"):
+            cursor = store.conn.cursor()
+            cursor.execute(
+                "DELETE FROM SQLUser.nodes WHERE node_id NOT IN "
+                "(SELECT DISTINCT s FROM SQLUser.rdf_labels)"
+            )
+            store.conn.commit()
 
 
 def _ensure_named_graph(context, graph_name: str, label: str):

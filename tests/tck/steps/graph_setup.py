@@ -58,7 +58,11 @@ def step_procedure_exists(context, procedure_sig):
 
 
 def _extract_match_bound_vars(query: str) -> set:
-    """Extract variable names bound in MATCH clauses (not in CREATE)."""
+    """Extract variable names bound in MATCH or WITH clauses (not in CREATE).
+
+    Includes WITH aliases like 'n AS a' so that CREATE (a)-[:T]->(b) does not
+    re-inject the isolation label onto already-bound variables.
+    """
     import re
     bound = set()
     in_match = False
@@ -67,10 +71,15 @@ def _extract_match_bound_vars(query: str) -> set:
         first_word = stripped.split()[0] if stripped.split() else ''
         if first_word in ('MATCH', 'OPTIONAL'):
             in_match = True
-        elif first_word in ('CREATE', 'MERGE', 'WITH', 'RETURN', 'WHERE',
+        elif first_word in ('CREATE', 'MERGE', 'RETURN', 'WHERE',
                             'ORDER', 'SKIP', 'LIMIT', 'UNWIND', 'SET',
                             'DELETE', 'REMOVE', 'CALL', 'UNION'):
             in_match = False
+        elif first_word == 'WITH':
+            in_match = False
+            # Collect all aliases introduced by WITH: "expr AS alias"
+            for m in re.finditer(r'\bAS\s+([A-Za-z_][A-Za-z0-9_]*)', line, re.IGNORECASE):
+                bound.add(m.group(1))
         if in_match:
             # Extract variable names from node patterns: (varname ...) or (varname)
             for m in re.finditer(r'\(([A-Za-z_][A-Za-z0-9_]*)', line):
@@ -78,12 +87,17 @@ def _extract_match_bound_vars(query: str) -> set:
     return bound
 
 
-def _inject_label(query: str, label: str) -> str:
+def _inject_label(query: str, label: str, inject_anonymous: bool = True) -> str:
     """
-    Inject isolation label into ALL node patterns in CREATE/MERGE clauses.
-    Injects into every node (including relationship endpoints) since all
-    newly created nodes need the label for teardown.
-    Skips MATCH-bound variables used as relationship endpoints in CREATE —
+    Inject isolation label into node patterns in CREATE/MERGE clauses.
+
+    inject_anonymous: if True (default, for setup queries), also label anonymous
+    nodes () so teardown can clean them.  If False (for main test queries),
+    anonymous endpoint nodes are NOT labeled — this prevents them from polluting
+    Stage1 CTE scans that query by the isolation label.  Orphaned anonymous
+    nodes are cleaned up by _teardown_orphaned_nodes.
+
+    Skips MATCH-bound variables and WITH aliases used as CREATE endpoints —
     they don't create new nodes and adding labels would trigger VariableAlreadyBound.
     """
     match_bound = _extract_match_bound_vars(query)
@@ -102,15 +116,18 @@ def _inject_label(query: str, label: str) -> str:
             in_create = False
 
         if in_create:
-            line = _inject_all_nodes(line, label, skip_vars=match_bound)
+            line = _inject_all_nodes(line, label, skip_vars=match_bound,
+                                     inject_anonymous=inject_anonymous)
         result_lines.append(line)
     return '\n'.join(result_lines)
 
 
-def _inject_all_nodes(line: str, label: str, skip_vars: set = None) -> str:
+def _inject_all_nodes(line: str, label: str, skip_vars: set = None,
+                      inject_anonymous: bool = True) -> str:
     """Add :<label> to every node pattern in a line.
 
     skip_vars: variable names to skip (e.g. MATCH-bound vars used as CREATE endpoints).
+    inject_anonymous: if False, skip anonymous () nodes (no variable name).
     """
     if skip_vars is None:
         skip_vars = set()
@@ -134,9 +151,13 @@ def _inject_all_nodes(line: str, label: str, skip_vars: set = None) -> str:
             # Extract variable name from inner (before first : or {)
             inner_stripped = inner.strip()
             var_name = inner_stripped.split(':')[0].split('{')[0].strip() if inner_stripped else ''
-            # Only inject if non-empty, not already labeled, and not a skip_var
-            if inner.strip() and label not in inner and var_name not in skip_vars:
-                inner = _add_label_to_node(inner, label)
+            # Inject label unless: already labeled, a skip_var, or truly anonymous (empty
+            # inner) when inject_anonymous is disabled.  Nodes with labels but no var
+            # name — e.g. (:A) — are not anonymous and always get the isolation label.
+            is_truly_anonymous = not inner.strip()
+            if label not in inner and var_name not in skip_vars:
+                if not is_truly_anonymous or inject_anonymous:
+                    inner = _add_label_to_node(inner, label)
             result.append(f"({inner})")
             i = end + 1
         else:

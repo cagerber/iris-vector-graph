@@ -248,12 +248,13 @@ class IRISGraphEngine(RdfExportMixin, ShaclMixin, ProvMixin, TemporalMixin, Snap
                     "'CREATE TABLE ivg_ff_probe_b (sid VARCHAR(64))']:\n"
                     "    try: cur.execute(d)\n"
                     "    except Exception: pass\n"
+                    "cur.execute('SELECT id FROM ivg_ff_probe_a FETCH FIRST 0 ROWS ONLY'); cur.fetchall()\n"
                     "cur.execute('SELECT a.id FROM ivg_ff_probe_a a JOIN ivg_ff_probe_b b "
                     "ON b.sid=a.id FETCH FIRST 1 ROWS ONLY'); cur.fetchall()\n"
                     "print('OK')\n"
                 )
                 r = subprocess.run([sys.executable, "-c", script],
-                                   capture_output=True, text=True, timeout=60)
+                                   capture_output=True, text=True, timeout=5)
                 if r.returncode in (-11, 139, -6, 134):
                     logger.warning(
                         "IRIS build SIGSEGVs in %%qaqpre on FETCH FIRST + multi-table JOIN "
@@ -262,20 +263,28 @@ class IRISGraphEngine(RdfExportMixin, ShaclMixin, ProvMixin, TemporalMixin, Snap
                     )
                     return True
                 return False
+            except subprocess.TimeoutExpired:
+                # Probe query hung — IRIS hangs (not SIGSEGV) on FETCH FIRST + JOIN.
+                # This build is also unsafe; mark it and fall through to warn.
+                logger.warning(
+                    "IRIS FETCH FIRST + multi-table JOIN probe hung (timeout); "
+                    "marking build as fetch-first-unsafe and using TOP/ROW_NUMBER instead."
+                )
+                return True
             except Exception as e:
                 logger.debug("fetch-first probe failed, falling back to version check: %s", e)
         # Fallback: $ZVERSION check (no crash risk) when a subprocess probe is not
         # possible (e.g. embedded context with no stored connection params). The bug
-        # has been observed on the IRIS "AI" build line (2026.2.0AI build 161 and
-        # 2026.3.0AI build 106); treat AI builds as unsafe conservatively. Non-AI
-        # builds are assumed safe (FETCH FIRST retained). If a future build fixes it,
-        # this fallback can be narrowed — the subprocess probe remains authoritative.
+        # affects IRIS "AI" builds (2026.2.0AI build 161, 2026.3.0AI build 106) AND
+        # IRIS 2026.1 community (Build 234U). Treat all 2026.x builds as unsafe
+        # conservatively. If a future 2026 build fixes it, the subprocess probe
+        # (which runs a live behavioral check) remains authoritative.
         try:
             cur = self.conn.cursor()
             cur.execute("SELECT $ZVERSION")
             ver = str(cur.fetchone()[0])
             import re as _re
-            if _re.search(r"20\d\d\.\d+\.\d+AI", ver):
+            if _re.search(r"2026\.", ver):
                 return True
         except Exception:
             pass

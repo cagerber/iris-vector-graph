@@ -11,7 +11,7 @@ def step_executing_query(context, query=None):
         query = context.text
     query = query.strip()
     injected = _inject_match_scope(
-        _inject_label(query, context.scenario_label),
+        _inject_label(query, context.scenario_label, inject_anonymous=False),
         context.scenario_label,
     )
     params = getattr(context, "params", {}) or {}
@@ -30,7 +30,7 @@ def step_control_query(context, query=None):
         query = context.text
     query = query.strip()
     injected = _inject_match_scope(
-        _inject_label(query, context.scenario_label),
+        _inject_label(query, context.scenario_label, inject_anonymous=False),
         context.scenario_label,
     )
     params = getattr(context, "params", {}) or {}

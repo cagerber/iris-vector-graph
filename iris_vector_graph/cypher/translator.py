@@ -2160,10 +2160,44 @@ def translate_delete_clause(delete, context, metadata):
         alias = context.variable_aliases.get(var.name)
         if not alias:
             raise SyntaxError(f"Undefined variable: {var.name}")
+
+        # Detect whether the variable is a relationship (edge), taking into account
+        # variables promoted to a CTE stage via WITH.
+        is_edge_var = (
+            alias.startswith("e")
+            or var.name in getattr(context, "edge_stage_variables", set())
+        )
         # When alias is a CTE stage (e.g. "Stage1"), the node_id column is named
         # after the variable (e.g. "n"), not "node_id".
         stage_names = {s.split(" AS ")[0].strip() for s in getattr(context, "stages", [])}
-        node_col = var.name if alias in stage_names else "node_id"
+        is_stage_alias = alias in stage_names
+
+        if is_edge_var and is_stage_alias:
+            # Relationship variable promoted through WITH into a CTE stage.
+            # The Stage SELECT now includes __edge_<var>_s/p/o identity columns;
+            # use them to reconstruct the edge identity for deletion.
+            s_col = f"__edge_{var.name}_s"
+            p_col = f"__edge_{var.name}_p"
+            o_col = f"__edge_{var.name}_o"
+            cte_s, subquery_s, subparams_s = context.build_dml_subquery(
+                select_override=f"SELECT {alias}.{s_col}"
+            )
+            _, subquery_p, _ = context.build_dml_subquery(
+                select_override=f"SELECT {alias}.{p_col}"
+            )
+            _, subquery_o, _ = context.build_dml_subquery(
+                select_override=f"SELECT {alias}.{o_col}"
+            )
+            # All three calls return the same CTE and params (same Stage1 binding).
+            # The CTE appears once in the SQL; params are bound once.
+            context.add_dml(
+                f"{cte_s}DELETE FROM {_table('rdf_edges')} WHERE "
+                f"s IN ({subquery_s}) AND p IN ({subquery_p}) AND o_id IN ({subquery_o})",
+                subparams_s,
+            )
+            return
+
+        node_col = var.name if is_stage_alias else "node_id"
         cte, subquery, subparams = context.build_dml_subquery(
             select_override=f"SELECT {alias}.{node_col}"
         )
@@ -2175,14 +2209,14 @@ def translate_delete_clause(delete, context, metadata):
                 f"{cte}DELETE FROM {_table('rdf_edges')} WHERE s IN ({subquery}) OR o_id IN ({subquery})",
                 dual_params,
             )
-        elif not alias.startswith("e"):
+        elif not is_edge_var:
             # Non-DETACH DELETE: guard against connected nodes (Cypher constraint).
             # Stored as a sentinel SQL so execute_transaction can raise the right error.
             context.add_dml(
                 f"__constraint_check_delete_connected__ {cte}SELECT COUNT(*) FROM {_table('rdf_edges')} WHERE s IN ({subquery}) OR o_id IN ({subquery})",
                 dual_params,
             )
-        if not alias.startswith("e"):
+        if not is_edge_var:
             context.add_dml(
                 f"{cte}DELETE FROM {_table('rdf_labels')} WHERE s IN ({subquery})", subparams
             )
@@ -4525,6 +4559,18 @@ def translate_with_clause(with_clause, context):
             if not hasattr(context, "edge_stage_variables"):
                 context.edge_stage_variables = set()
             context.edge_stage_variables.add(item.expression.name)
+            # Preserve edge identity columns so DELETE can find the original edge row
+            # even after the relationship variable is promoted to a CTE stage.
+            var_name = item.expression.name
+            is_undirected = e_alias in getattr(context, "_undirected_aliases", set())
+            if is_undirected:
+                context.select_items.append(f"{e_alias}._src AS __edge_{var_name}_s")
+                context.select_items.append(f"{e_alias}._p AS __edge_{var_name}_p")
+                context.select_items.append(f"{e_alias}._dst AS __edge_{var_name}_o")
+            else:
+                context.select_items.append(f"{e_alias}.s AS __edge_{var_name}_s")
+                context.select_items.append(f"{e_alias}.p AS __edge_{var_name}_p")
+                context.select_items.append(f"{e_alias}.o_id AS __edge_{var_name}_o")
         context.select_items.append(f"{sql} AS {_safe_alias(alias).replace('.', '_')}")
         if has_agg and not isinstance(item.expression, ast.AggregationFunction):
             context.group_by_items.append(sql)

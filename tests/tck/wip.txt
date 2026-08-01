@@ -104,14 +104,6 @@ features.clauses.call.Call6.Call6 - Call clause interoperation with other clause
 features.clauses.call.Call6.Call6 - Call clause interoperation with other clauses::Scenario: [3] Project procedure results between query scopes with WITH clause and rename the projection
 # reason: IVG stores all values as VARCHAR; 64-bit integer precision lost
 features.clauses.create.Create1.Create1 - Creating nodes::Scenario: [12] CREATE does not lose precision on large integers
-# reason: Stage1 CTE re-evaluates after DML inserts — WITH-CREATE alias scoping
-features.clauses.create.Create3.Create3 - Interoperation with other clauses::Scenario: [5] WITH-CREATE: Nodes are not created when aliases are applied to variable names
-# reason: Stage1 CTE re-evaluates after DML inserts — WITH-CREATE alias scoping
-features.clauses.create.Create3.Create3 - Interoperation with other clauses::Scenario: [6] WITH-CREATE: Only a single node is created when an alias is applied to a variable name
-# reason: Stage1 CTE re-evaluates after DML inserts — WITH-CREATE alias scoping
-features.clauses.create.Create3.Create3 - Interoperation with other clauses::Scenario: [7] WITH-CREATE: Nodes are not created when aliases are applied to variable names multiple times
-# reason: Stage1 CTE re-evaluates after DML inserts — WITH-CREATE alias scoping
-features.clauses.create.Create3.Create3 - Interoperation with other clauses::Scenario: [8] WITH-CREATE: Only a single node is created when an alias is applied to a variable name multiple times
 # reason: multi-hop CREATE — intermediate edges not all generated
 features.clauses.create.Create5.Create5 - Multiple hops create patterns::Scenario: [4] Create a pattern with multiple hops with multiple types and varying directions
 # reason: multi-hop CREATE — intermediate edges not all generated
