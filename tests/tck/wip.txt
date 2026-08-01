@@ -2,6 +2,12 @@
 # Format: feature_file::Scenario: title
 # reason: <why this scenario is @wip>
 # Baseline: 1015/3897 passing as of v2.4.8 + TCK harness fixes (2026-08-01)
+# Current:  ~1099/3897 passing as of round-3 parallel agent fixes (2026-08-01)
+#   clauses: 618 pass (with-orderBy 86 +7, expressions +79, BooleanOperator +74, NOT NOT fold)
+#   expressions: 480 pass / 2136 fail
+#   useCases: 1 pass / 29 fail
+#   Key fixes: BooleanOperator enum attrs, NOT NOT fold, WITH ORDER BY subquery wrap,
+#              ORDER BY alias passthrough, segment=select for ORDER BY params
 
 # reason: IVG does not yet support this scenario
 features.clauses.call.Call1.Call1 - Basic procedure calling::Scenario: [10] In-query call to procedure should fail if too many explicit argument are given

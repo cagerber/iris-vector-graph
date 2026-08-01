@@ -3880,31 +3880,46 @@ def _expr_list_predicate(expr, context, segment):
     var = sanitize_identifier(expr.variable)
     alias = context.next_alias("lp")
     context.variable_aliases[expr.variable] = f"{alias}"
-    pred_sql = translate_expression(expr.predicate, context, segment=segment)
+    # Use translate_boolean_expression for proper SQL predicates — IRIS requires
+    # comparison predicates in WHERE, not CASE WHEN boolean expressions.
+    if isinstance(expr.predicate, ast.BooleanExpression):
+        pred_sql = translate_boolean_expression(expr.predicate, context)
+    else:
+        pred_sql = translate_expression(expr.predicate, context, segment="where")
     del context.variable_aliases[expr.variable]
-    pred_with_alias = pred_sql.replace(
-        f"{alias}.node_id", f"{alias}.{var}"
-    ).replace(f"{alias}.", f"{alias}.")
     pred_with_alias = pred_sql
     for col in ("node_id", "p", "val", "label"):
         pred_with_alias = pred_with_alias.replace(
             f"{alias}.{col}", f"{alias}.{var}"
         )
+    # IRIS WHERE clause needs a comparison predicate, not a bare boolean expression.
+    # Coerce bare 1/0 and bare column references to proper predicates.
+    where_pred = pred_with_alias
+    if where_pred in ("1", "1=1", "TRUE"):
+        where_pred = "1 = 1"
+    elif where_pred in ("0", "1=0", "FALSE"):
+        where_pred = "1 = 0"
+    elif where_pred and not any(op in where_pred for op in ("=", "<", ">", " IN ", " IS ", " LIKE ", " NOT ")):
+        # Bare column reference (e.g. lp0.x) — treat as truth test
+        where_pred = f"{where_pred} = 1"
     count_alias = context.next_alias("lpc")
     inner = (
         f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} VARCHAR(1000) PATH '$')) {alias}"
-        f" WHERE {pred_with_alias}"
+        f" WHERE {where_pred}"
     )
     all_count = f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} VARCHAR(1000) PATH '$')) {count_alias}"
     if expr.quantifier == "all":
-        return f"(({inner}) = ({all_count}))"
-    if expr.quantifier == "any":
-        return f"(({inner}) > 0)"
-    if expr.quantifier == "none":
-        return f"(({inner}) = 0)"
-    if expr.quantifier == "single":
-        return f"(({inner}) = 1)"
-    return f"(({inner}) > 0)"
+        pred = f"(({inner}) = ({all_count}))"
+    elif expr.quantifier == "none":
+        pred = f"(({inner}) = 0)"
+    elif expr.quantifier == "single":
+        pred = f"(({inner}) = 1)"
+    else:  # any
+        pred = f"(({inner}) > 0)"
+    # In SELECT/scalar context IRIS needs a value, not a predicate — wrap in CASE WHEN
+    if segment in ("select", "inline", None):
+        return f"CASE WHEN {pred} THEN 1 ELSE 0 END"
+    return pred
 
 
 def _expr_list_comprehension(expr, context, segment):
