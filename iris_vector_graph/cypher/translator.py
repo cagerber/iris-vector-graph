@@ -3520,8 +3520,45 @@ def _boolean_expr_comparison_ops(op, left, left_expr, right, right_expr) -> Opti
     return None
 
 
+def _get_non_boolean_operand(expr):
+    """Check if expression has non-boolean literal operands and return it."""
+    for operand in expr.operands:
+        if isinstance(operand, ast.Literal):
+            v = operand.value
+            # Boolean and None (null) are valid for AND/OR/XOR/NOT
+            if not (isinstance(v, bool) or v is None):
+                return operand
+        elif isinstance(operand, (ast.MapLiteral, ast.Literal)):
+            # Map literals are not boolean
+            if isinstance(operand, ast.MapLiteral):
+                return operand
+    return None
+
+def _format_invalid_type(operand):
+    """Format error message for invalid operand type."""
+    if isinstance(operand, ast.Literal):
+        v = operand.value
+        type_name = type(v).__name__
+        return f"{type_name}: {v!r}"
+    elif isinstance(operand, ast.MapLiteral):
+        return "map"
+    elif isinstance(operand, (ast.Literal, ast.Variable)):
+        if isinstance(operand.value, list):
+            return f"list: {operand.value!r}"
+    # Fallback
+    return str(operand)
+
+
+
 def _boolean_expr_logical(op, expr, context):
     if op == ast.BooleanOperator.AND:
+        # Type validation: AND requires boolean operands
+        bad_operand = _get_non_boolean_operand(expr)
+        if bad_operand is not None:
+            raise CypherParseError(
+                f"InvalidArgumentType: AND requires boolean operands, "
+                f"got {_format_invalid_type(bad_operand)}"
+            )
         parts = []
         for o in expr.operands:
             if _is_temporal_ts_condition(o, context):
@@ -3529,6 +3566,13 @@ def _boolean_expr_logical(op, expr, context):
             parts.append(translate_boolean_expression(o, context))
         return "(" + " AND ".join(parts) + ")" if parts else "1=1"
     if op == ast.BooleanOperator.OR:
+        # Type validation: OR requires boolean operands
+        bad_operand = _get_non_boolean_operand(expr)
+        if bad_operand is not None:
+            raise CypherParseError(
+                f"InvalidArgumentType: OR requires boolean operands, "
+                f"got {_format_invalid_type(bad_operand)}"
+            )
         return (
             "("
             + " OR ".join(
@@ -3537,11 +3581,25 @@ def _boolean_expr_logical(op, expr, context):
             + ")"
         )
     if op == ast.BooleanOperator.XOR:
+        # Type validation: XOR requires boolean operands
+        bad_operand = _get_non_boolean_operand(expr)
+        if bad_operand is not None:
+            raise CypherParseError(
+                f"InvalidArgumentType: XOR requires boolean operands, "
+                f"got {_format_invalid_type(bad_operand)}"
+            )
         a, b = expr.operands[0], expr.operands[1]
         sa = translate_boolean_expression(a, context)
         sb = translate_boolean_expression(b, context)
         return f"(({sa} AND NOT ({sb})) OR (NOT ({sa}) AND {sb}))"
     if op == ast.BooleanOperator.NOT:
+        # Type validation: NOT requires boolean operand
+        bad_operand = _get_non_boolean_operand(expr)
+        if bad_operand is not None:
+            raise CypherParseError(
+                f"InvalidArgumentType: NOT requires boolean operand, "
+                f"got {_format_invalid_type(bad_operand)}"
+            )
         operand = expr.operands[0]
         # NOT null = null (three-valued logic)
         if isinstance(operand, ast.Literal) and operand.value is None:
@@ -4622,12 +4680,12 @@ def _expr_to_cypher_text(expr) -> str:
         op_str = {
             ast.BooleanOperator.AND: "AND",
             ast.BooleanOperator.OR: "OR",
-            ast.BooleanOperator.EQ: "=",
-            ast.BooleanOperator.NEQ: "<>",
-            ast.BooleanOperator.LT: "<",
-            ast.BooleanOperator.LTE: "<=",
-            ast.BooleanOperator.GT: ">",
-            ast.BooleanOperator.GTE: ">=",
+            ast.BooleanOperator.EQUALS: "=",
+            ast.BooleanOperator.NOT_EQUALS: "<>",
+            ast.BooleanOperator.LESS_THAN: "<",
+            ast.BooleanOperator.LESS_THAN_OR_EQUAL: "<=",
+            ast.BooleanOperator.GREATER_THAN: ">",
+            ast.BooleanOperator.GREATER_THAN_OR_EQUAL: ">=",
             ast.BooleanOperator.IN: "IN",
             ast.BooleanOperator.CONTAINS: "CONTAINS",
             ast.BooleanOperator.STARTS_WITH: "STARTS WITH",
