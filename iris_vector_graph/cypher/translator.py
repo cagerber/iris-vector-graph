@@ -1235,60 +1235,89 @@ def _to_sql_handle_foreach(clause, context: TranslationContext, metadata) -> boo
 def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=None) -> None:
     translate_with_clause(part.with_clause, context)
 
-    # Preprocess ORDER BY items for the WITH clause (before build_stage_sql so joins are included)
+    # Preprocess ORDER BY items for the WITH clause (before build_stage_sql so joins are included).
+    # For alias-based ORDER BY (e.g. WITH n.name AS prop ORDER BY prop), the alias is not yet
+    # resolvable as a variable — emit it as a bare column name for the subquery wrapper to resolve.
     order_by_items = []
+    with_aliases = {
+        (item.alias or (item.expression.name if isinstance(item.expression, ast.Variable) else None))
+        for item in part.with_clause.items
+    } - {None}
     if part.with_clause.order_by_clause:
         for item in part.with_clause.order_by_clause.items:
-            try:
-                expr = translate_expression(item.expression, context, segment="where")
-                order_by_items.append(f"{expr} {'ASC' if item.ascending else 'DESC'}")
-            except Exception:
-                pass
+            direction = "ASC" if item.ascending else "DESC"
+            # If the expression is a variable that matches a WITH alias, emit as bare column name
+            if isinstance(item.expression, ast.Variable) and item.expression.name in with_aliases:
+                order_by_items.append(f"{item.expression.name} {direction}")
+            else:
+                try:
+                    expr = translate_expression(item.expression, context, segment="select")
+                    order_by_items.append(f"{expr} {direction}")
+                except Exception:
+                    pass
 
     sql, stage_params = context.build_stage_sql(part.with_clause.distinct)
 
-    # Apply ORDER BY, SKIP, LIMIT from the WITH clause (if present)
-    if order_by_items or part.with_clause.limit is not None or part.with_clause.skip is not None:
-        # Apply pagination: ORDER BY, SKIP, LIMIT
-        if order_by_items:
-            sql += f"\nORDER BY {', '.join(order_by_items)}"
+    # Apply ORDER BY, SKIP, LIMIT from the WITH clause (if present).
+    # IRIS does not allow ORDER BY directly in a CTE body — it must be inside a subquery wrapper.
+    limit = _resolve_pagination_value(part.with_clause.limit, context)
+    skip = _resolve_pagination_value(part.with_clause.skip, context)
 
-        # Handle LIMIT and SKIP within the CTE
-        limit = _resolve_pagination_value(part.with_clause.limit, context)
-        skip = _resolve_pagination_value(part.with_clause.skip, context)
+    if order_by_items or limit is not None or skip is not None:
+        has_join = "\nJOIN " in sql or " JOIN " in sql
 
-        if limit is not None or skip is not None:
-            # IRIS: FETCH FIRST crashes with multi-table JOINs in CTEs (qaqpre bug).
-            # Use TOP for LIMIT-only when the SQL has JOIN; otherwise FETCH FIRST is safe.
-            has_join = "\nJOIN " in sql or " JOIN " in sql
-            if limit is not None and skip is not None:
-                # SKIP+LIMIT: wrap in ROW_NUMBER subquery to avoid FETCH FIRST entirely
+        if limit is not None and skip is not None:
+            # SKIP+LIMIT: ROW_NUMBER subquery (no FETCH FIRST, no ORDER BY in CTE body)
+            if order_by_items:
+                inner = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
+            else:
+                inner = sql
+            sql = (
+                f"SELECT * FROM (\n"
+                f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({inner}) __q\n"
+                f") __paged WHERE __rn > {skip} AND __rn <= {skip + limit}"
+            )
+        elif limit is not None:
+            if order_by_items:
+                # Need subquery to hold ORDER BY + TOP together
+                inner = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
+                head, sep, rest = inner.partition("SELECT ")
+                if rest[:9].upper().startswith("DISTINCT "):
+                    rest = "DISTINCT " + f"TOP {limit} " + rest[9:]
+                else:
+                    rest = f"TOP {limit} " + rest
+                sql = head + sep + rest
+            elif has_join:
+                # JOIN CTE: inject TOP to avoid qaqpre FETCH FIRST crash
+                head, sep, rest = sql.partition("SELECT ")
+                if rest[:9].upper().startswith("DISTINCT "):
+                    rest = "DISTINCT " + f"TOP {limit} " + rest[9:]
+                else:
+                    rest = f"TOP {limit} " + rest
+                sql = head + sep + rest
+            else:
+                sql += f"\nFETCH FIRST {limit} ROWS ONLY"
+        elif skip is not None:
+            # SKIP only
+            if order_by_items:
+                inner = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
+                sql = (
+                    f"SELECT * FROM (\n"
+                    f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({inner}) __q\n"
+                    f") __paged WHERE __rn > {skip}"
+                )
+            elif has_join:
+                # ROW_NUMBER on JOIN query to avoid OFFSET in CTE
                 sql = (
                     f"SELECT * FROM (\n"
                     f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({sql}) __q\n"
-                    f") __paged WHERE __rn > {skip} AND __rn <= {skip + limit}"
+                    f") __paged WHERE __rn > {skip}"
                 )
-            elif limit is not None:
-                if has_join:
-                    # JOIN CTE: inject TOP to avoid qaqpre crash
-                    head, sep, rest = sql.partition("SELECT ")
-                    if rest[:9].upper().startswith("DISTINCT "):
-                        rest = "DISTINCT " + f"TOP {limit} " + rest[9:]
-                    else:
-                        rest = f"TOP {limit} " + rest
-                    sql = head + sep + rest
-                else:
-                    sql += f"\nFETCH FIRST {limit} ROWS ONLY"
-            elif skip is not None:
-                if has_join:
-                    # SKIP only with JOIN: use ROW_NUMBER subquery
-                    sql = (
-                        f"SELECT * FROM (\n"
-                        f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({sql}) __q\n"
-                        f") __paged WHERE __rn > {skip}"
-                    )
-                else:
-                    sql += f"\nOFFSET {skip} ROWS"
+            else:
+                sql += f"\nOFFSET {skip} ROWS"
+        elif order_by_items:
+            # ORDER BY only (no LIMIT/SKIP): wrap to keep ORDER BY out of CTE body
+            sql = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
 
     context.all_stage_params.extend(stage_params)
     context.stages.append(f"Stage{i + 1} AS (\n{sql}\n)")
@@ -3604,6 +3633,11 @@ def _boolean_expr_logical(op, expr, context):
         # NOT null = null (three-valued logic)
         if isinstance(operand, ast.Literal) and operand.value is None:
             return "NULL"
+        # Fold NOT NOT: double negation cancels (IRIS SQL rejects NOT NOT syntax)
+        if (isinstance(operand, ast.BooleanExpression)
+                and operand.operator == ast.BooleanOperator.NOT
+                and len(operand.operands) == 1):
+            return translate_boolean_expression(operand.operands[0], context)
         return f"NOT ({translate_boolean_expression(operand, context)})"
     return None
 
