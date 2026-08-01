@@ -1677,6 +1677,8 @@ def _create_resolve_prop_value(v, context):
     if isinstance(v, ast.Variable) and getattr(context, "foreach_literals", {}).get(v.name) is not None:
         raw = context.foreach_literals[v.name]
         return raw.value if isinstance(raw, ast.Literal) else raw
+    if isinstance(v, ast.Variable) and v.name not in context.variable_aliases:
+        raise SyntaxError(f"Undefined variable: {v.name}")
     return v
 
 
