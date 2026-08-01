@@ -3590,11 +3590,33 @@ def _boolean_expr_logical(op, expr, context):
                 f"got {_format_invalid_type(bad_operand)}"
             )
         parts = []
+        has_null = False
         for o in expr.operands:
             if _is_temporal_ts_condition(o, context):
                 continue
-            parts.append(translate_boolean_expression(o, context))
-        return "(" + " AND ".join(parts) + ")" if parts else "1=1"
+            p = translate_boolean_expression(o, context)
+            if p == "NULL":
+                has_null = True
+            else:
+                parts.append(p)
+        if not parts:
+            # All operands were null or temporal
+            return "NULL" if has_null else "1=1"
+        # Three-value AND: if any operand is definitively false, result is false
+        if "(1=0)" in parts:
+            return "(1=0)"
+        combined = "(" + " AND ".join(parts) + ")"
+        if has_null:
+            # null AND (all true parts) = null
+            # null AND (any false part) = false — handled above
+            # If all non-null parts are literals that are true, result is null
+            all_true = all(p == "(1=1)" for p in parts)
+            if all_true:
+                return "NULL"
+            # Mixed variable/unknown parts: use CASE WHEN to preserve 3VL without bare NULL
+            # CASE WHEN (parts_false) THEN (1=0) ELSE NULL END
+            return f"CASE WHEN NOT ({combined}) THEN (1=0) ELSE NULL END"
+        return combined
     if op == ast.BooleanOperator.OR:
         # Type validation: OR requires boolean operands
         bad_operand = _get_non_boolean_operand(expr)
@@ -3603,13 +3625,27 @@ def _boolean_expr_logical(op, expr, context):
                 f"InvalidArgumentType: OR requires boolean operands, "
                 f"got {_format_invalid_type(bad_operand)}"
             )
-        return (
-            "("
-            + " OR ".join(
-                translate_boolean_expression(o, context) for o in expr.operands
-            )
-            + ")"
-        )
+        parts_or = []
+        has_null_or = False
+        for o in expr.operands:
+            p = translate_boolean_expression(o, context)
+            if p == "NULL":
+                has_null_or = True
+            else:
+                parts_or.append(p)
+        if not parts_or:
+            return "NULL" if has_null_or else "(1=0)"
+        if "(1=1)" in parts_or:
+            return "(1=1)"
+        combined_or = "(" + " OR ".join(parts_or) + ")"
+        if has_null_or:
+            # null OR true = true (handled above); null OR false = null
+            all_false = all(p == "(1=0)" for p in parts_or)
+            if all_false:
+                return "NULL"
+            # Mixed: CASE WHEN (any true) THEN (1=1) ELSE NULL END
+            return f"CASE WHEN ({combined_or}) THEN (1=1) ELSE NULL END"
+        return combined_or
     if op == ast.BooleanOperator.XOR:
         # Type validation: XOR requires boolean operands
         bad_operand = _get_non_boolean_operand(expr)
@@ -3621,6 +3657,8 @@ def _boolean_expr_logical(op, expr, context):
         a, b = expr.operands[0], expr.operands[1]
         sa = translate_boolean_expression(a, context)
         sb = translate_boolean_expression(b, context)
+        if sa == "NULL" or sb == "NULL":
+            return "NULL"
         return f"(({sa} AND NOT ({sb})) OR (NOT ({sa}) AND {sb}))"
     if op == ast.BooleanOperator.NOT:
         # Type validation: NOT requires boolean operand
@@ -4327,6 +4365,15 @@ def _scalar_string(fn, args, args_exprs):
     return None
 
 
+def _extract_int_from_map_entry(map_literal, key, default=0):
+    if key not in map_literal.entries:
+        return default
+    val_expr = map_literal.entries[key]
+    if isinstance(val_expr, ast.Literal) and isinstance(val_expr.value, int):
+        return val_expr.value
+    return default
+
+
 def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
     if fn == "haversin":
         return f"(1 - COS({args[0]})) / 2" if args else "NULL"
@@ -4341,18 +4388,48 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
     if fn == "date":
         if not args:
             return "NULL"
+        if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
+            m = args_exprs[0]
+            y = _extract_int_from_map_entry(m, "year", 1970)
+            mo = _extract_int_from_map_entry(m, "month", 1)
+            d = _extract_int_from_map_entry(m, "day", 1)
+            return f"'{y:04d}-{mo:02d}-{d:02d}'"
         return args[0]
     if fn in ("datetime", "localdatetime"):
         if not args:
             return "NULL"
+        if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
+            m = args_exprs[0]
+            y = _extract_int_from_map_entry(m, "year", 1970)
+            mo = _extract_int_from_map_entry(m, "month", 1)
+            d = _extract_int_from_map_entry(m, "day", 1)
+            h = _extract_int_from_map_entry(m, "hour", 0)
+            mi = _extract_int_from_map_entry(m, "minute", 0)
+            s = _extract_int_from_map_entry(m, "second", 0)
+            return f"'{y:04d}-{mo:02d}-{d:02d}T{h:02d}:{mi:02d}:{s:02d}'"
         return args[0]
     if fn in ("localtime", "time"):
         if not args:
             return "NULL"
+        if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
+            m = args_exprs[0]
+            h = _extract_int_from_map_entry(m, "hour", 0)
+            mi = _extract_int_from_map_entry(m, "minute", 0)
+            s = _extract_int_from_map_entry(m, "second", 0)
+            return f"'{h:02d}:{mi:02d}:{s:02d}'"
         return args[0]
     if fn == "duration":
         if not args:
             return "NULL"
+        if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
+            m = args_exprs[0]
+            yr = _extract_int_from_map_entry(m, "years", 0)
+            mo = _extract_int_from_map_entry(m, "months", 0)
+            d = _extract_int_from_map_entry(m, "days", 0)
+            h = _extract_int_from_map_entry(m, "hours", 0)
+            mi = _extract_int_from_map_entry(m, "minutes", 0)
+            s = _extract_int_from_map_entry(m, "seconds", 0)
+            return f"'P{yr}Y{mo}M{d}DT{h}H{mi}M{s}S'"
         return args[0]
     return None
 
