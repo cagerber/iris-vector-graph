@@ -119,23 +119,29 @@ class TCKResultTable:
                     return f"Row {i} mismatch:\n  expected: {exp}\n  actual:   {act}"
             return None
         else:
-            # unordered: match each expected row to any unmatched actual row.
-            # Simple sort-then-compare fails when expected uses node pattern strings
-            # ("(:A)") but actual uses node dicts — sort keys differ, so pairings break.
-            unmatched_actual = list(norm_actual)
-            for exp in expected_rows:
-                found = False
-                for idx, act in enumerate(unmatched_actual):
-                    if _rows_equal(exp, act, self.columns, self.list_unordered):
-                        unmatched_actual.pop(idx)
-                        found = True
-                        break
-                if not found:
-                    return (
-                        f"Unordered comparison: no match for expected row {exp}\n"
-                        f"Expected: {expected_rows}\n"
-                        f"Actual:   {norm_actual}"
-                    )
+            # unordered: bipartite matching — each expected row must match a distinct
+            # actual row.  Simple sort-then-compare fails when expected uses node
+            # pattern strings ("(:A)") and actual uses node dicts (sort keys differ).
+            # Greedy matching fails when a less-specific pattern consumes a node that
+            # a more-specific pattern needed, so we use backtracking.
+            def _can_match(exp_rows, avail_indices):
+                if not exp_rows:
+                    return True
+                exp = exp_rows[0]
+                for i in avail_indices:
+                    if _rows_equal(exp, norm_actual[i], self.columns, self.list_unordered):
+                        remaining = [j for j in avail_indices if j != i]
+                        if _can_match(exp_rows[1:], remaining):
+                            return True
+                return False
+
+            avail = list(range(len(norm_actual)))
+            if not _can_match(expected_rows, avail):
+                return (
+                    f"Unordered comparison: no perfect matching found\n"
+                    f"Expected: {expected_rows}\n"
+                    f"Actual:   {norm_actual}"
+                )
             return None
 
 
