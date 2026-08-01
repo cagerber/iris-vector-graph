@@ -762,20 +762,57 @@ class Parser:
         return ast.NodePattern(variable=var, labels=labels, properties=props, labels_or=labels_or)
 
     def parse_relationship_pattern(self) -> ast.RelationshipPattern:
-        """Parse -[r:TYPE]-> or <-[r:TYPE]- or -[r:TYPE]-"""
+        """Parse -[r:TYPE]-> or <-[r:TYPE]- or -[r:TYPE]- or --> or <-- or --
+
+        Supports both explicit brackets -[r:TYPE]-> and anonymous relationships:
+        - --> : outgoing anonymous (equivalent to -[]->)
+        - <-- : incoming anonymous (equivalent to <-[]-)
+        - -- : both anonymous (equivalent to -[]-)
+        """
         direction = ast.Direction.BOTH
 
         if self.matches(TokenType.ARROW_LEFT):
+            # <-[...]-  or <-- (anonymous incoming)
             direction = ast.Direction.INCOMING
-            self.expect(TokenType.LBRACKET)
+            if self.peek().kind == TokenType.MINUS:
+                # Consume the second MINUS
+                self.eat()
+                # Now check if it's <-- (anonymous) or <-[...-
+                if self.peek().kind == TokenType.LBRACKET:
+                    # <-[...] — has brackets, proceed with bracket parsing
+                    pass
+                else:
+                    # <-- anonymous relationship (completed)
+                    return ast.RelationshipPattern(
+                        variable=None,
+                        types=[],
+                        direction=ast.Direction.INCOMING,
+                        properties={},
+                        variable_length=None,
+                    )
+            else:
+                # Expected <-[ for explicit bracket syntax
+                self.expect(TokenType.LBRACKET)
         else:
             self.expect(TokenType.MINUS)
             if self.matches(TokenType.LBRACKET):
-                # -[...]
+                # -[...] pattern (explicit bracket)
                 pass
             else:
-                if self.peek().kind == TokenType.MINUS:
-                    self.eat()
+                # Check what comes after the first MINUS
+                if self.peek().kind == TokenType.ARROW_RIGHT:
+                    # --> outgoing anonymous (MINUS already consumed, see ARROW_RIGHT)
+                    self.eat()  # consume the ARROW_RIGHT
+                    return ast.RelationshipPattern(
+                        variable=None,
+                        types=[],
+                        direction=ast.Direction.OUTGOING,
+                        properties={},
+                        variable_length=None,
+                    )
+                elif self.peek().kind == TokenType.MINUS:
+                    # -- both anonymous
+                    self.eat()  # consume second MINUS
                     return ast.RelationshipPattern(
                         variable=None,
                         types=[],
@@ -783,10 +820,11 @@ class Parser:
                         properties={},
                         variable_length=None,
                     )
-                tok = self.peek()
-                raise CypherParseError("Expected '[' after '-'", tok.line, tok.column)
+                else:
+                    tok = self.peek()
+                    raise CypherParseError("Expected '[' after '-'", tok.line, tok.column)
 
-        # Inside brackets [...]
+        # Inside brackets [...] — parse variable, types, variable_length, properties
         var = None
         if self.peek().kind == TokenType.IDENTIFIER:
             var = self.eat().value

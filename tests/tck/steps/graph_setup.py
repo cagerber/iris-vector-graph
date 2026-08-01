@@ -99,38 +99,53 @@ def _inject_label(query: str, label: str, inject_anonymous: bool = True) -> str:
 
     Skips MATCH-bound variables and WITH aliases used as CREATE endpoints —
     they don't create new nodes and adding labels would trigger VariableAlreadyBound.
+
+    Within a multi-line CREATE/MERGE block, tracks injected variables to avoid
+    re-injecting labels on variable references in subsequent lines (e.g., relationships).
     """
     match_bound = _extract_match_bound_vars(query)
     lines = query.split('\n')
     result_lines = []
     in_create = False
+    create_block_injected_vars = set()  # Track vars injected across entire CREATE/MERGE block
 
     for line in lines:
         stripped = line.strip().upper()
         first_word = stripped.split()[0] if stripped.split() else ''
         if first_word in ('CREATE', 'MERGE'):
             in_create = True
+            create_block_injected_vars = set()  # Reset for new CREATE/MERGE
         elif first_word in ('MATCH', 'OPTIONAL', 'WITH', 'RETURN', 'WHERE',
                             'ORDER', 'SKIP', 'LIMIT', 'UNWIND', 'SET',
                             'DELETE', 'REMOVE', 'CALL', 'UNION'):
             in_create = False
 
         if in_create:
-            line = _inject_all_nodes(line, label, skip_vars=match_bound,
-                                     inject_anonymous=inject_anonymous)
+            line, newly_injected = _inject_all_nodes_tracking(
+                line, label, skip_vars=match_bound.union(create_block_injected_vars),
+                inject_anonymous=inject_anonymous)
+            create_block_injected_vars.update(newly_injected)
         result_lines.append(line)
     return '\n'.join(result_lines)
 
 
-def _inject_all_nodes(line: str, label: str, skip_vars: set = None,
-                      inject_anonymous: bool = True) -> str:
-    """Add :<label> to every node pattern in a line.
+def _inject_all_nodes_tracking(line: str, label: str, skip_vars: set = None,
+                               inject_anonymous: bool = True) -> tuple[str, set]:
+    """Add :<label> to every node pattern in a line, returning modified line and injected vars.
 
-    skip_vars: variable names to skip (e.g. MATCH-bound vars used as CREATE endpoints).
+    Returns: (modified_line, newly_injected_variables)
+
+    skip_vars: variable names to skip (e.g. MATCH-bound vars used as CREATE endpoints,
+               or variables already injected in prior lines of a CREATE/MERGE block).
     inject_anonymous: if False, skip anonymous () nodes (no variable name).
+
+    On the same line, track which variables have already been injected with the label
+    to avoid double-binding (e.g., CREATE (root:A), ..., (root)-[:R]->(...) should not
+    inject the label into the second (root) reference since it refers to the already-bound root).
     """
     if skip_vars is None:
         skip_vars = set()
+    injected_vars = set()  # Track vars we've injected on this line
     result = []
     i = 0
     while i < len(line):
@@ -151,19 +166,29 @@ def _inject_all_nodes(line: str, label: str, skip_vars: set = None,
             # Extract variable name from inner (before first : or {)
             inner_stripped = inner.strip()
             var_name = inner_stripped.split(':')[0].split('{')[0].strip() if inner_stripped else ''
-            # Inject label unless: already labeled, a skip_var, or truly anonymous (empty
-            # inner) when inject_anonymous is disabled.  Nodes with labels but no var
-            # name — e.g. (:A) — are not anonymous and always get the isolation label.
+            # Inject label unless: already labeled, a skip_var, already injected on this line,
+            # or truly anonymous (empty inner) when inject_anonymous is disabled.
+            # Nodes with labels but no var name — e.g. (:A) — are not anonymous and always get
+            # the isolation label (unless already on this line or in skip_vars).
             is_truly_anonymous = not inner.strip()
-            if label not in inner and var_name not in skip_vars:
+            if label not in inner and var_name not in skip_vars and var_name not in injected_vars:
                 if not is_truly_anonymous or inject_anonymous:
                     inner = _add_label_to_node(inner, label)
+                    if var_name:  # Track that we injected this variable
+                        injected_vars.add(var_name)
             result.append(f"({inner})")
             i = end + 1
         else:
             result.append(line[i])
             i += 1
-    return ''.join(result)
+    return ''.join(result), injected_vars
+
+
+def _inject_all_nodes(line: str, label: str, skip_vars: set = None,
+                      inject_anonymous: bool = True) -> str:
+    """Add :<label> to every node pattern in a line. (Legacy wrapper; use _inject_all_nodes_tracking)"""
+    result, _ = _inject_all_nodes_tracking(line, label, skip_vars, inject_anonymous)
+    return result
 
 
 def _add_label_to_node(inner: str, label: str) -> str:

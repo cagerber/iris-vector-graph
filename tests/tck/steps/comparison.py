@@ -295,6 +295,9 @@ def _normalise_row(actual: dict, expected: dict, columns: list[str]) -> dict:
 
 def normalise_iris_value(iris_val: Any, expected_tck_val: Any) -> Any:
     """Cast IRIS value to match expected TCK type."""
+    # IRIS stores '' as NULL — coerce back when expected is empty string
+    if iris_val is None and expected_tck_val == '':
+        return ''
     if iris_val is None:
         return None
     if isinstance(iris_val, Decimal):

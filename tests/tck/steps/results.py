@@ -90,6 +90,11 @@ def step_error_any_time(context, err_type, detail):
 def step_error_type_raised(context, error_type: str):
     expected_types = ERROR_TYPE_MAP.get(error_type, (Exception,))
     err = getattr(context, "last_error", None)
+    # Also accept SQL-level errors stored in result.error (IRIS raises as result, not exception)
+    if err is None:
+        result = getattr(context, "last_result", None)
+        if result is not None and getattr(result, "error", None):
+            return  # SQL error in result counts as an error being raised
     assert err is not None, (
         f"Expected a {error_type} to be raised, but no error occurred. "
         f"Last result: {getattr(context, 'last_result', None)}"

@@ -65,33 +65,64 @@ def _inject_match_scope(query: str, label: str) -> str:
     """
     In MATCH clauses, add label filter so reads see only this scenario's nodes.
     Skips anonymous nodes () and already-labelled nodes.
+
+    Also tracks variables already bound (from prior MATCH/CREATE/WITH) and
+    does NOT re-inject labels into already-bound variables, which would cause
+    VariableAlreadyBound errors in the translator.
     """
     import re
 
     lines = query.split('\n')
     result_lines = []
     in_match = False
+    bound_vars = set()  # Track variables bound in MATCH/WITH/CREATE clauses
 
     for line in lines:
         stripped = line.strip().upper()
         first_word = stripped.split()[0] if stripped.split() else ''
-        if first_word in ('MATCH', 'OPTIONAL'):
-            in_match = True
-        elif first_word in ('WHERE', 'WITH', 'RETURN', 'CREATE', 'MERGE',
+
+        # Track when we exit MATCH to update bound variables
+        if first_word in ('WHERE', 'WITH', 'RETURN', 'CREATE', 'MERGE',
                             'SET', 'DELETE', 'REMOVE', 'UNWIND', 'CALL',
                             'UNION', 'ORDER', 'SKIP', 'LIMIT'):
             in_match = False
 
+            # Extract variables from WITH clause (e.g., "WITH a, b AS c" binds a, c)
+            if first_word == 'WITH':
+                # Collect AS aliases and direct variables passed through
+                for m in re.finditer(r'\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)',
+                                     line, re.IGNORECASE):
+                    bound_vars.add(m.group(2))  # AS target is new binding
+                # Also collect non-aliased variables before commas or end of line
+                for m in re.finditer(r'(?:,|\s|^)([A-Za-z_][A-Za-z0-9_]*)(?:\s|,|$)', line):
+                    var = m.group(1)
+                    if var.upper() not in ('WITH', 'AS'):
+                        bound_vars.add(var)
+
+        if first_word in ('MATCH', 'OPTIONAL'):
+            in_match = True
+
         if in_match:
-            line = _inject_match_label_in_line(line, label)
+            line = _inject_match_label_in_line(line, label, skip_vars=bound_vars)
+            # Extract newly-bound variables from this MATCH line
+            for m in re.finditer(r'\(([A-Za-z_][A-Za-z0-9_]*)', line):
+                bound_vars.add(m.group(1))
+
         result_lines.append(line)
 
     return '\n'.join(result_lines)
 
 
-def _inject_match_label_in_line(line: str, label: str) -> str:
-    """Add :<label> to named node patterns in MATCH lines. Anonymous nodes are not scoped."""
+def _inject_match_label_in_line(line: str, label: str, skip_vars: set = None) -> str:
+    """Add :<label> to named node patterns in MATCH lines. Anonymous nodes are not scoped.
+
+    skip_vars: set of variable names that are already bound (e.g., from prior MATCH/WITH)
+               and should NOT be re-labeled.
+    """
     import re
+
+    if skip_vars is None:
+        skip_vars = set()
 
     def replacer(m):
         inner = m.group(1)
@@ -101,6 +132,12 @@ def _inject_match_label_in_line(line: str, label: str) -> str:
         # skip already labelled
         if label in inner:
             return m.group(0)
+        # Extract variable name from inner (before first : or {)
+        # to check if it's already bound
+        inner_stripped = inner.strip()
+        var_name = inner_stripped.split(':')[0].split('{')[0].strip() if inner_stripped else ''
+        if var_name and var_name in skip_vars:
+            return m.group(0)  # Don't add label to already-bound variable
         # Insert label BEFORE any property map {…} so the result is valid Cypher.
         if '{' in inner:
             label_part, _, props_part = inner.partition('{')

@@ -11,6 +11,7 @@ import logging
 import json
 from pydantic import BaseModel, Field
 from . import ast
+from .parser import CypherParseError
 from iris_vector_graph.security import (
     validate_table_name,
     VALID_GRAPH_TABLES,
@@ -261,6 +262,12 @@ class TranslationContext:
         self.optional_null_row_labels: List[tuple] = []
         # Parallel list of SQL values for the null row, one per select item.
         self.optional_null_row_items: List[str] = []
+        # Variable type tracking for semantic validation.
+        # Maps variable name → "node" | "relationship" | "scalar"
+        # Used to enforce type consistency and detect VariableTypeConflict/VariableAlreadyBound errors.
+        self.variable_types: Dict[str, str] = (
+            {} if parent is None else parent.variable_types.copy()
+        )
 
     def next_alias(self, prefix: str = "t") -> str:
         alias = f"{prefix}{self._alias_counter}"
@@ -271,6 +278,28 @@ class TranslationContext:
         if variable not in self.variable_aliases:
             self.variable_aliases[variable] = self.next_alias(prefix)
         return self.variable_aliases[variable]
+
+    def bind_variable_type(self, variable: str, var_type: str) -> None:
+        """Track variable type and validate no type conflicts.
+
+        Args:
+            variable: Cypher variable name
+            var_type: One of "node", "relationship", or "scalar"
+
+        Raises:
+            CypherParseError: If variable is rebound to a different type
+        """
+        if not variable:
+            return
+        if variable in self.variable_types:
+            existing_type = self.variable_types[variable]
+            if existing_type != var_type:
+                raise CypherParseError(
+                    f"VariableTypeConflict: variable '{variable}' is bound as "
+                    f"{existing_type!r}, cannot rebind as {var_type!r}"
+                )
+        else:
+            self.variable_types[variable] = var_type
 
     def add_select_param(self, value: Any) -> str:
         self.select_params.append(value)
@@ -1195,7 +1224,7 @@ def _to_sql_handle_foreach(clause, context: TranslationContext, metadata) -> boo
     return True
 
 
-def _to_sql_handle_with(part, context: TranslationContext, i: int) -> None:
+def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=None) -> None:
     translate_with_clause(part.with_clause, context)
     sql, stage_params = context.build_stage_sql(part.with_clause.distinct)
     context.all_stage_params.extend(stage_params)
@@ -1215,6 +1244,21 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int) -> None:
             )
             if alias:
                 new_aliases[alias] = new_stage
+                # Track the type of the variable in WITH clause.
+                # If it's a reference to an existing variable, preserve its type.
+                # Otherwise, it's a scalar (function result, literal, etc.)
+                if isinstance(item.expression, ast.Variable):
+                    # Passthrough: preserve the bound variable's type
+                    # (from MATCH, previous WITH, etc.)
+                    existing_type = context.variable_types.get(item.expression.name)
+                    if existing_type:
+                        context.bind_variable_type(alias, existing_type)
+                    else:
+                        # If not yet typed, assume node (safest for graph ops)
+                        context.bind_variable_type(alias, "node")
+                else:
+                    # Everything else is scalar: aggregation, function call, literal, etc.
+                    context.bind_variable_type(alias, "scalar")
             if isinstance(item.expression, ast.AggregationFunction) and alias:
                 context.scalar_variables.add(alias)
             elif alias and not isinstance(item.expression, ast.Variable):
@@ -1859,6 +1903,8 @@ def translate_unwind_clause(unwind, context):
             context.join_params[-1] = json.dumps(val)
     alias = context.register_variable(unwind.alias, prefix="u")
     context.scalar_variables.add(unwind.alias)
+    # UNWIND binds a scalar variable (array element)
+    context.bind_variable_type(unwind.alias, "scalar")
     json_table_sql = f"JSON_TABLE({expr}, '$[*]' COLUMNS ({unwind.alias} VARCHAR(1000) PATH '$')) {alias}"
     if context.from_clauses:
         context.join_clauses.append(f"CROSS JOIN {json_table_sql}")
@@ -2386,9 +2432,43 @@ def translate_remove_clause(remove, context, metadata):
 
 
 def translate_match_clause(match_clause, context, metadata):
+    # Validate no duplicate variables within the same MATCH clause (across all patterns)
+    vars_in_match = set()
     for pattern in match_clause.patterns:
         if not pattern.nodes:
             continue
+        # Check within pattern
+        vars_in_pattern = set()
+        for node in pattern.nodes:
+            if node.variable:
+                if node.variable in vars_in_pattern:
+                    raise CypherParseError(
+                        f"VariableAlreadyBound: variable '{node.variable}' appears twice "
+                        f"in the same pattern"
+                    )
+                vars_in_pattern.add(node.variable)
+                # Also check if this variable was already seen in this MATCH clause
+                if node.variable in vars_in_match:
+                    raise CypherParseError(
+                        f"VariableAlreadyBound: variable '{node.variable}' is already bound "
+                        f"in this MATCH clause"
+                    )
+                vars_in_match.add(node.variable)
+        for rel in pattern.relationships:
+            if rel.variable:
+                if rel.variable in vars_in_pattern:
+                    raise CypherParseError(
+                        f"VariableAlreadyBound: variable '{rel.variable}' appears twice "
+                        f"in the same pattern"
+                    )
+                vars_in_pattern.add(rel.variable)
+                # Also check if this variable was already seen in this MATCH clause
+                if rel.variable in vars_in_match:
+                    raise CypherParseError(
+                        f"VariableAlreadyBound: variable '{rel.variable}' is already bound "
+                        f"in this MATCH clause"
+                    )
+                vars_in_match.add(rel.variable)
         first_node = pattern.nodes[0]
         # Skip upfront node join when the first node is unbound but the pattern's
         # last node IS already bound.  translate_relationship_pattern will anchor
@@ -2433,6 +2513,8 @@ def translate_match_clause(match_clause, context, metadata):
 
     for np in match_clause.named_paths:
         context.named_paths[np.variable] = np
+        # Track path variable type for semantic validation
+        context.bind_variable_type(np.variable, "path")
         node_aliases = [
             context.variable_aliases.get(n.variable, f"n{i}")
             for i, n in enumerate(np.pattern.nodes)
@@ -2645,6 +2727,8 @@ def translate_subquery_call(
 
 def translate_node_pattern(node, context, metadata, optional=False):
     if node.variable and node.variable in context.variable_aliases:
+        # Validate type consistency: if variable was previously bound to a different type, error
+        context.bind_variable_type(node.variable, "node")
         # Node already registered (e.g. as far-end of a relationship JOIN), but
         # labels and properties declared on this node pattern still need to be
         # applied as filter JOINs against the already-registered alias.
@@ -2684,6 +2768,9 @@ def translate_node_pattern(node, context, metadata, optional=False):
         if node.variable
         else context.next_alias("n")
     )
+    # Track node type for semantic validation
+    if node.variable:
+        context.bind_variable_type(node.variable, "node")
     jt = "LEFT OUTER JOIN" if optional else "JOIN"
 
     engine = getattr(context, "_engine", None)
@@ -3178,6 +3265,8 @@ def translate_relationship_pattern(
     # Track named relationship variables for Bolt column-type tagging.
     if rel.variable:
         context.rel_variables.add(rel.variable)
+        # Track relationship type for semantic validation
+        context.bind_variable_type(rel.variable, "relationship")
     def _node_col(variable, alias):
         if alias.startswith("Stage") or alias == "VecSearch":
             return variable
@@ -3772,9 +3861,11 @@ def _expr_property_reference(expr, context, segment):
         if expr.variable in context.scalar_variables or expr.variable in edge_stage_vars:
             return f"CASE WHEN {_safe_alias(expr.variable)} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({_safe_alias(expr.variable)}, '$.{expr.property_name}') END"
         # Node variables from Stage: JOIN rdf_props to get the property value
+        # The Stage column contains the node ID, so use it directly
         p_alias = context.next_alias("p")
+        stage_col = _safe_alias(expr.variable)
         context.join_clauses.append(
-            f'LEFT JOIN {_table("rdf_props")} {p_alias} ON {p_alias}.s = {_safe_alias(expr.variable)} AND {p_alias}."key" = {context.add_join_param(expr.property_name)}'
+            f'LEFT JOIN {_table("rdf_props")} {p_alias} ON {p_alias}.s = {stage_col} AND {p_alias}."key" = {context.add_join_param(expr.property_name)}'
         )
         return f"{p_alias}.val"
     if alias.startswith("e") and not alias.startswith("ES_"):
