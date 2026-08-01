@@ -1258,15 +1258,37 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
         skip = _resolve_pagination_value(part.with_clause.skip, context)
 
         if limit is not None or skip is not None:
+            # IRIS: FETCH FIRST crashes with multi-table JOINs in CTEs (qaqpre bug).
+            # Use TOP for LIMIT-only when the SQL has JOIN; otherwise FETCH FIRST is safe.
+            has_join = "\nJOIN " in sql or " JOIN " in sql
             if limit is not None and skip is not None:
-                # Both SKIP and LIMIT: use OFFSET FETCH
-                sql += f"\nOFFSET {skip} ROWS FETCH FIRST {limit} ROWS ONLY"
+                # SKIP+LIMIT: wrap in ROW_NUMBER subquery to avoid FETCH FIRST entirely
+                sql = (
+                    f"SELECT * FROM (\n"
+                    f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({sql}) __q\n"
+                    f") __paged WHERE __rn > {skip} AND __rn <= {skip + limit}"
+                )
             elif limit is not None:
-                # LIMIT only: use FETCH FIRST
-                sql += f"\nFETCH FIRST {limit} ROWS ONLY"
+                if has_join:
+                    # JOIN CTE: inject TOP to avoid qaqpre crash
+                    head, sep, rest = sql.partition("SELECT ")
+                    if rest[:9].upper().startswith("DISTINCT "):
+                        rest = "DISTINCT " + f"TOP {limit} " + rest[9:]
+                    else:
+                        rest = f"TOP {limit} " + rest
+                    sql = head + sep + rest
+                else:
+                    sql += f"\nFETCH FIRST {limit} ROWS ONLY"
             elif skip is not None:
-                # SKIP only: use OFFSET
-                sql += f"\nOFFSET {skip} ROWS"
+                if has_join:
+                    # SKIP only with JOIN: use ROW_NUMBER subquery
+                    sql = (
+                        f"SELECT * FROM (\n"
+                        f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({sql}) __q\n"
+                        f") __paged WHERE __rn > {skip}"
+                    )
+                else:
+                    sql += f"\nOFFSET {skip} ROWS"
 
     context.all_stage_params.extend(stage_params)
     context.stages.append(f"Stage{i + 1} AS (\n{sql}\n)")
