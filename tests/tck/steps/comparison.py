@@ -119,17 +119,22 @@ class TCKResultTable:
                     return f"Row {i} mismatch:\n  expected: {exp}\n  actual:   {act}"
             return None
         else:
-            # unordered: sort both sets
-            exp_sorted = _sort_rows(expected_rows, self.columns)
-            act_sorted = _sort_rows(norm_actual, self.columns)
-            for i, (exp, act) in enumerate(zip(exp_sorted, act_sorted)):
-                if not _rows_equal(exp, act, self.columns, self.list_unordered):
+            # unordered: match each expected row to any unmatched actual row.
+            # Simple sort-then-compare fails when expected uses node pattern strings
+            # ("(:A)") but actual uses node dicts — sort keys differ, so pairings break.
+            unmatched_actual = list(norm_actual)
+            for exp in expected_rows:
+                found = False
+                for idx, act in enumerate(unmatched_actual):
+                    if _rows_equal(exp, act, self.columns, self.list_unordered):
+                        unmatched_actual.pop(idx)
+                        found = True
+                        break
+                if not found:
                     return (
-                        f"Unordered comparison failed at position {i} after sorting:\n"
-                        f"  expected: {exp}\n"
-                        f"  actual:   {act}\n"
-                        f"Full expected (sorted): {exp_sorted}\n"
-                        f"Full actual (sorted):   {act_sorted}"
+                        f"Unordered comparison: no match for expected row {exp}\n"
+                        f"Expected: {expected_rows}\n"
+                        f"Actual:   {norm_actual}"
                     )
             return None
 

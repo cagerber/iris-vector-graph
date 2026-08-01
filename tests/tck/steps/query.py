@@ -101,6 +101,10 @@ def _inject_match_label_in_line(line: str, label: str) -> str:
         # skip already labelled
         if label in inner:
             return m.group(0)
+        # Insert label BEFORE any property map {…} so the result is valid Cypher.
+        if '{' in inner:
+            label_part, _, props_part = inner.partition('{')
+            return f"({label_part.rstrip()}:{label} {{{props_part})"
         return f"({inner}:{label})"
 
     return re.sub(r'\(([^()]*)\)', replacer, line)
