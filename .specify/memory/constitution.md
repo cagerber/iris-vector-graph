@@ -1,23 +1,19 @@
 <!--
 SYNC IMPACT REPORT
 ==================
-Version change: 1.1.0 → 1.1.1 (PATCH — clarification; no principles added or removed)
-Bump rationale: Principle IV example container name corrected from "los-iris" (a different
-  project's container) to the actual project container name "iris_vector_graph" (from
-  docker-compose.yml). Added Principle VI (Grounding Rule) to prevent recurrence: any
-  infrastructure detail written into specs, tests, or templates MUST first be verified
-  against the authoritative source in the repository (docker-compose.yml, pyproject.toml,
-  conftest.py) before use. No placeholder values, no assumed names from other projects.
+Version change: 1.1.1 → 1.2.0 (MINOR — new principle VII added)
+Bump rationale: Added Principle VII (Cypher Conformance Gates) after the
+  direction-symmetry cross-join bug was found independently in two Cypher
+  implementations (cbm HEAD 571196db and IVG ≤v2.5.1).  The openCypher TCK
+  (Match7) partially covers bound-at-nodes[1] patterns but has NO scenario
+  asserting that (a)-[:R]->(b) and (b)<-[:R]-(a) return identical results when
+  b is pre-bound.  This principle closes that gap for IVG by requiring a
+  direction-symmetry E2E gate in every spec that touches the Cypher translator.
 
 Modified principles:
-  - IV: example container name corrected (iris_vector_graph, not los-iris)
-  - VI: new principle added — Grounding Rule (verify before you write)
+  - VII: new principle added — Cypher Conformance Gates
 
-Templates requiring updates:
-  ✅ .specify/templates/plan-template.md — container name corrected
-  ✅ .specify/templates/tasks-template.md — container name corrected
-
-Deferred items: none.
+No other principles changed.  Templates do not require updates.
 -->
 
 # iris-vector-graph Constitution
@@ -92,6 +88,31 @@ Violation of this rule caused the `los-iris` incident (Feb 2026): a container na
 an unrelated project was propagated into the constitution, all spec artifacts, and test
 code before being caught. The fix required amending 8+ files. The cost is not acceptable.
 
+### VII. Cypher Conformance Gates
+
+Any spec or feature that modifies the Cypher translator (`cypher/translator.py`,
+`cypher/parser.py`, or any `_engine/` mixin that generates SQL from a Cypher pattern)
+MUST include an E2E integration test that asserts **direction-symmetry**:
+
+> For any directed pattern `(a)-[:R]->(b)` and its mirror `(b)<-[:R]-(a)`, when one
+> of the variables is pre-bound from a preceding MATCH clause, both forms MUST return
+> identical result sets against a live IRIS database.
+
+**Rationale**: The openCypher TCK (Match7.feature) partially covers bound-target
+patterns but contains no scenario asserting direction equivalence for directed patterns.
+This gap allowed the same cross-join bug to ship in two independent implementations
+(cbm `571196db` and IVG ≤v2.5.1) without being caught by conformance tests.  The bug
+is invisible in unit tests because the SQL strings differ but look plausible; only a
+live database reveals the wrong row counts.
+
+**Conformance resources to consult when changing the translator**:
+- openCypher TCK: `tck/features/clauses/match/Match7.feature` (bound-target scenarios)
+- openCypher OPTIONAL MATCH CIP: `CIP2015-09-16-OPTIONAL-MATCH.adoc`
+- IVG regression: `tests/integration/test_cypher_advanced.py::test_integration_direction_symmetry_optional_match`
+- Bug record: `specs/` or `productivity-framework/specs/073-suite-failure-repair/CBM-BUG-optional-match-cross-join.md`
+
+**Unit tests alone are insufficient** for translator changes that affect JOIN shape.
+
 ## Additional Constraints
 
 - Use the existing RDF schema (`nodes`, `rdf_labels`, `rdf_props`, `rdf_edges`,
@@ -117,4 +138,4 @@ amendments MUST be documented and explicitly approved before implementation begi
 Version increments follow semantic versioning: MAJOR for backward-incompatible governance
 changes, MINOR for new or materially expanded principles, PATCH for clarifications.
 
-**Version**: 1.1.1 | **Ratified**: 2026-01-31 | **Last Amended**: 2026-02-21
+**Version**: 1.2.0 | **Ratified**: 2026-01-31 | **Last Amended**: 2026-08-01

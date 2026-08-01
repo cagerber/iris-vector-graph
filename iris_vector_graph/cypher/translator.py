@@ -1954,12 +1954,32 @@ def translate_match_clause(match_clause, context, metadata):
         if not pattern.nodes:
             continue
         first_node = pattern.nodes[0]
-        if first_node.variable or first_node.labels or first_node.properties:
-            translate_node_pattern(
-                first_node, context, metadata, optional=match_clause.optional
-            )
-        else:
-            _ = context.next_alias("n")
+        # Skip upfront node join when the first node is unbound but the pattern's
+        # last node IS already bound.  translate_relationship_pattern will anchor
+        # the edge on the bound target and join this node from the edge (direction-
+        # symmetry fix).  Without this guard, translate_node_pattern emits a CROSS
+        # JOIN that produces wrong results for (t)-[:R]->(f_bound).
+        first_is_unbound = (
+            first_node.variable is not None
+            and first_node.variable not in context.variable_aliases
+        )
+        last_node_bound = (
+            pattern.nodes
+            and pattern.nodes[-1].variable
+            and pattern.nodes[-1].variable in context.variable_aliases
+        )
+        skip_first_node_join = (
+            first_is_unbound
+            and last_node_bound
+            and bool(pattern.relationships)
+        )
+        if not skip_first_node_join:
+            if first_node.variable or first_node.labels or first_node.properties:
+                translate_node_pattern(
+                    first_node, context, metadata, optional=match_clause.optional
+                )
+            else:
+                _ = context.next_alias("n")
         for i, rel in enumerate(pattern.relationships):
             translate_relationship_pattern(
                 rel,
@@ -2317,12 +2337,20 @@ def _trp_variable_length(rel, source_node, target_node, context, metadata):
 
 
 def _trp_setup_aliases(rel, source_node, target_node, context):
-    """Register aliases. Returns (src, tgt, edge, is_anon, is_new)."""
+    """Register aliases. Returns (src, tgt, edge, is_anon, is_new, is_unbound_src).
+
+    is_unbound_src: source has a variable name but was not yet bound when this
+    pattern was entered.  The caller must NOT pre-join it as a CROSS JOIN; instead
+    the edge join must be anchored on the (already-bound) target and the source
+    node joined from the edge.  This fixes the direction-symmetry bug: patterns
+    (t)-[:R]->(f) and (f)<-[:R]-(t) must produce identical SQL when f is bound.
+    """
     is_anon_source = (
         source_node.variable is None
         and not source_node.labels
         and not source_node.properties
     )
+    is_unbound_src = False
     if is_anon_source:
         source_alias = context.next_alias("n")
     elif source_node.variable is None:
@@ -2338,7 +2366,15 @@ def _trp_setup_aliases(rel, source_node, target_node, context):
                     f"JOIN {_table('nodes')} {source_alias} ON 1=1"
                 )
     else:
-        source_alias = context.variable_aliases.get(source_node.variable)
+        existing = context.variable_aliases.get(source_node.variable)
+        if existing is None:
+            # Source variable exists in the query but has not been bound yet.
+            # Register it now so downstream code has an alias, but flag it so
+            # translate_relationship_pattern anchors the edge on the target side.
+            source_alias = context.register_variable(source_node.variable)
+            is_unbound_src = True
+        else:
+            source_alias = existing
     is_new_target = target_node.variable not in context.variable_aliases
     target_alias = context.register_variable(target_node.variable)
     edge_alias = (
@@ -2346,7 +2382,7 @@ def _trp_setup_aliases(rel, source_node, target_node, context):
         if rel.variable
         else context.next_alias("e")
     )
-    return source_alias, target_alias, edge_alias, is_anon_source, is_new_target
+    return source_alias, target_alias, edge_alias, is_anon_source, is_new_target, is_unbound_src
 
 
 def _trp_temporal_rewrite_from_joins(context, source_alias, cte_name):
@@ -2656,7 +2692,7 @@ def translate_relationship_pattern(
     if rel.variable_length is not None:
         _trp_variable_length(rel, source_node, target_node, context, metadata)
         return
-    source_alias, target_alias, edge_alias, is_anon_source, is_new_target = (
+    source_alias, target_alias, edge_alias, is_anon_source, is_new_target, is_unbound_src = (
         _trp_setup_aliases(rel, source_node, target_node, context)
     )
     # Track named relationship variables for Bolt column-type tagging.
@@ -2678,6 +2714,29 @@ def translate_relationship_pattern(
         _trp_undirected_edge(rel, source_node, target_node, context,
                               source_alias, target_alias, edge_alias, s_col, t_col, jt, is_new_target)
         return
+
+    # Direction-symmetry fix: when source is unbound but target is already bound,
+    # anchor the edge join on the target and join the source node from the edge.
+    # This makes (t)-[:R]->(f) and (f)<-[:R]-(t) with f pre-bound produce identical SQL.
+    if is_unbound_src and not is_new_target:
+        if rel.direction == ast.Direction.OUTGOING:
+            # (t)-[:R]->(f_bound): anchor edge on f, join t from edge.s
+            edge_cond = f"{edge_alias}.o_id = {target_alias}.{t_col}"
+            src_on = f"{source_alias}.{s_col} = {edge_alias}.s"
+        else:
+            # (t)<-[:R]-(f_bound): anchor edge on f, join t from edge.o_id
+            edge_cond = f"{edge_alias}.s = {target_alias}.{t_col}"
+            src_on = f"{source_alias}.{s_col} = {edge_alias}.o_id"
+        if rel.types:
+            if len(rel.types) == 1:
+                edge_cond += f" AND {edge_alias}.p = {context.add_join_param(rel.types[0])}"
+            else:
+                edge_cond += f" AND {edge_alias}.p IN ({', '.join([context.add_join_param(t) for t in rel.types])})"
+        context.join_clauses.append(f"{jt} {_table('rdf_edges')} {edge_alias} ON {edge_cond}")
+        context.join_clauses.append(f"{jt} {_table('nodes')} {source_alias} ON {src_on}")
+        _trp_apply_inline_props(source_node, source_alias, target_node, target_alias, context, jt)
+        return
+
     if rel.direction == ast.Direction.OUTGOING:
         if is_anon_source:
             edge_cond = "1=1"
