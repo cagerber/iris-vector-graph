@@ -1335,6 +1335,23 @@ def _tts_transactional_result(cypher_query, context, metadata, order_by_items):
     if cypher_query.return_clause:
         sql, p = context.build_stage_sql(cypher_query.return_clause.distinct)
         sql = apply_pagination(sql, cypher_query, context, order_by_items)
+    # OPTIONAL MATCH null-row fallback for RETURN clause in transactional queries.
+    optional_union_sql = ""
+    optional_extra_params: List[Any] = []
+    if sql is not None and context.optional_null_row_labels and context.optional_null_row_items:
+        null_items = list(context.optional_null_row_items)
+        while len(null_items) < len(context.select_items):
+            null_items.append("NULL")
+        null_select = ", ".join(null_items[:len(context.select_items)])
+        not_exists_parts = []
+        for label in context.optional_null_row_labels:
+            not_exists_parts.append(
+                f"NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE label = ?)"
+            )
+            optional_extra_params.append(label)
+        where_clause = " AND ".join(not_exists_parts)
+        optional_union_sql = f"\nUNION ALL\nSELECT {null_select} WHERE {where_clause}"
+
     all_ctes = [
         c
         for c in getattr(context, "cte_clauses", [])
@@ -1344,9 +1361,13 @@ def _tts_transactional_result(cypher_query, context, metadata, order_by_items):
         sql, all_ctes = _demote_agg_stages_to_subqueries(sql, all_ctes)
         if all_ctes:
             sql = "WITH " + ",\n".join(all_ctes) + "\n" + sql
-        all_params.append(context.all_stage_params + p)
+        if optional_union_sql:
+            sql += optional_union_sql
+        all_params.append(context.all_stage_params + p + optional_extra_params)
     elif sql is not None:
-         all_params.append(p)
+        if optional_union_sql:
+            sql += optional_union_sql
+        all_params.append(p + optional_extra_params)
     if sql is not None:
         stmts.append(sql)
     return SQLQuery(
@@ -1725,7 +1746,7 @@ def _create_clause_node_entry(node, context):
         if not var_alias and node_id_expr.name in context.input_params:
             node_id_expr = ast.Literal(context.input_params[node_id_expr.name])
         elif not var_alias:
-            raise ValueError(f"Undefined: {node_id_expr.name}")
+            raise SyntaxError(f"Undefined variable: {node_id_expr.name}")
 
     if isinstance(node_id_expr, ast.Variable) and var_alias:
         _create_node_from_alias(node, node_id_expr, var_alias, context)
@@ -1865,13 +1886,20 @@ def translate_delete_clause(delete, context, metadata):
     for var in delete.expressions:
         alias = context.variable_aliases.get(var.name)
         if not alias:
-            raise ValueError(f"Undefined: {var.name}")
+            raise SyntaxError(f"Undefined variable: {var.name}")
         subquery, subparams = context.build_stage_sql(
             select_override=f"SELECT {alias}.node_id"
         )
         if delete.detach:
             context.add_dml(
                 f"DELETE FROM {_table('rdf_edges')} WHERE s IN ({subquery}) OR o_id IN ({subquery})",
+                subparams + subparams,
+            )
+        elif not alias.startswith("e"):
+            # Non-DETACH DELETE: guard against connected nodes (Cypher constraint).
+            # Stored as a sentinel SQL so execute_transaction can raise the right error.
+            context.add_dml(
+                f"__constraint_check_delete_connected__ SELECT COUNT(*) FROM {_table('rdf_edges')} WHERE s IN ({subquery}) OR o_id IN ({subquery})",
                 subparams + subparams,
             )
         if not alias.startswith("e"):
@@ -1890,14 +1918,18 @@ def translate_delete_clause(delete, context, metadata):
                 subparams,
             )
         else:
+            is_undirected = alias in getattr(context, "_undirected_aliases", set())
+            s_col = "_src" if is_undirected else "s"
+            p_col = "_p" if is_undirected else "p"
+            o_col = "_dst" if is_undirected else "o_id"
             subquery_s, subparams_s = context.build_stage_sql(
-                select_override=f"SELECT {alias}.s"
+                select_override=f"SELECT {alias}.{s_col}"
             )
             subquery_p, subparams_p = context.build_stage_sql(
-                select_override=f"SELECT {alias}.p"
+                select_override=f"SELECT {alias}.{p_col}"
             )
             subquery_o, subparams_o = context.build_stage_sql(
-                select_override=f"SELECT {alias}.o_id"
+                select_override=f"SELECT {alias}.{o_col}"
             )
             context.add_dml(
                 f"DELETE FROM {_table('rdf_edges')} WHERE "
@@ -3409,7 +3441,7 @@ def _expr_propref_edge_alias(expr, context, alias):
 def _expr_property_reference(expr, context, segment):
     alias = context.variable_aliases.get(expr.variable)
     if not alias:
-        raise ValueError(f"Undefined: {expr.variable}")
+        raise SyntaxError(f"Undefined variable: {expr.variable}")
     temporal = _expr_propref_temporal(expr, context, alias)
     if temporal is not None:
         return temporal
@@ -3542,7 +3574,7 @@ def _expr_variable(expr, context, segment):
             if segment == "join":
                 return context.add_join_param(v)
             return context.add_where_param(v)
-        raise ValueError(f"Undefined: {expr.name}")
+        raise SyntaxError(f"Undefined variable: {expr.name}")
     if alias.startswith("Stage"):
         return expr.name
     if alias.startswith("e"):
@@ -4117,6 +4149,8 @@ def translate_return_clause(ret, context):
                 context.select_items.append(
                     f"{properties_subquery(node_expr)} AS {prefix}_props"
                 )
+                # Null-row for OPTIONAL MATCH: node is null → 3 NULLs
+                context.optional_null_row_items.extend(["NULL", "NULL", "NULL"])
                 continue
         sql = translate_expression(item.expression, context, segment="select")
         alias = item.alias

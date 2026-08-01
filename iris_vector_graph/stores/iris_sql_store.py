@@ -324,6 +324,16 @@ class IRISGraphStore:
             rows = []
             for i, stmt in enumerate(stmts):
                 p = params_list[i] if i < len(params_list) else []
+                if isinstance(stmt, str) and stmt.startswith("__constraint_check_delete_connected__"):
+                    actual_sql = stmt[len("__constraint_check_delete_connected__ "):]
+                    cursor.execute(actual_sql, p)
+                    count_row = cursor.fetchone()
+                    count = count_row[0] if count_row else 0
+                    if count > 0:
+                        raise Exception(
+                            "ConstraintVerificationFailed: Cannot delete node with existing relationships. Use DETACH DELETE."
+                        )
+                    continue
                 cursor.execute(stmt, p)
                 if cursor.description:
                     rows = cursor.fetchall()
