@@ -1247,8 +1247,9 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
         for item in part.with_clause.order_by_clause.items:
             direction = "ASC" if item.ascending else "DESC"
             # If the expression is a variable that matches a WITH alias, emit as bare column name
+            # (but quote it if it's a SQL reserved word, same as the SELECT alias)
             if isinstance(item.expression, ast.Variable) and item.expression.name in with_aliases:
-                order_by_items.append(f"{item.expression.name} {direction}")
+                order_by_items.append(f"{_safe_alias(item.expression.name)} {direction}")
             else:
                 try:
                     expr = translate_expression(item.expression, context, segment="select")
@@ -4240,6 +4241,9 @@ def _expr_literal(expr, context, segment):
                 elif iv is False: sql_items.append("0")
                 elif iv is None: sql_items.append("NULL")
                 elif isinstance(iv, str): sql_items.append(f"'{iv.replace(chr(39), chr(39)+chr(39))}'")
+                elif isinstance(iv, list):
+                    # Nested list literal — recursively translate via the list branch
+                    sql_items.append(translate_expression(item, context, segment=segment))
                 else: sql_items.append(str(iv))
             else:
                 sql_items.append(translate_expression(item, context, segment=segment))
@@ -4334,12 +4338,22 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
         return "CAST(DATEDIFF('ms', '1970-01-01', GETDATE()) AS BIGINT)"
     if fn == "randomuuid":
         return "SQLUser.NEWID()"
+    if fn == "date":
+        if not args:
+            return "NULL"
+        return args[0]
     if fn in ("datetime", "localdatetime"):
-        return f"CAST(GETDATE() AS TIMESTAMP)" if not args else f"CAST({args[0]} AS TIMESTAMP)"
+        if not args:
+            return "NULL"
+        return args[0]
     if fn in ("localtime", "time"):
-        return f"CAST(GETDATE() AS TIME)"
+        if not args:
+            return "NULL"
+        return args[0]
     if fn == "duration":
-        return f"CAST({args[0]} AS VARCHAR(256))" if args else "NULL"
+        if not args:
+            return "NULL"
+        return args[0]
     return None
 
 
