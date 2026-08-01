@@ -147,11 +147,18 @@ def _remap_node_columns(actual_row: dict, tck_columns: list[str], actual_columns
         labels_key = f"{col}_labels"
         props_key = f"{col}_props"
         if id_key in actual_columns and labels_key in actual_columns and props_key in actual_columns:
-            result[col] = {
-                "_id": actual_row.get(id_key),
-                "_labels": actual_row.get(labels_key),
-                "_props": actual_row.get(props_key),
-            }
+            node_id = actual_row.get(id_key)
+            node_labels = actual_row.get(labels_key)
+            node_props = actual_row.get(props_key)
+            # All-None triplet = null node (from OPTIONAL MATCH with no results)
+            if node_id is None and node_labels is None and node_props is None:
+                result[col] = None
+            else:
+                result[col] = {
+                    "_id": node_id,
+                    "_labels": node_labels,
+                    "_props": node_props,
+                }
     return result
 
 
