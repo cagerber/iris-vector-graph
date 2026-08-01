@@ -255,6 +255,12 @@ class TranslationContext:
         self.column_name_map: Dict[str, str] = (
             {} if parent is None else parent.column_name_map
         )
+        # OPTIONAL MATCH null-row fallback: when set, the generated SQL gains a
+        # UNION ALL branch that emits one null row when the label has no nodes.
+        # List of (label_value, param_placeholder) tuples — one per optional label constraint.
+        self.optional_null_row_labels: List[tuple] = []
+        # Parallel list of SQL values for the null row, one per select item.
+        self.optional_null_row_items: List[str] = []
 
     def next_alias(self, prefix: str = "t") -> str:
         alias = f"{prefix}{self._alias_counter}"
@@ -1439,6 +1445,27 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
 
     _tts_collect_path_funcs(cypher_query, vl)
 
+    # OPTIONAL MATCH null-row fallback: append UNION ALL SELECT <nulls> WHERE NOT EXISTS
+    # This handles the Cypher semantics: if the optional pattern matches 0 rows, yield
+    # one null row instead of 0 rows.
+    optional_union_sql = ""
+    optional_extra_params: List[Any] = []
+    if context.optional_null_row_labels and context.optional_null_row_items:
+        null_items = context.optional_null_row_items
+        # Build the null-row SELECT: pad with NULLs if fewer items than select columns
+        while len(null_items) < len(context.select_items):
+            null_items.append("NULL")
+        null_select = ", ".join(null_items[:len(context.select_items)])
+        # NOT EXISTS check: all label constraints must have 0 matching nodes
+        not_exists_parts = []
+        for label in context.optional_null_row_labels:
+            not_exists_parts.append(
+                f"NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE label = ?)"
+            )
+            optional_extra_params.append(label)
+        where_clause = " AND ".join(not_exists_parts)
+        optional_union_sql = f"\nUNION ALL\nSELECT {null_select} WHERE {where_clause}"
+
     all_ctes = [
         c
         for c in getattr(context, "cte_clauses", [])
@@ -1448,9 +1475,11 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
         sql, all_ctes = _demote_agg_stages_to_subqueries(sql, all_ctes)
         if all_ctes:
             sql = "WITH " + ",\n".join(all_ctes) + "\n" + sql
+        if optional_union_sql:
+            sql += optional_union_sql
         return SQLQuery(
             sql=sql,
-            parameters=[context.all_stage_params + p],
+            parameters=[context.all_stage_params + p + optional_extra_params],
             query_metadata=metadata,
             var_length_paths=vl,
             bolt_column_types=_build_bolt_column_types(cypher_query, context),
@@ -1458,9 +1487,12 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
         )
 
     sql = _maybe_split_deep_joins(sql, p, context)
+    if optional_union_sql:
+        sql += optional_union_sql
 
     return SQLQuery(
-        sql=sql, parameters=[p], query_metadata=metadata, var_length_paths=vl,
+        sql=sql, parameters=[p + optional_extra_params], query_metadata=metadata,
+        var_length_paths=vl,
         bolt_column_types=_build_bolt_column_types(cypher_query, context),
         column_name_map=dict(context.column_name_map),
     )
@@ -2327,6 +2359,14 @@ def translate_node_pattern(node, context, metadata, optional=False):
                 return
 
     nodes_tbl = _table("nodes")
+    # For OPTIONAL MATCH, the "optional" semantics mean: if the whole pattern matches
+    # nothing, produce one null row. The label/property constraints on the anchor node
+    # (the first node in the query, when from_clauses is still empty) are still
+    # restrictive — use INNER JOIN so only nodes carrying the label are returned.
+    # LEFT OUTER JOIN is reserved for extending an already-bound variable (e.g. the
+    # target node in MATCH (a) OPTIONAL MATCH (a)-->(b)).
+    is_anchor_optional = optional and not context.from_clauses
+    effective_jt = "JOIN" if is_anchor_optional else jt
     if not context.from_clauses:
         context.from_clauses.append(f"{nodes_tbl} {alias}")
     elif f"{nodes_tbl} {alias}" not in context.from_clauses and not any(
@@ -2338,18 +2378,21 @@ def translate_node_pattern(node, context, metadata, optional=False):
             l_alias = context.next_alias("l")
             labels_inlined = ", ".join(f"'{lab}'" for lab in node.labels)
             context.join_clauses.append(
-                f"{jt} {_table('rdf_labels')} {l_alias} ON {l_alias}.s = {alias}.node_id AND {l_alias}.label IN ({labels_inlined})"
+                f"{effective_jt} {_table('rdf_labels')} {l_alias} ON {l_alias}.s = {alias}.node_id AND {l_alias}.label IN ({labels_inlined})"
             )
-            if not optional:
+            if not optional or is_anchor_optional:
                 context.where_conditions.append(f"{l_alias}.s IS NOT NULL")
         else:
             for label in node.labels:
                 l_alias = context.next_alias("l")
+                label_param = context.add_join_param(label)
                 context.join_clauses.append(
-                    f"{jt} {_table('rdf_labels')} {l_alias} ON {l_alias}.s = {alias}.node_id AND {l_alias}.label = {context.add_join_param(label)}"
+                    f"{effective_jt} {_table('rdf_labels')} {l_alias} ON {l_alias}.s = {alias}.node_id AND {l_alias}.label = {label_param}"
                 )
-                if not optional:
+                if not optional or is_anchor_optional:
                     context.where_conditions.append(f"{l_alias}.s IS NOT NULL")
+                if is_anchor_optional:
+                    context.optional_null_row_labels.append(label)
     for k, v in node.properties.items():
         val_sql = translate_expression(v, context, segment="where")
         if k in ("node_id", "id"):
@@ -3378,7 +3421,7 @@ def _expr_property_reference(expr, context, segment):
     if alias.startswith("Stage"):
         if expr.property_name in ("node_id", "id"):
             return expr.variable
-        return f"SQLUser.JSON_VALUE({expr.variable}, '$.{expr.property_name}')"
+        return f"CASE WHEN {expr.variable} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({expr.variable}, '$.{expr.property_name}') END"
     if alias.startswith("e") and not alias.startswith("ES_"):
         return _expr_propref_edge_alias(expr, context, alias)
     if expr.property_name in ("node_id", "id"):
@@ -3477,7 +3520,7 @@ def _expr_slice(expr, context, segment):
 def _expr_property_access(expr, context, segment):
     base_sql = translate_expression(expr.expression, context, segment=segment)
     prop = expr.property_name.replace("'", "''")
-    return f"SQLUser.JSON_VALUE({base_sql}, '$.{prop}')"
+    return f"CASE WHEN ({base_sql}) IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({base_sql}, '$.{prop}') END"
 
 
 def _expr_variable(expr, context, segment):
@@ -4103,6 +4146,18 @@ def translate_return_clause(ret, context):
             context.select_items.append(f"{sql} AS {_safe_alias(alias).replace('.', '_')}")
         else:
             context.select_items.append(sql)
+        # Build null-row value for OPTIONAL MATCH fallback:
+        # IS NULL → 1 (null IS NULL = true), IS NOT NULL → 0, else NULL
+        if isinstance(item.expression, ast.BooleanExpression):
+            op = item.expression.operator
+            if op == ast.BooleanOperator.IS_NULL:
+                context.optional_null_row_items.append("1")
+            elif op == ast.BooleanOperator.IS_NOT_NULL:
+                context.optional_null_row_items.append("0")
+            else:
+                context.optional_null_row_items.append("NULL")
+        else:
+            context.optional_null_row_items.append("NULL")
 
 
 def translate_with_clause(with_clause, context):

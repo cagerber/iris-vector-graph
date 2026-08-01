@@ -47,17 +47,20 @@ class TestQuerySteps:
         assert ctx.last_result == mock_result
 
     def test_parameters_step_stores_params(self):
-        """And parameters are: stores dict in context.params."""
+        """And parameters are: stores dict in context.params.
+
+        TCK table format: 2-column | name | value |.
+        behave treats first row as headings, so headings = [name0, val0],
+        subsequent rows = additional pairs.
+        """
         from tests.tck.steps.query import step_parameters
 
         ctx = MagicMock()
         ctx.params = {}
-        # TCK table: | name | -> | 'Alice' |
+        # TCK table: | name | 'Alice' |  (first pair is the heading row)
         table = MagicMock()
-        table.headings = ["name"]
-        row = MagicMock()
-        row.__iter__ = MagicMock(return_value=iter(["'Alice'"]))
-        table.rows = [row]
+        table.headings = ["name", "'Alice'"]
+        table.rows = []
 
         step_parameters(ctx, table)
         assert ctx.params.get("name") == "Alice"
