@@ -1912,14 +1912,41 @@ def translate_unwind_clause(unwind, context):
         context.from_clauses.append(json_table_sql)
 
 
+def _extract_literal_value(v):
+    """Recursively extract Python values from Literal/list/dict structures.
+
+    Handles nested Literals within lists and dicts.
+    """
+    if isinstance(v, ast.Literal):
+        return _extract_literal_value(v.value)
+    elif isinstance(v, list):
+        return [_extract_literal_value(item) for item in v]
+    elif isinstance(v, dict):
+        return {k: _extract_literal_value(val) for k, val in v.items()}
+    else:
+        return v
+
+
 def _create_resolve_prop_value(v, context):
     if isinstance(v, ast.Literal):
-        return v.value
+        val = _extract_literal_value(v)
+        # JSON-encode lists and dicts for storage in rdf_props
+        if isinstance(val, (list, dict)):
+            return json.dumps(val)
+        return val
     if isinstance(v, ast.Variable) and v.name in context.input_params:
-        return context.input_params[v.name]
+        val = context.input_params[v.name]
+        # JSON-encode lists and dicts for storage in rdf_props
+        if isinstance(val, (list, dict)):
+            return json.dumps(val)
+        return val
     if isinstance(v, ast.Variable) and getattr(context, "foreach_literals", {}).get(v.name) is not None:
         raw = context.foreach_literals[v.name]
-        return raw.value if isinstance(raw, ast.Literal) else raw
+        val = _extract_literal_value(raw)
+        # JSON-encode lists and dicts for storage in rdf_props
+        if isinstance(val, (list, dict)):
+            return json.dumps(val)
+        return val
     if isinstance(v, ast.Variable) and v.name not in context.variable_aliases:
         raise SyntaxError(f"Undefined variable: {v.name}")
     return v
