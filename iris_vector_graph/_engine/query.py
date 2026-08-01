@@ -226,6 +226,10 @@ class QueryMixin:
             result.metadata = metadata
             if sql_query.bolt_column_types:
                 result.bolt_column_types = sql_query.bolt_column_types
+            if sql_query.column_name_map and result.columns:
+                result.columns = [
+                    sql_query.column_name_map.get(col, col) for col in result.columns
+                ]
             return result
         traversal = self._extract_traversal(parsed, parameters)
         if traversal is not None:

@@ -48,10 +48,16 @@ def step_parameters(context, table=None):
     if table is None:
         table = context.table
     params = {}
+    # TCK table format: first column = param name, second column = value.
+    # The table header row itself is row 0 (behave treats it as headings).
+    # First, treat the heading row as a name=value pair.
+    headings = table.headings
+    if len(headings) == 2:
+        params[headings[0]] = TCKValue.parse(headings[1]).python
     for row in table.rows:
         values = list(row)
-        for i, heading in enumerate(table.headings):
-            params[heading] = TCKValue.parse(values[i]).python
+        if len(values) >= 2:
+            params[values[0]] = TCKValue.parse(values[1]).python
     context.params = params
 
 

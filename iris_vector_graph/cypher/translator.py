@@ -172,6 +172,8 @@ class SQLQuery(BaseModel):
     query_metadata: QueryMetadata = Field(default_factory=QueryMetadata)
     is_transactional: bool = False
     var_length_paths: Optional[List[dict]] = None
+    # Mapping from SQL-safe column alias → desired Cypher column name, for renaming after execution.
+    column_name_map: Dict[str, str] = Field(default_factory=dict)
     # Parallel list to the result columns: each entry is "scalar", "node", or "relationship".
     # Consumed by the Bolt server to emit correct PackStream struct tags (TAG_NODE / TAG_RELATIONSHIP).
     bolt_column_types: List[str] = Field(default_factory=list)
@@ -248,6 +250,10 @@ class TranslationContext:
         self.pending_where = None
         self.mapped_node_aliases: Dict[str, dict] = (
             {} if parent is None else parent.mapped_node_aliases.copy()
+        )
+        # Maps SQL-safe column alias → Cypher expression text for post-execution column renaming.
+        self.column_name_map: Dict[str, str] = (
+            {} if parent is None else parent.column_name_map
         )
 
     def next_alias(self, prefix: str = "t") -> str:
@@ -1448,6 +1454,7 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
             query_metadata=metadata,
             var_length_paths=vl,
             bolt_column_types=_build_bolt_column_types(cypher_query, context),
+            column_name_map=dict(context.column_name_map),
         )
 
     sql = _maybe_split_deep_joins(sql, p, context)
@@ -1455,6 +1462,7 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
     return SQLQuery(
         sql=sql, parameters=[p], query_metadata=metadata, var_length_paths=vl,
         bolt_column_types=_build_bolt_column_types(cypher_query, context),
+        column_name_map=dict(context.column_name_map),
     )
 
 
@@ -2958,23 +2966,45 @@ def _boolean_expr_logical(op, expr, context):
         sb = translate_boolean_expression(b, context)
         return f"(({sa} AND NOT ({sb})) OR (NOT ({sa}) AND {sb}))"
     if op == ast.BooleanOperator.NOT:
-        return f"NOT ({translate_boolean_expression(expr.operands[0], context)})"
+        operand = expr.operands[0]
+        # NOT null = null (three-valued logic)
+        if isinstance(operand, ast.Literal) and operand.value is None:
+            return "NULL"
+        return f"NOT ({translate_boolean_expression(operand, context)})"
     return None
 
 
 def _boolean_expr_in(left, right_expr, context):
     if isinstance(right_expr, ast.Literal) and isinstance(right_expr.value, list):
         items = right_expr.value
+        # Separate null items from non-null items for 3VL: x IN [a, null, b]
+        # = x IN (a, b) OR NULL (unknown if no exact match but list has nulls)
+        null_items = [i for i in items if isinstance(i, ast.Literal) and i.value is None]
+        non_null_items = [i for i in items if not (isinstance(i, ast.Literal) and i.value is None)]
+        if not non_null_items:
+            # All null: x IN [null] = null (handled by caller null check for left=null, else null)
+            return "NULL"
         placeholders = ", ".join(
             context.add_where_param(item.value if isinstance(item, ast.Literal) else item)
-            for item in items
+            for item in non_null_items
         )
-        return f"{left} IN ({placeholders})"
+        in_expr = f"{left} IN ({placeholders})"
+        if null_items:
+            # 3VL: if x matches → true; if x doesn't match and list has null → null
+            return f"CASE WHEN {in_expr} THEN 1 ELSE NULL END"
+        return in_expr
     if isinstance(right_expr, ast.Variable) and right_expr.name in context.input_params:
         val = context.input_params[right_expr.name]
         if isinstance(val, list):
-            placeholders = ", ".join(context.add_where_param(v) for v in val)
-            return f"{left} IN ({placeholders})"
+            null_vals = [v for v in val if v is None]
+            non_null_vals = [v for v in val if v is not None]
+            if not non_null_vals:
+                return "NULL"
+            placeholders = ", ".join(context.add_where_param(v) for v in non_null_vals)
+            in_expr = f"{left} IN ({placeholders})"
+            if null_vals:
+                return f"CASE WHEN {in_expr} THEN 1 ELSE NULL END"
+            return in_expr
     return None
 
 
@@ -3006,11 +3036,37 @@ def translate_boolean_expression(expr, context) -> str:
         return logical
     left_expr = expr.operands[0]
     right_expr = expr.operands[1] if len(expr.operands) > 1 else None
-    left = translate_expression(left_expr, context, segment="where")
-    if op == ast.BooleanOperator.IS_NULL:
-        return f"{left} IS NULL"
-    if op == ast.BooleanOperator.IS_NOT_NULL:
+    if op in (ast.BooleanOperator.IS_NULL, ast.BooleanOperator.IS_NOT_NULL):
+        # Use segment="select" to avoid the structural-guard EXISTS clause —
+        # IS NULL explicitly handles the missing-property case via LEFT JOIN.
+        left = translate_expression(left_expr, context, segment="select")
+        if op == ast.BooleanOperator.IS_NULL:
+            return f"{left} IS NULL"
         return f"{left} IS NOT NULL"
+    # Cypher three-valued logic: any comparison involving NULL yields NULL (unknown).
+    # This includes null = null, null <> null, null < x, x IN [null], null IN [...], etc.
+    _left_is_null = isinstance(left_expr, ast.Literal) and left_expr.value is None
+    _right_is_null = right_expr is not None and isinstance(right_expr, ast.Literal) and right_expr.value is None
+    # Also check parameter variables whose resolved value is null
+    if not _left_is_null and isinstance(left_expr, ast.Variable):
+        _left_val = context.input_params.get(left_expr.name)
+        _left_is_null = _left_val is None and left_expr.name in context.input_params
+    if not _right_is_null and right_expr is not None and isinstance(right_expr, ast.Variable):
+        _right_val = context.input_params.get(right_expr.name)
+        _right_is_null = _right_val is None and right_expr.name in context.input_params
+    if (_left_is_null or _right_is_null) and op not in (
+        ast.BooleanOperator.IS_NULL, ast.BooleanOperator.IS_NOT_NULL
+    ):
+        # Special case: null IN [] = false (empty list, no unknowns possible)
+        if op == ast.BooleanOperator.IN and _left_is_null:
+            if isinstance(right_expr, ast.Literal) and right_expr.value == []:
+                return "(1=0)"  # false
+            if isinstance(right_expr, ast.Variable):
+                _rcoll = context.input_params.get(right_expr.name)
+                if isinstance(_rcoll, list) and len(_rcoll) == 0:
+                    return "(1=0)"  # false
+        return "NULL"
+    left = translate_expression(left_expr, context, segment="where")
     if op == ast.BooleanOperator.IN:
         in_sql = _boolean_expr_in(left, right_expr, context)
         if in_sql is not None:
@@ -3881,6 +3937,14 @@ def _expr_function_call(expr, context, segment):
 
 def _expr_boolean(expr, context, segment):
     cond = translate_boolean_expression(expr, context)
+    # If the condition evaluates to SQL NULL (e.g. NOT null, null = null),
+    # the result must also be NULL (Cypher three-valued logic).
+    if cond == "NULL":
+        return "NULL"
+    # If translate_boolean_expression already returned a 1/0/NULL CASE expression
+    # (e.g. for IN with null list elements), don't wrap it again.
+    if cond.startswith("CASE WHEN ") and (" THEN 1 ELSE NULL END" in cond or " THEN 1 ELSE 0 END" in cond):
+        return cond
     return f"CASE WHEN ({cond}) THEN 1 ELSE 0 END"
 
 
@@ -3932,11 +3996,50 @@ _IRIS_RESERVED = frozenset({
     "order","group","index","select","from","where","join","having",
     "union","insert","update","delete","create","drop","alter","set",
     "table","schema","column","row","data","id","user","date","time",
+    "result","results","null","true","false","top","exists","not","and","or",
 })
 
 
 def _safe_alias(a: str) -> str:
     return f'"{a}"' if a and a.lower() in _IRIS_RESERVED else a
+
+
+def _expr_to_cypher_text(expr) -> str:
+    """Return a Cypher-text representation of an expression for use as a column alias."""
+    if isinstance(expr, ast.PropertyReference):
+        return f"{expr.variable}.{expr.property_name}"
+    if isinstance(expr, ast.Variable):
+        return expr.name
+    if isinstance(expr, ast.Literal):
+        return repr(expr.value)
+    if isinstance(expr, ast.BooleanExpression):
+        op = expr.operator
+        if op in (ast.BooleanOperator.IS_NULL, ast.BooleanOperator.IS_NOT_NULL):
+            left = _expr_to_cypher_text(expr.operands[0])
+            suffix = "IS NULL" if op == ast.BooleanOperator.IS_NULL else "IS NOT NULL"
+            return f"{left} {suffix}"
+        if op == ast.BooleanOperator.NOT and len(expr.operands) == 1:
+            return f"NOT {_expr_to_cypher_text(expr.operands[0])}"
+        op_str = {
+            ast.BooleanOperator.AND: "AND",
+            ast.BooleanOperator.OR: "OR",
+            ast.BooleanOperator.EQ: "=",
+            ast.BooleanOperator.NEQ: "<>",
+            ast.BooleanOperator.LT: "<",
+            ast.BooleanOperator.LTE: "<=",
+            ast.BooleanOperator.GT: ">",
+            ast.BooleanOperator.GTE: ">=",
+            ast.BooleanOperator.IN: "IN",
+            ast.BooleanOperator.CONTAINS: "CONTAINS",
+            ast.BooleanOperator.STARTS_WITH: "STARTS WITH",
+            ast.BooleanOperator.ENDS_WITH: "ENDS WITH",
+        }.get(op, str(op))
+        parts = [_expr_to_cypher_text(o) for o in expr.operands]
+        return f" {op_str} ".join(parts)
+    if isinstance(expr, ast.FunctionCall):
+        args = ", ".join(_expr_to_cypher_text(a) for a in expr.arguments)
+        return f"{expr.function_name}({args})"
+    return ""
 
 
 def translate_return_clause(ret, context):
@@ -3974,15 +4077,28 @@ def translate_return_clause(ret, context):
                 continue
         sql = translate_expression(item.expression, context, segment="select")
         alias = item.alias
+        cypher_col = None  # Cypher-text column name for post-execution remapping
         if alias is None:
             if isinstance(item.expression, ast.PropertyReference):
                 alias = f"{item.expression.variable}_{item.expression.property_name}"
+                cypher_col = f"{item.expression.variable}.{item.expression.property_name}"
             elif isinstance(item.expression, ast.Variable):
                 alias = item.expression.name
             elif isinstance(
                 item.expression, (ast.AggregationFunction, ast.FunctionCall)
             ):
                 alias = f"{item.expression.function_name}_res"
+            else:
+                cypher_text = _expr_to_cypher_text(item.expression)
+                if cypher_text:
+                    import re as _re_alias
+                    # Build a SQL-safe alias (replace non-identifier chars with underscores)
+                    alias = _re_alias.sub(r'[^A-Za-z0-9_]', '_', cypher_text)
+                    if alias and alias[0].isdigit():
+                        alias = f"_{alias}"
+                    # Register the mapping so the engine can rename after execution
+                    if alias and cypher_text != alias:
+                        context.column_name_map[alias] = cypher_text
         if alias:
             context.select_items.append(f"{sql} AS {_safe_alias(alias).replace('.', '_')}")
         else:
