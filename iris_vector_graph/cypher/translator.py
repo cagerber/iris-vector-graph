@@ -3742,6 +3742,11 @@ def translate_boolean_expression(expr, context) -> str:
             prop_expr = translate_expression(expr, context, segment="where")
             # Convert VARCHAR '1'/'0' to boolean: property = '1'
             return f"({prop_expr} = '1')"
+        # Variable in boolean context — may be VARCHAR 'true'/'false'/'1'/'0' from UNWIND/JSON_TABLE.
+        # Coerce to boolean comparison so IRIS doesn't get CASE WHEN (varchar_col).
+        if isinstance(expr, ast.Variable):
+            var_sql = translate_expression(expr, context, segment="where")
+            return f"({var_sql} IN ('1', 'true', 'TRUE'))"
         return translate_expression(expr, context, segment="where")
     op = expr.operator
     logical = _boolean_expr_logical(op, expr, context)
@@ -3780,11 +3785,16 @@ def translate_boolean_expression(expr, context) -> str:
                     return "(1=0)"  # false
         return "NULL"
     left = translate_expression(left_expr, context, segment="where")
+    # Wrap CASE WHEN expressions in parens — IRIS SQLCODE -25 if bare CASE ends before =
+    if left.startswith("CASE WHEN ") and " END" in left:
+        left = f"({left})"
     if op == ast.BooleanOperator.IN:
         in_sql = _boolean_expr_in(left, right_expr, context)
         if in_sql is not None:
             return in_sql
     right = translate_expression(right_expr, context, segment="where")
+    if right.startswith("CASE WHEN ") and " END" in right:
+        right = f"({right})"
     if op in (
         ast.BooleanOperator.LESS_THAN,
         ast.BooleanOperator.LESS_THAN_OR_EQUAL,
@@ -4088,7 +4098,7 @@ def _expr_propref_edge_alias(expr, context, alias):
         return f"{alias}.{'_dst' if is_undirected else 'o_id'}"
     if is_undirected or is_edgescan:
         return "NULL"
-    return f"SQLUser.JSON_VALUE({alias}.qualifiers, '$.{expr.property_name}')"
+    return f"CASE WHEN {alias}.qualifiers IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({alias}.qualifiers, '$.{expr.property_name}') END"
 
 
 def _expr_property_reference(expr, context, segment):
