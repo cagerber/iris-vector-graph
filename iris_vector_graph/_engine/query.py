@@ -218,6 +218,10 @@ class QueryMixin:
         if sql_query.is_transactional:
             result = self._store.execute_transaction(sql_query.sql, sql_query.parameters)
             result.metadata = metadata
+            if sql_query.column_name_map and result.columns:
+                result.columns = [
+                    sql_query.column_name_map.get(col, col) for col in result.columns
+                ]
             return result
         if self._store_capabilities.get("native_sql", True):
             sql_str = sql_query.sql

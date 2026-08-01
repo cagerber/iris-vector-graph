@@ -336,8 +336,20 @@ class TranslationContext:
         if expanded_joins:
             parts.extend(expanded_joins)
         if self.where_conditions:
-            ordered = sorted(self.where_conditions, key=self._predicate_cost)
-            parts.append(f"WHERE {' AND '.join(ordered)}")
+            # Pair each condition with its param slice so sorting keeps params aligned.
+            wp = list(self.where_params)
+            offset = 0
+            paired = []
+            for cond in self.where_conditions:
+                n = cond.count("?")
+                paired.append((cond, wp[offset : offset + n]))
+                offset += n
+            paired.sort(key=lambda x: self._predicate_cost(x[0]))
+            ordered_conds = [p[0] for p in paired]
+            ordered_where_params = [v for p in paired for v in p[1]]
+            parts.append(f"WHERE {' AND '.join(ordered_conds)}")
+        else:
+            ordered_where_params = list(self.where_params)
         if self.group_by_items:
             parts.append(f"GROUP BY {', '.join(self.group_by_items)}")
         if self.having_conditions:
@@ -346,7 +358,7 @@ class TranslationContext:
         params = (
             (self.select_params if not select_override else [])
             + self.join_params
-            + self.where_params
+            + ordered_where_params
         )
         return sql, params
 
@@ -1309,6 +1321,9 @@ def _tts_process_parts(cypher_query, context, metadata):
             is_transactional = True
             aliases_before = dict(context.variable_aliases)
             last_iter_aliases = dict(context.variable_aliases)
+            # Accumulate created node IDs per variable for use in RETURN
+            if not hasattr(context, "_unwind_create_node_ids"):
+                context._unwind_create_node_ids = {}  # var_name → [uuid, ...]
             for item in unwind_literals:
                 item_val = item.value if isinstance(item, ast.Literal) else item
                 # Start each iteration from the pre-loop state so new vars don't accumulate
@@ -1323,6 +1338,18 @@ def _tts_process_parts(cypher_query, context, metadata):
                         translate_updating_clause(clause, context, metadata)
                     elif isinstance(clause, ast.WhereClause):
                         translate_where_clause(clause, context)
+                # Collect node IDs created in this iteration
+                for var_name in set(context.variable_aliases) - set(aliases_before):
+                    nid = context.input_params.get(f"__create_id_{var_name}")
+                    if nid:
+                        context._unwind_create_node_ids.setdefault(var_name, []).append(nid)
+                # Collect relationship identities created in this iteration
+                if not hasattr(context, "_unwind_create_rel_ids"):
+                    context._unwind_create_rel_ids = {}  # var_name → [(s,p,o), ...]
+                for var_name in set(context.variable_aliases) - set(aliases_before):
+                    edge_key = context.input_params.get(f"__create_edge_{var_name}")
+                    if edge_key:
+                        context._unwind_create_rel_ids.setdefault(var_name, []).append(edge_key)
                 last_iter_aliases = dict(context.variable_aliases)
             if hasattr(context, "foreach_literals"):
                 context.foreach_literals.pop(unwind_clause.alias, None)
@@ -1349,8 +1376,72 @@ def _tts_process_parts(cypher_query, context, metadata):
         if part.procedure_call is not None:
             translate_procedure_call(part.procedure_call, context)
         if part.with_clause:
+            # If UNWIND+CREATE relationship expansion ran, reset context to correct single-table
+            # structure before building the WITH stage (avoids 5-JOIN spurious structure).
+            _apply_unwind_create_context_reset(context)
             _to_sql_handle_with(part, context, i)
     return is_transactional
+
+
+def _apply_unwind_create_context_reset(context):
+    """Reset FROM/JOIN/WHERE to correct single-table structure after UNWIND+CREATE expansion.
+
+    Called before translating a WITH clause or RETURN that follows UNWIND+CREATE.
+    Prevents the accumulated per-iteration JOIN structure from leaking into CTEs.
+    """
+    unwind_node_ids = getattr(context, "_unwind_create_node_ids", {})
+    if unwind_node_ids:
+        context.select_items, context.select_params = [], []
+        context.join_clauses, context.join_params = [], []
+        context.where_conditions, context.where_params = [], []
+        first_node_alias = None
+        for var_name, ids in unwind_node_ids.items():
+            if not ids:
+                continue
+            node_alias = context.next_alias("n")
+            if first_node_alias is None:
+                first_node_alias = node_alias
+            context.variable_aliases[var_name] = node_alias
+            placeholders = ",".join(["?"] * len(ids))
+            context.where_conditions.append(f"{node_alias}.node_id IN ({placeholders})")
+            context.where_params.extend(ids)
+        if first_node_alias is not None:
+            context.from_clauses = [f"{_table('nodes')} {first_node_alias}"]
+            for var_name, ids in list(unwind_node_ids.items())[1:]:
+                if not ids:
+                    continue
+                na = context.variable_aliases[var_name]
+                context.from_clauses.append(f"{_table('nodes')} {na}")
+        return
+
+    unwind_rel_ids = getattr(context, "_unwind_create_rel_ids", {})
+    if unwind_rel_ids:
+        context.select_items, context.select_params = [], []
+        context.join_clauses, context.join_params = [], []
+        context.where_conditions, context.where_params = [], []
+        first_edge_alias = None
+        for var_name, triples in unwind_rel_ids.items():
+            if not triples:
+                continue
+            e_alias = context.next_alias("e")
+            if first_edge_alias is None:
+                first_edge_alias = e_alias
+            context.variable_aliases[var_name] = e_alias
+            conds = []
+            for s_id, p_val, o_id in triples:
+                conds.append(
+                    f"({e_alias}.s = {context.add_where_param(s_id)}"
+                    f" AND {e_alias}.p = {context.add_where_param(p_val)}"
+                    f" AND {e_alias}.o_id = {context.add_where_param(o_id)})"
+                )
+            context.where_conditions.append("(" + " OR ".join(conds) + ")")
+        if first_edge_alias is not None:
+            context.from_clauses = [f"{_table('rdf_edges')} {first_edge_alias}"]
+            for var_name in list(unwind_rel_ids.keys())[1:]:
+                if not unwind_rel_ids[var_name]:
+                    continue
+                ea = context.variable_aliases[var_name]
+                context.from_clauses.append(f"{_table('rdf_edges')} {ea}")
 
 
 def _tts_finalize_context(cypher_query, context):
@@ -1363,7 +1454,11 @@ def _tts_finalize_context(cypher_query, context):
         if cypher_query.query_parts
         else False
     )
-    if context.stages and last_part_had_with:
+    # A WITH clause in any query part (not just the last) may have produced stages.
+    any_part_had_with = any(
+        qp.with_clause is not None for qp in cypher_query.query_parts
+    ) if cypher_query.query_parts else False
+    if context.stages and (last_part_had_with or any_part_had_with):
         context.select_items, context.select_params = [], []
         context.from_clauses, context.join_clauses, context.join_params = (
             [f"Stage{len(context.stages)}"],
@@ -1371,6 +1466,12 @@ def _tts_finalize_context(cypher_query, context):
             [],
         )
         context.where_conditions, context.where_params = [], []
+
+    # UNWIND+CREATE+RETURN: foreach expansion created nodes/relationships and tracked their IDs.
+    # Reset context to a fresh single-table scan filtered to the collected IDs.
+    # Skip when any query part had a WITH — the Stage CTE already handles scoping.
+    if cypher_query.return_clause and not any_part_had_with:
+        _apply_unwind_create_context_reset(context)
 
     if cypher_query.return_clause:
          translate_return_clause(cypher_query.return_clause, context)
@@ -1451,6 +1552,7 @@ def _tts_transactional_result(cypher_query, context, metadata, order_by_items):
         parameters=all_params,
         query_metadata=metadata,
         is_transactional=True,
+        column_name_map=dict(context.column_name_map),
     )
 
 
@@ -1688,27 +1790,46 @@ def apply_pagination(
             sql = sql.rstrip() + "\nFROM (SELECT 1) __dual"
     # Build-106 workaround: IRIS 2026.3.0AI build 106 SIGSEGVs in %qaqpre when a
     # multi-table JOIN is combined with `FETCH FIRST n ROWS ONLY` on VARCHAR-keyed
-    # tables (the ivg schema). `SELECT TOP n` does NOT crash. When the engine has
-    # detected the bug (engine._fetch_first_unsafe, set by a connect-time probe) and
-    # there is a LIMIT with NO SKIP (TOP cannot express OFFSET), emit TOP instead.
+    # tables (the ivg schema). `SELECT TOP n` does NOT crash for LIMIT-only queries.
+    # For SKIP+LIMIT, wrap in a ROW_NUMBER subquery (also avoids FETCH FIRST).
     engine = getattr(context, "_engine", None)
     fetch_first_unsafe = bool(getattr(engine, "_fetch_first_unsafe", False))
-    if (
-        limit is not None
-        and skip is None
-        and fetch_first_unsafe
-        and sql.lstrip().upper().startswith("SELECT ")
-        and " TOP " not in sql.split("\n", 1)[0].upper()
-    ):
-        # Inject `TOP n` right after the leading SELECT (and after DISTINCT if present).
-        head, sep, rest = sql.partition("SELECT ")
-        if rest[:9].upper().startswith("DISTINCT "):
-            rest = "DISTINCT " + f"TOP {limit} " + rest[9:]
-        else:
-            rest = f"TOP {limit} " + rest
-        return head + sep + rest
+    if fetch_first_unsafe and sql.lstrip().upper().startswith("SELECT "):
+        if limit is not None and skip is not None:
+            # ROW_NUMBER subquery handles SKIP+LIMIT without FETCH FIRST/OFFSET
+            sql = (
+                f"SELECT * FROM (\n"
+                f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({sql}) __q\n"
+                f") __paged WHERE __rn > {skip} AND __rn <= {skip + limit}"
+            )
+            return sql
+        if limit is not None and " TOP " not in sql.split("\n", 1)[0].upper():
+            # LIMIT only: inject TOP (no OFFSET needed)
+            head, sep, rest = sql.partition("SELECT ")
+            if rest[:9].upper().startswith("DISTINCT "):
+                rest = "DISTINCT " + f"TOP {limit} " + rest[9:]
+            else:
+                rest = f"TOP {limit} " + rest
+            return head + sep + rest
+        if skip is not None:
+            # SKIP only with unsafe FETCH FIRST: use ROW_NUMBER
+            sql = (
+                f"SELECT * FROM (\n"
+                f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({sql}) __q\n"
+                f") __paged WHERE __rn > {skip}"
+            )
+            return sql
     if limit is not None:
-        sql += f"\nFETCH FIRST {limit} ROWS ONLY"
+        if limit == 0 and sql.lstrip().upper().startswith("SELECT "):
+            # FETCH FIRST 0 ROWS ONLY hangs on IRIS 2026.x builds; use TOP 0 instead
+            head, sep, rest = sql.partition("SELECT ")
+            if rest[:9].upper().startswith("DISTINCT "):
+                rest = "DISTINCT TOP 0 " + rest[9:]
+            else:
+                rest = "TOP 0 " + rest
+            sql = head + sep + rest
+        else:
+            sql += f"\nFETCH FIRST {limit} ROWS ONLY"
     if skip is not None:
         sql += f"\nOFFSET {skip}"
     return sql
@@ -1896,10 +2017,29 @@ def _create_clause_relationship_entry(rel, i, pat, context):
     t_id = _create_clause_resolve_node_id(t_id_expr, target_node, context)
     if s_id and t_id:
         for rt in rel.types:
-            context.add_dml(
-                f"INSERT INTO {_table('rdf_edges')} (s, p, o_id) VALUES (?, ?, ?)",
-                [s_id, rt, t_id],
-            )
+            rel_props_raw = {
+                k: (v.value if isinstance(v, ast.Literal) else
+                    context.foreach_literals.get(v.name)
+                    if isinstance(v, ast.Variable) and hasattr(context, "foreach_literals")
+                    else None)
+                for k, v in rel.properties.items()
+            }
+            # Exclude null values (null props are not stored per openCypher semantics)
+            rel_props = {k: v for k, v in rel_props_raw.items() if v is not None}
+            if rel_props:
+                import json as _json
+                # Store all values as strings — JSON_VALUE returns VARCHAR; ints stored
+                # as JSON numbers are returned as NULL by IRIS SQLUser.JSON_VALUE.
+                qualifiers_json = _json.dumps({k: str(v) for k, v in rel_props.items()})
+                context.add_dml(
+                    f"INSERT INTO {_table('rdf_edges')} (s, p, o_id, qualifiers) VALUES (?, ?, ?, ?)",
+                    [s_id, rt, t_id, qualifiers_json],
+                )
+            else:
+                context.add_dml(
+                    f"INSERT INTO {_table('rdf_edges')} (s, p, o_id) VALUES (?, ?, ?)",
+                    [s_id, rt, t_id],
+                )
     else:
         s_alias = (
             context.variable_aliases.get(source_node.variable)
@@ -1970,6 +2110,49 @@ def translate_create_clause(create, context, metadata):
             _create_clause_node_entry(node, context)
         for i, rel in enumerate(pat.relationships):
             _create_clause_relationship_entry(rel, i, pat, context)
+            if rel.variable:
+                _register_created_relationship(rel, i, pat, context)
+
+
+def _register_created_relationship(rel, i, pat, context):
+    """Register a named relationship created by CREATE so RETURN r works."""
+    left_node, right_node = pat.nodes[i], pat.nodes[i + 1]
+    if rel.direction == ast.Direction.INCOMING:
+        source_node, target_node = right_node, left_node
+    else:
+        source_node, target_node = left_node, right_node
+
+    def _node_id(node):
+        if node.variable:
+            nid = context.input_params.get(f"__create_id_{node.variable}")
+            if nid:
+                return nid
+            return context.input_params.get(node.variable)
+        return context.input_params.get(f"__create_id_anon_{id(node)}")
+
+    s_id = _node_id(source_node)
+    t_id = _node_id(target_node)
+    rel_type = rel.types[0] if rel.types else None
+    e_alias = context.register_variable(rel.variable, prefix="e")
+    if s_id and t_id and rel_type:
+        # Store identity for UNWIND+CREATE relationship tracking in _tts_finalize_context
+        if rel.variable:
+            context.input_params[f"__create_edge_{rel.variable}"] = (s_id, rel_type, t_id)
+        if not context.from_clauses:
+            context.from_clauses.append(f"{_table('rdf_edges')} {e_alias}")
+        else:
+            context.join_clauses.append(
+                f"JOIN {_table('rdf_edges')} {e_alias} ON "
+                f"{e_alias}.s = {context.add_join_param(s_id)}"
+                f" AND {e_alias}.p = {context.add_join_param(rel_type)}"
+                f" AND {e_alias}.o_id = {context.add_join_param(t_id)}"
+            )
+            return
+        context.where_conditions.append(
+            f"{e_alias}.s = {context.add_where_param(s_id)}"
+            f" AND {e_alias}.p = {context.add_where_param(rel_type)}"
+            f" AND {e_alias}.o_id = {context.add_where_param(t_id)}"
+        )
 
 
 def translate_delete_clause(delete, context, metadata):
@@ -1977,20 +2160,27 @@ def translate_delete_clause(delete, context, metadata):
         alias = context.variable_aliases.get(var.name)
         if not alias:
             raise SyntaxError(f"Undefined variable: {var.name}")
+        # When alias is a CTE stage (e.g. "Stage1"), the node_id column is named
+        # after the variable (e.g. "n"), not "node_id".
+        stage_names = {s.split(" AS ")[0].strip() for s in getattr(context, "stages", [])}
+        node_col = var.name if alias in stage_names else "node_id"
         cte, subquery, subparams = context.build_dml_subquery(
-            select_override=f"SELECT {alias}.node_id"
+            select_override=f"SELECT {alias}.{node_col}"
         )
+        # When a CTE is present, the subquery is a bare reference (no ?); params are CTE-only
+        # and used once. When no CTE, the subquery has its own ? for each IN clause.
+        dual_params = subparams if cte else subparams + subparams
         if delete.detach:
             context.add_dml(
                 f"{cte}DELETE FROM {_table('rdf_edges')} WHERE s IN ({subquery}) OR o_id IN ({subquery})",
-                subparams + subparams,
+                dual_params,
             )
         elif not alias.startswith("e"):
             # Non-DETACH DELETE: guard against connected nodes (Cypher constraint).
             # Stored as a sentinel SQL so execute_transaction can raise the right error.
             context.add_dml(
                 f"__constraint_check_delete_connected__ {cte}SELECT COUNT(*) FROM {_table('rdf_edges')} WHERE s IN ({subquery}) OR o_id IN ({subquery})",
-                subparams + subparams,
+                dual_params,
             )
         if not alias.startswith("e"):
             context.add_dml(
@@ -3542,8 +3732,17 @@ def _expr_property_reference(expr, context, segment):
         return f"{alias}.{sanitize_identifier(expr.property_name)}"
     if alias.startswith("Stage"):
         if expr.property_name in ("node_id", "id"):
-            return expr.variable
-        return f"CASE WHEN {expr.variable} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({expr.variable}, '$.{expr.property_name}') END"
+            return _safe_alias(expr.variable)
+        # Edge-qualifiers variables: use JSON_VALUE on the column value (Stage column = qualifiers JSON)
+        edge_stage_vars = getattr(context, "edge_stage_variables", set())
+        if expr.variable in context.scalar_variables or expr.variable in edge_stage_vars:
+            return f"CASE WHEN {_safe_alias(expr.variable)} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({_safe_alias(expr.variable)}, '$.{expr.property_name}') END"
+        # Node variables from Stage: JOIN rdf_props to get the property value
+        p_alias = context.next_alias("p")
+        context.join_clauses.append(
+            f'LEFT JOIN {_table("rdf_props")} {p_alias} ON {p_alias}.s = {_safe_alias(expr.variable)} AND {p_alias}."key" = {context.add_join_param(expr.property_name)}'
+        )
+        return f"{p_alias}.val"
     if alias.startswith("e") and not alias.startswith("ES_"):
         return _expr_propref_edge_alias(expr, context, alias)
     if expr.property_name in ("node_id", "id"):
@@ -3666,7 +3865,7 @@ def _expr_variable(expr, context, segment):
             return context.add_where_param(v)
         raise SyntaxError(f"Undefined variable: {expr.name}")
     if alias.startswith("Stage"):
-        return expr.name
+        return _safe_alias(expr.name)
     if alias.startswith("e"):
         is_undirected = alias in getattr(context, "_undirected_aliases", set())
         return f"{alias}.{'_p' if is_undirected else 'p'}"
@@ -4249,6 +4448,7 @@ def translate_return_clause(ret, context):
             if isinstance(item.expression, ast.PropertyReference):
                 alias = f"{item.expression.variable}_{item.expression.property_name}"
                 cypher_col = f"{item.expression.variable}.{item.expression.property_name}"
+                context.column_name_map[alias] = cypher_col
             elif isinstance(item.expression, ast.Variable):
                 alias = item.expression.name
             elif isinstance(
@@ -4316,6 +4516,15 @@ def translate_with_clause(with_clause, context):
                 alias = f"{item.expression.function_name}"
         if alias is None:
             alias = context.next_alias("v")
+        # Edge variables: expose qualifiers JSON so downstream r.prop works via JSON_VALUE(r, '$.prop')
+        if (isinstance(item.expression, ast.Variable)
+                and context.variable_aliases.get(item.expression.name, "").startswith("e")
+                and not context.variable_aliases.get(item.expression.name, "").startswith("Stage")):
+            e_alias = context.variable_aliases[item.expression.name]
+            sql = f"{e_alias}.qualifiers"
+            if not hasattr(context, "edge_stage_variables"):
+                context.edge_stage_variables = set()
+            context.edge_stage_variables.add(item.expression.name)
         context.select_items.append(f"{sql} AS {_safe_alias(alias).replace('.', '_')}")
         if has_agg and not isinstance(item.expression, ast.AggregationFunction):
             context.group_by_items.append(sql)

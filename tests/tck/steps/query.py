@@ -90,7 +90,7 @@ def _inject_match_scope(query: str, label: str) -> str:
 
 
 def _inject_match_label_in_line(line: str, label: str) -> str:
-    """Add :<label> to named node patterns in MATCH lines."""
+    """Add :<label> to named node patterns in MATCH lines. Anonymous nodes are not scoped."""
     import re
 
     def replacer(m):
