@@ -1596,10 +1596,16 @@ def _tts_finalize_context(cypher_query, context):
         qp.with_clause is not None for qp in cypher_query.query_parts
     ) if cypher_query.query_parts else False
     if context.stages and (last_part_had_with or any_part_had_with):
+        # Preserve UNWIND CROSS JOIN JSON_TABLE clauses before reset — they were
+        # added by translate_unwind_clause and must survive the stage reset.
+        unwind_joins = [
+            j for j in context.join_clauses
+            if "JSON_TABLE" in j and j.strip().startswith("CROSS JOIN")
+        ]
         context.select_items, context.select_params = [], []
         context.from_clauses, context.join_clauses, context.join_params = (
             [f"Stage{len(context.stages)}"],
-            [],
+            list(unwind_joins),
             [],
         )
         context.where_conditions, context.where_params = [], []
@@ -4250,7 +4256,14 @@ def _expr_subscript(expr, context, segment):
     base = expr.expression
     idx = expr.index
     if isinstance(base, ast.Variable) and isinstance(idx, ast.Variable):
-        node_alias = context.variable_aliases.get(base.name, "")
+        base_alias = context.variable_aliases.get(base.name, "")
+        idx_alias = context.variable_aliases.get(idx.name, "")
+        # If base is a stage scalar (list from WITH), use JSON_VALUE with dynamic path
+        if base_alias.startswith("Stage") or base.name in context.scalar_variables:
+            base_sql = translate_expression(base, context, segment=segment)
+            idx_sql = translate_expression(idx, context, segment=segment)
+            return f"SQLUser.JSON_VALUE({base_sql}, '$[' || CAST(({idx_sql}) AS VARCHAR) || ']')"
+        node_alias = base_alias
         key_val = context.input_params.get(idx.name, idx.name)
         p_alias = context.next_alias("dp")
         node_ref = f"{node_alias}.node_id" if node_alias else "NULL"
@@ -4266,10 +4279,7 @@ def _expr_subscript(expr, context, segment):
             f"'$[{i}]' COLUMNS (elem VARCHAR(1000) PATH '$')) __jt)"
         )
     idx_sql = translate_expression(idx, context, segment=segment)
-    return (
-        f"JSON_TABLE({base_sql}, '$[*]' COLUMNS "
-        f"(idx FOR ORDINALITY, elem VARCHAR(1000) PATH '$'))[{idx_sql}].elem"
-    )
+    return f"SQLUser.JSON_VALUE({base_sql}, '$[' || CAST(({idx_sql}) AS VARCHAR) || ']')"
 
 
 def _expr_slice(expr, context, segment):
@@ -4740,7 +4750,13 @@ def _expr_function_call(expr, context, segment):
         v = expr.arguments[0].value
         if not isinstance(v, str):
             return "1" if v else "0"
-    
+    # toString(bool_expr): must be checked BEFORE args translation to avoid double-parameter issue
+    if fn == "tostring" and expr.arguments:
+        arg0 = expr.arguments[0]
+        if isinstance(arg0, ast.BooleanExpression):
+            cond = translate_boolean_expression(arg0, context)
+            return f"CASE WHEN ({cond}) THEN 'true' ELSE 'false' END"
+
     def _translate_arg(a):
         if isinstance(a, ast.Literal) and not isinstance(a.value, list):
             inlined = _inline_literal(a)
@@ -4795,12 +4811,6 @@ def _expr_function_call(expr, context, segment):
         "exists": "EXISTS",
         "toboolean": "CASE WHEN",
     }
-    # toString(bool_expr): boolean comparisons evaluate to 1/0 in SQL; map to 'true'/'false'
-    if fn == "tostring" and expr.arguments:
-        arg0 = expr.arguments[0]
-        if isinstance(arg0, ast.BooleanExpression):
-            cond = translate_boolean_expression(arg0, context)
-            return f"CASE WHEN ({cond}) THEN 'true' ELSE 'false' END"
     sql_fn = _CYPHER_FN_MAP.get(fn, fn.upper())
     scalar_result = _expr_scalar_function(fn, sql_fn, args, expr.arguments, expr, context, segment)
     if scalar_result is not None:
