@@ -4203,10 +4203,15 @@ def _expr_property_reference(expr, context, segment):
         return _expr_propref_edge_alias(expr, context, alias)
     # Scalar variable from JSON_TABLE (list predicate / list comprehension): use JSON_VALUE
     # not rdf_props join.  The column holds a JSON-serialised value, not a graph node id.
+    # Guard: only call JSON_VALUE when the value is a JSON object (starts with '{').
+    # JSON_VALUE raises SQLCODE=-400 on non-JSON or non-matching path.
     if expr.variable in context.scalar_variables:
         col_ref = f"{alias}.{sanitize_identifier(expr.variable)}"
         prop = expr.property_name.replace("'", "''")
-        return f"CASE WHEN ({col_ref}) IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{prop}') END"
+        return (
+            f"CASE WHEN ({col_ref}) IS NULL OR SUBSTRING({col_ref}, 1, 1) <> '{{' "
+            f"THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{prop}') END"
+        )
     if expr.property_name in ("node_id", "id"):
         # Use node_id shortcut unless this variable's 'id' is a regular user property
         id_as_prop = getattr(context, '_id_as_property_vars', set())
