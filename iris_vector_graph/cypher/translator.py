@@ -2817,6 +2817,16 @@ def translate_remove_clause(remove, context, metadata):
 
 
 def translate_match_clause(match_clause, context, metadata):
+    # For OPTIONAL MATCH: snapshot the set of alias strings already bound before
+    # this clause starts.  _trp_directed_edge uses this to choose the correct null
+    # guard: "edge IS NULL" when the source was bound before the optional started
+    # (the source can be legitimately non-null while the edge is absent), vs
+    # "source IS NULL" when the source was introduced inside this optional (meaning
+    # the source only exists if the full optional path was found).
+    if match_clause.optional:
+        context.optional_prebound_aliases = set(context.variable_aliases.values())
+    else:
+        context.optional_prebound_aliases = set()
     # Validate no duplicate variables within the same MATCH clause (across all patterns)
     vars_in_match = set()
     for pattern in match_clause.patterns:
@@ -6453,7 +6463,15 @@ def translate_return_clause(ret, context):
             ):
                 # For function calls (e.g., labels(a), count(*)), use cypher_text as the actual column name
                 cypher_text = _expr_to_cypher_text(item.expression)
-                alias = f"{item.expression.function_name}_res"
+                if cypher_text:
+                    import re as _re_fn
+                    alias = _re_fn.sub(r'[^A-Za-z0-9_]', '_', cypher_text)
+                    if alias and alias[0].isdigit():
+                        alias = f"_{alias}"
+                    if not alias:
+                        alias = f"{item.expression.function_name}_res"
+                else:
+                    alias = f"{item.expression.function_name}_res"
                 if cypher_text and cypher_text != alias:
                     context.column_name_map[alias] = cypher_text
             else:
