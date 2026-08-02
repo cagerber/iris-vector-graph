@@ -3911,7 +3911,8 @@ def translate_boolean_expression(expr, context) -> str:
                 if isinstance(_rcoll, list) and len(_rcoll) == 0:
                     return "(1=0)"  # false
         return "NULL"
-    left = translate_expression(left_expr, context, segment="where")
+    left_inlined = _inline_literal(left_expr)
+    left = left_inlined if left_inlined is not None else translate_expression(left_expr, context, segment="where")
     # Wrap CASE WHEN expressions in parens — IRIS SQLCODE -25 if bare CASE ends before =
     if left.startswith("CASE WHEN ") and " END" in left:
         left = f"({left})"
@@ -3919,7 +3920,8 @@ def translate_boolean_expression(expr, context) -> str:
         in_sql = _boolean_expr_in(left, right_expr, context)
         if in_sql is not None:
             return in_sql
-    right = translate_expression(right_expr, context, segment="where")
+    right_inlined = _inline_literal(right_expr)
+    right = right_inlined if right_inlined is not None else translate_expression(right_expr, context, segment="where")
     if right.startswith("CASE WHEN ") and " END" in right:
         right = f"({right})"
     if op in (
