@@ -4994,11 +4994,11 @@ def _expr_arith(expr, context, segment):
                 isinstance(arg, ast.FunctionCall) and arg.function_name.startswith("__arith_+")
         def _is_list(arg):
             return (isinstance(arg, ast.Literal) and isinstance(arg.value, list)) or \
-                isinstance(arg, ast.MapLiteral) is False and (
+                (not isinstance(arg, ast.MapLiteral) and (
                     isinstance(arg, ast.FunctionCall) and arg.function_name in (
                         "collect", "nodes", "relationships", "labels", "keys", "range",
                     )
-                )
+                ))
         left_str = _is_str(expr.arguments[0])
         right_str = _is_str(expr.arguments[1])
         if left_str or right_str:

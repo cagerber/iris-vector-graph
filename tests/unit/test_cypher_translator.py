@@ -564,3 +564,93 @@ class TestComplexStringExpressions:
         sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
         assert "COALESCE" in sql
         assert "UPPER" in sql
+
+
+# ============================================================================
+# Quantifier Expression Tests
+# ============================================================================
+
+class TestQuantifierExpressions:
+    """Test Cypher quantifier expressions: any(), none(), all(), single()."""
+
+    def test_any_quantifier_literal_list(self):
+        """Test any(x IN list WHERE condition) with literal list."""
+        query = "RETURN any(x IN [1, 2, 3] WHERE x > 1) AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # Should use JSON_TABLE to iterate over list
+        assert "JSON_TABLE" in sql
+        # Should have CASE WHEN for 3VL semantics
+        assert "CASE WHEN" in sql
+        # Should check if any element satisfies the condition
+        assert ">" in sql
+
+    def test_none_quantifier_empty_list(self):
+        """Test none() on empty list returns true."""
+        query = "RETURN none(x IN [] WHERE true) AS a"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # Should use JSON_TABLE
+        assert "JSON_TABLE" in sql
+        # Should have CASE WHEN for 3VL semantics
+        assert "CASE WHEN" in sql
+
+    def test_single_quantifier_literal_list(self):
+        """Test single(x IN list WHERE condition) with literal list."""
+        query = "RETURN single(x IN [1, 2, 3] WHERE x = 2) AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # Should use JSON_TABLE to iterate
+        assert "JSON_TABLE" in sql
+        # Should have CASE WHEN for 3VL semantics
+        assert "CASE WHEN" in sql
+        # Should check if exactly one element satisfies
+        assert "=" in sql
+
+    def test_single_quantifier_multiple_subqueries(self):
+        """Test single() uses distinct aliases for multiple subqueries.
+
+        The second WHEN condition checks if count = 0, which needs a separate
+        subquery with a different alias to avoid alias collision.
+        """
+        query = "RETURN single(x IN [1, 2, 3] WHERE x = 2) AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # Should have at least two JSON_TABLE clauses with different aliases
+        assert "JSON_TABLE" in sql
+        # Count occurrences of "JSON_TABLE" to verify multiple subqueries
+        assert sql.count("JSON_TABLE") >= 3  # Main + null check + alias variations
+
+    def test_all_quantifier_literal_list(self):
+        """Test all(x IN list WHERE condition) with literal list."""
+        query = "RETURN all(x IN [1, 2, 3] WHERE x > 0) AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # Should use JSON_TABLE to iterate
+        assert "JSON_TABLE" in sql
+        # Should have CASE WHEN for 3VL semantics
+        assert "CASE WHEN" in sql
+        # Should check non-null count vs satisfying count
+        assert ">" in sql or "<" in sql
+
+    def test_any_with_string_predicate(self):
+        """Test any() with string list and string predicate."""
+        query = "RETURN any(x IN ['a', 'b', 'c'] WHERE size(x) = 1) AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "JSON_TABLE" in sql
+        assert "CASE WHEN" in sql
+
+    def test_quantifier_parses_without_error(self):
+        """Test that quantifier expressions parse and translate without error."""
+        queries = [
+            "RETURN any(x IN [1, 2, 3] WHERE x > 1)",
+            "RETURN none(x IN [] WHERE true)",
+            "RETURN single(x IN [1, 2, 3] WHERE x = 2)",
+            "RETURN all(x IN [1, 2, 3] WHERE x > 0)",
+        ]
+        for query in queries:
+            result = translate_to_sql(parse_query(query))
+            # Just verify it produces SQL output without error
+            sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+            assert len(sql) > 0
