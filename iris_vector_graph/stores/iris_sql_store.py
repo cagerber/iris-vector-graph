@@ -408,10 +408,13 @@ class IRISGraphStore:
             if "__rn" in cols:
                 rn_idx = cols.index("__rn")
                 cols = [c for c in cols if c != "__rn"]
-                rows = [
-                    [v for i, v in enumerate(r) if i != rn_idx]
-                    for r in rows
-                ]
+                if rows is not None:
+                    rows = [
+                        [v for i, v in enumerate(r) if i != rn_idx]
+                        for r in rows
+                    ]
+            if rows is None:
+                rows = []
             return IVGResult(columns=cols, rows=[list(r) for r in rows])
         except Exception as e:
             self.conn.rollback()

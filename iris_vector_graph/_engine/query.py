@@ -198,7 +198,7 @@ class QueryMixin:
             current_params = dict(parameters) if parameters else {}
             for part_query in [parsed] + parsed.subsequent_queries:
                 part_query.subsequent_queries = []
-                result = self._execute_parsed(part_query, current_params)
+                result = self._execute_parsed(part_query, current_params, procedures)
                 if result and result.get("rows") and result.get("columns"):
                     first_row = result["rows"][0] if result["rows"] else []
                     for col, val in zip(result["columns"], first_row):
@@ -206,13 +206,13 @@ class QueryMixin:
                             current_params[col] = val
             return result
 
-        return self._execute_parsed(parsed, parameters)
-    def _execute_parsed(self, parsed, parameters):
+        return self._execute_parsed(parsed, parameters, procedures)
+    def _execute_parsed(self, parsed, parameters, procedures=None):
         if parsed.procedure_call is not None:
             result = self._try_system_procedure(parsed.procedure_call)
             if result is not None:
                 return result
-        sql_query = translate_to_sql(parsed, parameters, engine=self)
+        sql_query = translate_to_sql(parsed, parameters, engine=self, procedures=procedures)
         if sql_query.var_length_paths:
             return self._route_var_length(sql_query, parameters)
         metadata = sql_query.query_metadata

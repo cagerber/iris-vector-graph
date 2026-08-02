@@ -1,4 +1,4 @@
-/// User.SQL — SQL UDFs for Cypher expression translation
+/// User.SQL - SQL UDFs for Cypher expression translation
 /// Provides regex matching, string utilities, and JSON operations for TCK test compatibility
 Class User.SQL Extends %RegisteredObject
 {
@@ -11,13 +11,13 @@ ClassMethod REGEX_MATCH(str As %String, pattern As %String) As %Integer
         Return 0
     }
 
-    // Use IRIS %Regex for full regex support
+
     Try {
         Set compiled = ##class(%Regex.Matcher).%New(pattern)
         Set result = compiled.Match(str)
         Return $Select(result: 1, 1: 0)
     } Catch ex {
-        // Invalid regex pattern
+
         Return 0
     }
 }
@@ -53,7 +53,7 @@ ClassMethod JSON_VALUE(json As %String, path As %String) As %String
             Return ""
         }
 
-        // Handle simple paths like $.foo or $[0]
+
         If $Extract(path, 1, 2) = "$." {
             Set key = $Extract(path, 3, *)
             Return obj.%Get(key)

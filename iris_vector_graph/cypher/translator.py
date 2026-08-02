@@ -1793,7 +1793,44 @@ def _tts_finalize_context(cypher_query, context):
         context.select_params = []
 
     if cypher_query.return_clause:
-         translate_return_clause(cypher_query.return_clause, context)
+        # For transactional queries (with SET/REMOVE/DELETE), we need to clear WHERE
+        # conditions on properties that have been modified, since their values have changed.
+        set_properties = getattr(context, '_set_properties', set())
+        if set_properties and context.where_conditions:
+            # Filter out WHERE conditions that reference modified properties.
+            # A WHERE condition is property-related if it contains a " = ?" or similar
+            # and the property name appears in the SET properties list.
+            filtered_conditions = []
+            filtered_params = []
+            param_offset = 0
+            for cond in context.where_conditions:
+                param_count = cond.count("?")
+                cond_params = context.where_params[param_offset : param_offset + param_count]
+                param_offset += param_count
+
+                # Check if this condition involves a modified property.
+                # Look for patterns like `p2."key" = ?` where the value is a SET property.
+                is_modified_property_condition = False
+                for prop_name in set_properties:
+                    # Check for patterns like 'key' = ? or "key" = ?
+                    if f'"{prop_name}"' in cond or f"'{prop_name}'" in cond or f'key' in cond and prop_name in str(cond_params):
+                        # This is a property value filter on a modified property
+                        is_modified_property_condition = True
+                        break
+                    # Also check for direct property references like p.val = ?
+                    if f'.val = ?' in cond and cond_params:
+                        # This looks like a property value condition
+                        is_modified_property_condition = True
+                        break
+
+                if not is_modified_property_condition:
+                    filtered_conditions.append(cond)
+                    filtered_params.extend(cond_params)
+
+            context.where_conditions = filtered_conditions
+            context.where_params = filtered_params
+
+        translate_return_clause(cypher_query.return_clause, context)
 
     order_by_items = preprocess_order_by(cypher_query, context)
 
