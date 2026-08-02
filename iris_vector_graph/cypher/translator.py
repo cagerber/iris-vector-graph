@@ -4696,9 +4696,12 @@ def translate_boolean_expression(expr, context) -> str:
         ast.BooleanOperator.GREATER_THAN,
         ast.BooleanOperator.GREATER_THAN_OR_EQUAL,
     ):
-        if isinstance(left_expr, ast.PropertyReference):
+        # Cast VARCHAR property ref to DOUBLE only when comparing with a numeric literal.
+        # Do NOT cast when the other side is a string literal (string range comparisons).
+        _other_is_str = lambda e: isinstance(e, ast.Literal) and isinstance(e.value, str)
+        if isinstance(left_expr, ast.PropertyReference) and not _other_is_str(right_expr):
             left = f"CAST({left} AS DOUBLE)"
-        if isinstance(right_expr, ast.PropertyReference):
+        if isinstance(right_expr, ast.PropertyReference) and not _other_is_str(left_expr):
             right = f"CAST({right} AS DOUBLE)"
     result = _boolean_expr_comparison_ops(op, left, left_expr, right, right_expr)
     if result is not None:
