@@ -6924,7 +6924,14 @@ def _extract_temporal_component(base_sql: str, temporal_type: str, prop_name: st
         elif prop_name == "day":
             return f"CAST(SUBSTRING({base_sql}, 9, 2) AS INTEGER)"
         elif prop_name == "weekYear":
-            return f"CAST(SUBSTRING({base_sql}, 1, 4) AS INTEGER)"
+            # ISO week year = year of Thursday in same ISO week.
+            # Thursday offset from any date: 4 - iso_dow (where iso_dow 1=Mon..7=Sun)
+            # iso_dow = (IRIS_DAYOFWEEK + 5) % 7 + 1 (IRIS: Sun=1..Sat=7 → ISO: Mon=1..Sun=7)
+            _date = f"CAST({base_sql} AS DATE)"
+            _iris_dow = f"{{fn DAYOFWEEK({_date})}}"
+            _iso_dow = f"(({_iris_dow} + 5) % 7 + 1)"
+            _thu = f"DATEADD('day', 4 - {_iso_dow}, {_date})"
+            return f"DATEPART('year', {_thu})"
         elif prop_name == "week":
             return f"{{fn WEEK(CAST({base_sql} AS DATE))}}"
         elif prop_name == "dayOfWeek" or prop_name == "weekDay":
@@ -6961,7 +6968,12 @@ def _extract_temporal_component(base_sql: str, temporal_type: str, prop_name: st
         elif prop_name == "day":
             return f"CAST(SUBSTRING({base_sql}, 9, 2) AS INTEGER)"
         elif prop_name == "weekYear":
-            return f"CAST(SUBSTRING({base_sql}, 1, 4) AS INTEGER)"
+            # ISO week year = year of Thursday in same ISO week (see date case above)
+            _date = f"CAST(SUBSTRING({base_sql}, 1, 10) AS DATE)"
+            _iris_dow = f"{{fn DAYOFWEEK({_date})}}"
+            _iso_dow = f"(({_iris_dow} + 5) % 7 + 1)"
+            _thu = f"DATEADD('day', 4 - {_iso_dow}, {_date})"
+            return f"DATEPART('year', {_thu})"
         elif prop_name == "week":
             return f"{{fn WEEK(CAST(SUBSTRING({base_sql}, 1, 10) AS DATE))}}"
         elif prop_name == "dayOfWeek" or prop_name == "weekDay":
@@ -8797,9 +8809,9 @@ def _temporal_to_datetime_obj(temporal_str, fn_name):
         s = temporal_str
         # Remove IANA timezone like '[America/New_York]'
         s = _re.sub(r'\[.*\]$', '', s)
-        # Remove timezone offset like +01:00 or Z
-        s = _re.sub(r'[Z]$', '', s)
-        s = _re.sub(r'[+-]\d{2}:\d{2}(?::\d{2})?$', '', s)
+        # Remove timezone offset like +01:00, +0100, Z
+        s = _re.sub(r'[Zz]$', '', s)
+        s = _re.sub(r'[+-]\d{2}:?\d{2}(?::?\d{2})?$', '', s)
         m = _re.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', s)
         if m:
             h, mi = int(m.group(1)), int(m.group(2))
@@ -8877,14 +8889,77 @@ def _compute_duration_between(lhs_str, lhs_fn, rhs_str, rhs_fn):
     import datetime as _dt
     import re as _re
 
-    def _parse_wall_clock(temporal_str, fn_name):
-        """Parse a temporal to a datetime, treating it as wall clock (no UTC adjustment)."""
+    def _has_tz(fn_name, temporal_str):
+        """Return True if this temporal type carries an explicit timezone offset."""
+        import re as _re2
+        if fn_name == "datetime":
+            s = _re2.sub(r'\[.*\]$', '', temporal_str)
+            return bool(_re2.search(r'[Zz]$|[+-]\d{2}:?\d{2}', s))
+        if fn_name == "time":
+            return bool(_re2.search(r'[Zz]$|[+-]\d{2}:?\d{2}', temporal_str))
+        return False  # date, localtime, localdatetime have no tz
+
+    def _parse_utc_normalized(temporal_str, fn_name):
+        """Parse a temporal to a UTC-normalized comparable value.
+
+        For datetime: subtracts tz offset → UTC datetime.
+        For time with tz: subtracts tz offset → UTC time of day (date anchored to 2000-01-01).
+        For time without tz: treat as UTC (no adjustment).
+        For others: use wall-clock.
+        """
+        import re as _re2
+        if fn_name in ("datetime", "localdatetime"):
+            return _temporal_to_datetime_obj(temporal_str, fn_name)
+        if fn_name == "date":
+            return _temporal_to_datetime_obj(temporal_str, fn_name)
+        if fn_name in ("localtime", "time"):
+            # Extract wall-clock time value
+            s = temporal_str
+            tz_offset_secs = 0
+            if s.endswith("Z") or s.endswith("z"):
+                s = s[:-1]
+            else:
+                tz_m = _re2.search(r'([+-])(\d{2}):?(\d{2})(?::\d{2})?$', s)
+                if tz_m:
+                    sign = 1 if tz_m.group(1) == '+' else -1
+                    tz_offset_secs = sign * (int(tz_m.group(2)) * 3600 + int(tz_m.group(3)) * 60)
+                    s = s[:tz_m.start()]
+            m2 = _re2.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', s)
+            if not m2:
+                return None
+            h, mi = int(m2.group(1)), int(m2.group(2))
+            sec = int(m2.group(3) or 0)
+            frac = m2.group(4) or ""
+            ns = int(frac.ljust(9, '0')[:9]) if frac else 0
+            us = ns // 1000
+            try:
+                dt = _dt.datetime(2000, 1, 1, h, mi, sec, us)
+                dt = dt - _dt.timedelta(seconds=tz_offset_secs)
+                return dt
+            except ValueError:
+                return None
+        return None
+
+    def _parse_wall_clock_dt(temporal_str, fn_name):
+        """Parse a temporal to a datetime treating wall-clock time (no UTC adjustment)."""
         import re as _re2
         if fn_name == "date":
             return _temporal_to_datetime_obj(temporal_str, fn_name)
         if fn_name in ("localtime", "time"):
-            return _temporal_to_datetime_obj(temporal_str, fn_name)
-        # For datetime/localdatetime: parse but do NOT subtract timezone offset
+            # Strip offset, use local time value as-is
+            s = temporal_str
+            s = _re2.sub(r'[Zz]$', '', s)
+            s = _re2.sub(r'[+-]\d{2}:?\d{2}(?::\d{2})?$', '', s)
+            m2 = _re2.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', s)
+            if not m2:
+                return None
+            h, mi = int(m2.group(1)), int(m2.group(2))
+            sec = int(m2.group(3) or 0)
+            frac = m2.group(4) or ""
+            ns = int(frac.ljust(9, '0')[:9]) if frac else 0
+            us = ns // 1000
+            return _dt.datetime(2000, 1, 1, h, mi, sec, us)
+        # datetime / localdatetime: extract wall-clock (strip tz without applying)
         s = temporal_str
         s = _re2.sub(r'\[.*\]$', '', s)
         if "T" not in s.upper():
@@ -8896,8 +8971,7 @@ def _compute_duration_between(lhs_str, lhs_fn, rhs_str, rhs_fn):
         if not parsed_date:
             return None
         y, mo, d = parsed_date
-        # Strip timezone offset (but don't apply it)
-        if time_str.endswith("Z"):
+        if time_str.endswith("Z") or time_str.endswith("z"):
             time_str = time_str[:-1]
         else:
             tz_m = _re2.search(r'[+-]\d{2}:?\d{2}(?::\d{2})?$', time_str)
@@ -8916,9 +8990,21 @@ def _compute_duration_between(lhs_str, lhs_fn, rhs_str, rhs_fn):
         except ValueError:
             return None
 
-    # Parse both temporals into datetime objects (wall clock, no UTC conversion)
-    lhs_dt = _parse_wall_clock(lhs_str, lhs_fn)
-    rhs_dt = _parse_wall_clock(rhs_str, rhs_fn)
+    # openCypher spec: UTC normalization only when BOTH sides are tz-aware.
+    # tz-aware family: 'time' (UTC-implicit), 'datetime' (explicit offset).
+    # tz-naive family: 'date', 'localtime', 'localdatetime'.
+    # When mixing tz-aware + tz-naive: use wall-clock for both (tz offset ignored).
+    _TZ_AWARE = ("time", "datetime")
+    lhs_is_tz_aware = lhs_fn in _TZ_AWARE
+    rhs_is_tz_aware = rhs_fn in _TZ_AWARE
+    both_tz_aware = lhs_is_tz_aware and rhs_is_tz_aware
+
+    if both_tz_aware:
+        lhs_dt = _parse_utc_normalized(lhs_str, lhs_fn)
+        rhs_dt = _parse_utc_normalized(rhs_str, rhs_fn)
+    else:
+        lhs_dt = _parse_wall_clock_dt(lhs_str, lhs_fn)
+        rhs_dt = _parse_wall_clock_dt(rhs_str, rhs_fn)
 
     if lhs_dt is None or rhs_dt is None:
         return None
@@ -8939,15 +9025,15 @@ def _compute_duration_between(lhs_str, lhs_fn, rhs_str, rhs_fn):
     rem_ns = 0
 
     def _secs_ns_from_delta(delta):
-        """Extract (whole_seconds, nanoseconds_of_second) from a timedelta."""
+        """Extract (whole_seconds, nanoseconds_of_second) from a timedelta.
+
+        Uses truncating-toward-zero division so that whole_s and rem_us have the
+        same sign (or one is zero).  This matches openCypher's duration semantics
+        where -PT1.001S is -1 seconds -1 ms, not -2 seconds +999 ms.
+        """
         total_us = delta.days * 86400 * 1_000_000 + delta.seconds * 1_000_000 + delta.microseconds
-        if total_us >= 0:
-            whole_s = total_us // 1_000_000
-            rem_us = total_us % 1_000_000
-        else:
-            # negative: floor to negative seconds, remainder is positive ns
-            whole_s = -((-total_us + 999999) // 1_000_000)
-            rem_us = total_us - whole_s * 1_000_000
+        whole_s = int(total_us / 1_000_000)   # truncate toward zero
+        rem_us = total_us - whole_s * 1_000_000
         return whole_s, rem_us * 1000
 
     def _secs_to_hms(total_s):
@@ -9058,79 +9144,273 @@ def _compute_duration_between(lhs_str, lhs_fn, rhs_str, rhs_fn):
 
 
 def _compute_duration_inmonths(lhs_str, lhs_fn, rhs_str, rhs_fn):
-    """Compute duration.inMonths — only year+month components."""
-    lhs_dt = _temporal_to_datetime_obj(lhs_str, lhs_fn)
-    rhs_dt = _temporal_to_datetime_obj(rhs_str, rhs_fn)
-    if lhs_dt is None or rhs_dt is None:
-        return None
+    """Compute duration.inMonths — extract only years+months from duration.between.
+
+    Uses the same tz-aware/wall-clock logic as _compute_duration_between but
+    discards the day/time remainder, keeping only the complete year+month units.
+    """
     is_timeonly_l = lhs_fn in ("localtime", "time")
     is_timeonly_r = rhs_fn in ("localtime", "time")
     if is_timeonly_l or is_timeonly_r:
         return "PT0S"
-    years = rhs_dt.year - lhs_dt.year
-    months = rhs_dt.month - lhs_dt.month
-    if months < 0:
-        years -= 1
-        months += 12
-    total_months = years * 12 + months
-    if total_months == 0:
+    # Get the full duration.between result and extract only yr+mo components
+    full = _compute_duration_between(lhs_str, lhs_fn, rhs_str, rhs_fn)
+    if full is None:
+        return None
+    if full == "PT0S":
         return "PT0S"
-    if total_months % 12 == 0:
-        return _format_duration(total_months // 12, 0, 0, 0, 0, 0, 0)
-    return _format_duration(total_months // 12, total_months % 12, 0, 0, 0, 0, 0)
+    # Parse the ISO duration string and extract years/months
+    import re as _re
+    m = _re.match(r'^P(-?\d+Y)?(-?\d+M)?', full)
+    if not m:
+        return "PT0S"
+    yr_part = m.group(1)  # e.g. '-1Y' or '30Y' or None
+    mo_part = m.group(2)  # e.g. '-8M' or '8M' or None
+    if not yr_part and not mo_part:
+        return "PT0S"
+    yrs = int(yr_part[:-1]) if yr_part else 0
+    mos = int(mo_part[:-1]) if mo_part else 0
+    return _format_duration(yrs, mos, 0, 0, 0, 0, 0)
 
 
 def _compute_duration_indays(lhs_str, lhs_fn, rhs_str, rhs_fn):
-    """Compute duration.inDays — only days (truncated to whole days)."""
+    """Compute duration.inDays — total whole days between the two temporals.
+
+    Uses same tz-aware/wall-clock logic as duration.between.
+    For date-only inputs, strips time component. Truncates toward zero.
+    """
     import datetime as _dt
-    lhs_dt = _temporal_to_datetime_obj(lhs_str, lhs_fn)
-    rhs_dt = _temporal_to_datetime_obj(rhs_str, rhs_fn)
-    if lhs_dt is None or rhs_dt is None:
-        return None
+    import re as _re2
+
     is_timeonly_l = lhs_fn in ("localtime", "time")
     is_timeonly_r = rhs_fn in ("localtime", "time")
     if is_timeonly_l or is_timeonly_r:
         return "PT0S"
-    # Strip time component for date-only args
+
+    _TZ_AWARE = ("time", "datetime")
+    lhs_is_tz_aware = lhs_fn in _TZ_AWARE
+    rhs_is_tz_aware = rhs_fn in _TZ_AWARE
+    both_tz_aware = lhs_is_tz_aware and rhs_is_tz_aware
+
+    def _utc_normalize(ts, fn):
+        """UTC-normalize a temporal: for 'time', apply offset; for 'datetime', use _temporal_to_datetime_obj."""
+        if fn == "datetime":
+            return _temporal_to_datetime_obj(ts, fn)
+        if fn == "time":
+            s = _re2.sub(r'\[.*\]$', '', ts)
+            tz_offset_secs = 0
+            if s.endswith("Z") or s.endswith("z"):
+                s = s[:-1]
+            else:
+                tz_m = _re2.search(r'([+-])(\d{2}):?(\d{2})(?::\d{2})?$', s)
+                if tz_m:
+                    sign = 1 if tz_m.group(1) == '+' else -1
+                    tz_offset_secs = sign * (int(tz_m.group(2)) * 3600 + int(tz_m.group(3)) * 60)
+                    s = s[:tz_m.start()]
+            m = _re2.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', s)
+            if not m:
+                return None
+            h, mi = int(m.group(1)), int(m.group(2))
+            sec = int(m.group(3) or 0)
+            frac = m.group(4) or ""
+            ns = int(frac.ljust(9, '0')[:9]) if frac else 0
+            try:
+                dt = _dt.datetime(2000, 1, 1, h, mi, sec, ns // 1000)
+                return dt - _dt.timedelta(seconds=tz_offset_secs)
+            except ValueError:
+                return None
+        return _temporal_to_datetime_obj(ts, fn)
+
+    def _wall_clock(ts, fn):
+        """Wall-clock: strip tz offset without applying it."""
+        if fn == "date":
+            return _temporal_to_datetime_obj(ts, fn)
+        if fn in ("localtime", "time"):
+            s = _re2.sub(r'[Zz]$', '', ts)
+            s = _re2.sub(r'[+-]\d{2}:?\d{2}(?::?\d{2})?$', '', s)
+            m = _re2.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', s)
+            if not m:
+                return None
+            h, mi = int(m.group(1)), int(m.group(2))
+            sec = int(m.group(3) or 0)
+            frac = m.group(4) or ""
+            ns = int(frac.ljust(9, '0')[:9]) if frac else 0
+            return _dt.datetime(2000, 1, 1, h, mi, sec, ns // 1000)
+        s = _re2.sub(r'\[.*\]$', '', ts)
+        if "T" not in s.upper():
+            return None
+        sep = s.upper().index("T")
+        date_str, time_str = s[:sep], s[sep+1:]
+        parsed = _parse_date_string(date_str)
+        if not parsed:
+            return None
+        y, mo, d = parsed
+        if time_str.endswith("Z") or time_str.endswith("z"):
+            time_str = time_str[:-1]
+        else:
+            tz_m = _re2.search(r'[+-]\d{2}:?\d{2}(?::\d{2})?$', time_str)
+            if tz_m:
+                time_str = time_str[:tz_m.start()]
+        m2 = _re2.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', time_str)
+        if not m2:
+            return None
+        h, mi = int(m2.group(1)), int(m2.group(2))
+        sec = int(m2.group(3) or 0)
+        frac = m2.group(4) or ""
+        ns = int(frac.ljust(9, '0')[:9]) if frac else 0
+        try:
+            return _dt.datetime(y, mo, d, h, mi, sec, ns // 1000)
+        except ValueError:
+            return None
+
+    if both_tz_aware:
+        lhs_dt = _utc_normalize(lhs_str, lhs_fn)
+        rhs_dt = _utc_normalize(rhs_str, rhs_fn)
+    else:
+        lhs_dt = _wall_clock(lhs_str, lhs_fn)
+        rhs_dt = _wall_clock(rhs_str, rhs_fn)
+
+    if lhs_dt is None or rhs_dt is None:
+        return None
+
+    # For date-only: strip time so only calendar date difference is used
     if lhs_fn == "date":
         lhs_dt = lhs_dt.replace(hour=0, minute=0, second=0, microsecond=0)
     if rhs_fn == "date":
         rhs_dt = rhs_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
     delta = rhs_dt - lhs_dt
-    days_total = int(delta.total_seconds() // 86400)
+    days_total = int(delta.total_seconds() / 86400)  # truncate toward zero
     if days_total == 0:
         return "PT0S"
     return _format_duration(0, 0, days_total, 0, 0, 0, 0)
 
 
 def _compute_duration_inseconds(lhs_str, lhs_fn, rhs_str, rhs_fn):
-    """Compute duration.inSeconds — only seconds (no years/months)."""
+    """Compute duration.inSeconds — only seconds (no years/months).
+    Normalizes total seconds into H/M/S components.
+    """
     import datetime as _dt
-    lhs_dt = _temporal_to_datetime_obj(lhs_str, lhs_fn)
-    rhs_dt = _temporal_to_datetime_obj(rhs_str, rhs_fn)
+    # Use the same tz-aware logic as duration.between
+    _TZ_AWARE = ("time", "datetime")
+    lhs_is_tz_aware = lhs_fn in _TZ_AWARE
+    rhs_is_tz_aware = rhs_fn in _TZ_AWARE
+    both_tz_aware = lhs_is_tz_aware and rhs_is_tz_aware
+
+    import re as _re2
+
+    def _utc_norm(ts, fn):
+        """UTC-normalize for tz-aware types: apply tz offset."""
+        if fn == "datetime":
+            return _temporal_to_datetime_obj(ts, fn)
+        if fn == "time":
+            s = _re2.sub(r'\[.*\]$', '', ts)
+            tz_offset_secs = 0
+            if s.endswith("Z") or s.endswith("z"):
+                s = s[:-1]
+            else:
+                tz_m = _re2.search(r'([+-])(\d{2}):?(\d{2})(?::\d{2})?$', s)
+                if tz_m:
+                    sign = 1 if tz_m.group(1) == '+' else -1
+                    tz_offset_secs = sign * (int(tz_m.group(2)) * 3600 + int(tz_m.group(3)) * 60)
+                    s = s[:tz_m.start()]
+            m = _re2.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', s)
+            if not m:
+                return None
+            h, mi = int(m.group(1)), int(m.group(2))
+            sec = int(m.group(3) or 0)
+            frac = m.group(4) or ""
+            ns = int(frac.ljust(9, '0')[:9]) if frac else 0
+            try:
+                dt = _dt.datetime(2000, 1, 1, h, mi, sec, ns // 1000)
+                return dt - _dt.timedelta(seconds=tz_offset_secs)
+            except ValueError:
+                return None
+        return _temporal_to_datetime_obj(ts, fn)
+
+    if both_tz_aware:
+        lhs_dt = _utc_norm(lhs_str, lhs_fn)
+        rhs_dt = _utc_norm(rhs_str, rhs_fn)
+    else:
+        # Wall-clock: parse without applying tz offset
+        def _wall(ts, fn):
+            if fn in ("date", "localtime"):
+                return _temporal_to_datetime_obj(ts, fn)
+            if fn == "time":
+                s = _re2.sub(r'[Zz]$', '', ts)
+                s = _re2.sub(r'[+-]\d{2}:?\d{2}(?::?\d{2})?$', '', s)
+                m = _re2.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', s)
+                if not m:
+                    return None
+                h, mi = int(m.group(1)), int(m.group(2))
+                sec = int(m.group(3) or 0)
+                frac = m.group(4) or ""
+                ns = int(frac.ljust(9, '0')[:9]) if frac else 0
+                return _dt.datetime(2000, 1, 1, h, mi, sec, ns // 1000)
+            # datetime/localdatetime: strip tz without applying
+            s = _re2.sub(r'\[.*\]$', '', ts)
+            if "T" not in s.upper():
+                return None
+            sep = s.upper().index("T")
+            date_str, time_str = s[:sep], s[sep+1:]
+            parsed = _parse_date_string(date_str)
+            if not parsed:
+                return None
+            y, mo, d = parsed
+            if time_str.endswith("Z") or time_str.endswith("z"):
+                time_str = time_str[:-1]
+            else:
+                tz_m = _re2.search(r'[+-]\d{2}:?\d{2}(?::\d{2})?$', time_str)
+                if tz_m:
+                    time_str = time_str[:tz_m.start()]
+            m2 = _re2.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', time_str)
+            if not m2:
+                return None
+            h, mi = int(m2.group(1)), int(m2.group(2))
+            sec = int(m2.group(3) or 0)
+            frac = m2.group(4) or ""
+            ns = int(frac.ljust(9, '0')[:9]) if frac else 0
+            try:
+                return _dt.datetime(y, mo, d, h, mi, sec, ns // 1000)
+            except ValueError:
+                return None
+        lhs_dt = _wall(lhs_str, lhs_fn)
+        rhs_dt = _wall(rhs_str, rhs_fn)
+
     if lhs_dt is None or rhs_dt is None:
         return None
+
     is_timeonly_l = lhs_fn in ("localtime", "time")
     is_timeonly_r = rhs_fn in ("localtime", "time")
-    if is_timeonly_l and is_timeonly_r:
-        delta = rhs_dt - lhs_dt
-    elif is_timeonly_l:
-        time_lhs = lhs_dt
-        time_rhs = _dt.datetime(2000, 1, 1, rhs_dt.hour, rhs_dt.minute, rhs_dt.second, rhs_dt.microsecond)
-        delta = time_rhs - time_lhs
-    elif is_timeonly_r:
-        time_lhs = _dt.datetime(2000, 1, 1, lhs_dt.hour, lhs_dt.minute, lhs_dt.second, lhs_dt.microsecond)
-        time_rhs = rhs_dt
+
+    if is_timeonly_l or is_timeonly_r:
+        if is_timeonly_l:
+            time_lhs = lhs_dt if not both_tz_aware else _dt.datetime(2000, 1, 1, lhs_dt.hour, lhs_dt.minute, lhs_dt.second, lhs_dt.microsecond)
+            time_rhs = _dt.datetime(2000, 1, 1, rhs_dt.hour, rhs_dt.minute, rhs_dt.second, rhs_dt.microsecond)
+        else:
+            time_lhs = _dt.datetime(2000, 1, 1, lhs_dt.hour, lhs_dt.minute, lhs_dt.second, lhs_dt.microsecond)
+            time_rhs = rhs_dt if not both_tz_aware else _dt.datetime(2000, 1, 1, rhs_dt.hour, rhs_dt.minute, rhs_dt.second, rhs_dt.microsecond)
         delta = time_rhs - time_lhs
     else:
         delta = rhs_dt - lhs_dt
-    total_s = int(delta.total_seconds())
-    us_diff = rhs_dt.microsecond - lhs_dt.microsecond
-    rem_ns = us_diff * 1000
-    if rem_ns < 0:
-        total_s -= 1
-        rem_ns += 1_000_000_000
-    return _format_duration(0, 0, 0, 0, 0, total_s, rem_ns)
+
+    # Compute total microseconds using truncating-toward-zero arithmetic
+    total_us = delta.days * 86400 * 1_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+    s_total = int(total_us / 1_000_000)  # truncate toward zero
+    rem_us = total_us - s_total * 1_000_000
+    rem_ns = rem_us * 1000
+
+    # Normalize s_total into H/M/S
+    neg = s_total < 0
+    abs_s = abs(s_total)
+    h = abs_s // 3600
+    left = abs_s % 3600
+    m = left // 60
+    s = left % 60
+    if neg:
+        h, m, s = (-h if h else 0), (-m if m else 0), (-s if s else 0)
+
+    return _format_duration(0, 0, 0, h, m, s, rem_ns)
 
 
 def _eval_temporal_ns_function(fn, args_exprs, context):
@@ -10546,6 +10826,7 @@ def translate_return_clause(ret, context):
                 continue
         sql = translate_expression(item.expression, context, segment="select")
         alias = item.alias
+        user_provided_alias = alias is not None  # True when user wrote AS <alias>
         cypher_col = None  # Cypher-text column name for post-execution remapping
         if alias is None:
             if isinstance(item.expression, ast.PropertyReference):
@@ -10587,10 +10868,13 @@ def translate_return_clause(ret, context):
                     _dedup_n += 1
                 safe = f"{safe}_{_dedup_n}"
             _used_ret_aliases.add(safe)
-            # Register column_name_map with the FINAL (deduplicated) alias
-            cypher_text_final = _expr_to_cypher_text(item.expression)
-            if cypher_text_final and cypher_text_final != safe:
-                context.column_name_map[safe] = cypher_text_final
+            # Register column_name_map with the FINAL (deduplicated) alias.
+            # Only when the alias was auto-generated (not user-provided via AS <alias>):
+            # user-provided aliases are already the intended column names.
+            if not user_provided_alias:
+                cypher_text_final = _expr_to_cypher_text(item.expression)
+                if cypher_text_final and cypher_text_final != safe:
+                    context.column_name_map[safe] = cypher_text_final
             context.select_items.append(f"{sql} AS {safe}")
         else:
             context.select_items.append(sql)
