@@ -141,10 +141,15 @@ class TCKResultTable:
         remapped_rows = [_remap_node_columns(row, self.columns, actual_columns) for row in actual_rows]
 
         # Case-insensitive column renaming: IVG lowercases function names (toInteger→tointeger).
-        # Build a lower→tck_col map so actual rows use TCK-canonical casing.
-        lower_to_tck = {col.lower(): col for col in self.columns}
+        # Also normalize whitespace (cOuNt( * ) vs count(*)) for function call column names.
+        # Build a lower-normalized→tck_col map so actual rows use TCK-canonical casing.
+        import re as _re_col
+        def _norm_col(s: str) -> str:
+            """Normalize column name: lowercase + collapse all whitespace."""
+            return _re_col.sub(r'\s+', '', s.lower())
+        lower_to_tck = {_norm_col(col): col for col in self.columns}
         remapped_rows = [
-            {lower_to_tck.get(k.lower(), k): v for k, v in row.items()}
+            {lower_to_tck.get(_norm_col(k), k): v for k, v in row.items()}
             for row in remapped_rows
         ]
 
