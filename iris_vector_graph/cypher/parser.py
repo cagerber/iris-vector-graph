@@ -1060,7 +1060,10 @@ class Parser:
         while self.peek().kind in (TokenType.LBRACKET, TokenType.DOT):
             if self.peek().kind == TokenType.LBRACKET:
                 self.eat()
-                if self.peek().kind == TokenType.DOT and self.lexer.peek_ahead(1).kind == TokenType.DOT:
+                _nxt_is_dotdot = (
+                    self.peek().kind == TokenType.DOT and self.lexer.peek_ahead(1).kind == TokenType.DOT
+                )
+                if _nxt_is_dotdot:
                     self.eat()
                     self.eat()
                     end = self.parse_primary_expression()
@@ -1068,12 +1071,28 @@ class Parser:
                     base = ast.SliceExpression(expression=base, start=ast.Literal(0), end=end)
                 else:
                     first = self.parse_primary_expression()
-                    if self.peek().kind == TokenType.DOT and self.lexer.peek_ahead(1).kind == TokenType.DOT:
+                    _nxt_is_dotdot2 = (
+                        self.peek().kind == TokenType.DOT and self.lexer.peek_ahead(1).kind == TokenType.DOT
+                    )
+                    # Handle tokenization of N..M as INTEGER DOT FLOAT(.M) — the lexer
+                    # emits '.M' as a FLOAT_LITERAL, not DOT+INTEGER.
+                    _nxt_is_float_dotdot = (
+                        self.peek().kind == TokenType.DOT
+                        and self.lexer.peek_ahead(1).kind == TokenType.FLOAT_LITERAL
+                        and self.lexer.peek_ahead(1).value.startswith(".")
+                    )
+                    if _nxt_is_dotdot2:
                         self.eat()
                         self.eat()
                         second = self.parse_primary_expression()
                         self.expect(TokenType.RBRACKET)
                         base = ast.SliceExpression(expression=base, start=first, end=second)
+                    elif _nxt_is_float_dotdot:
+                        self.eat()  # consume the DOT
+                        float_tok = self.eat()  # consume .M as FLOAT_LITERAL
+                        end_val = int(float_tok.value.lstrip("."))
+                        self.expect(TokenType.RBRACKET)
+                        base = ast.SliceExpression(expression=base, start=first, end=ast.Literal(end_val))
                     else:
                         self.expect(TokenType.RBRACKET)
                         base = ast.SubscriptExpression(expression=base, index=first)
