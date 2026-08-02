@@ -4530,15 +4530,9 @@ def _boolean_expr_logical(op, expr, context):
         # - true XOR null = null
         # - false XOR null = null
         # - null XOR null = null
-        # Implementation: CASE WHEN sa IS NULL OR sb IS NULL THEN NULL
-        #                 ELSE (sa AND NOT sb) OR (NOT sa AND sb) END
-        # But when both are constants we can simplify.
         if sa == "NULL" or sb == "NULL":
-            # At least one is NULL: result is NULL if either operand is NULL
-            if sa == "NULL" and sb == "NULL":
-                return "NULL"
-            # One is NULL: always NULL
-            return f"CASE WHEN {sa} IS NULL OR {sb} IS NULL THEN NULL ELSE (({sa} AND NOT ({sb})) OR (NOT ({sa}) AND {sb})) END"
+            # At least one operand evaluates to NULL → XOR result is NULL
+            return "NULL"
         # Both are non-NULL expressions: simple XOR
         return f"(({sa} AND NOT ({sb})) OR (NOT ({sa}) AND {sb}))"
     if op == ast.BooleanOperator.NOT:
@@ -5212,18 +5206,20 @@ def _expr_reduce(expr, context, segment):
 
     source_sql = translate_expression(expr.source, context, segment=segment)
     alias = context.next_alias("re")
-    context.variable_aliases[expr.variable] = alias
+    # Map the variable to the alias.var reference for JSON_TABLE column access
+    context.variable_aliases[expr.variable] = f"{alias}.{var}"
+    # Mark as scalar variable so property access uses JSON_VALUE
+    context.scalar_variables.add(expr.variable)
     context.variable_aliases[acc] = "__acc__"
     body_sql = translate_expression(expr.body, context, segment=segment)
-    for col in ("node_id", "p", "val", "label"):
-        body_sql = body_sql.replace(f"{alias}.{col}", f"{alias}.{var}")
     body_sql = body_sql.replace("__acc__.node_id", "0").replace("__acc__", "0")
     del context.variable_aliases[expr.variable]
+    context.scalar_variables.discard(expr.variable)
     del context.variable_aliases[acc]
     init_sql = translate_expression(expr.init, context, segment=segment)
     return (
         f"({init_sql} + (SELECT SUM({body_sql}) FROM "
-        f"JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} DOUBLE PATH '$')) {alias}))"
+        f"JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} VARCHAR(32767) PATH '$')) {alias}))"
     )
 
 
@@ -7183,6 +7179,11 @@ def translate_with_clause(with_clause, context):
         isinstance(i.expression, ast.AggregationFunction) for i in with_clause.items
     )
     agg_aliases: set = set()
+
+    # Build a map of new WITH aliases so we can temporarily add them to context.variable_aliases
+    # before translating the WHERE clause. WITH WHERE should see both old variables (pre-WITH)
+    # and new aliases (projected in this WITH).
+    with_item_aliases: dict = {}  # Maps new alias -> placeholder (will be filled in by caller)
     for item in with_clause.items:
         sql = translate_expression(item.expression, context, segment="select")
         alias = item.alias
@@ -7195,6 +7196,8 @@ def translate_with_clause(with_clause, context):
                 alias = f"{item.expression.function_name}"
         if alias is None:
             alias = context.next_alias("v")
+
+        with_item_aliases[alias] = "__TEMP_WITH_ALIAS__"
 
         # Track temporal types for property access extraction
         if isinstance(item.expression, ast.FunctionCall):
@@ -7234,6 +7237,7 @@ def translate_with_clause(with_clause, context):
             context.group_by_items.append(sql)
         if isinstance(item.expression, ast.AggregationFunction):
             agg_aliases.add(alias)
+
     agg_alias_sql: dict = {}
     for item in with_clause.items:
         if isinstance(item.expression, ast.AggregationFunction):
@@ -7241,16 +7245,26 @@ def translate_with_clause(with_clause, context):
             if alias is None:
                 alias = item.expression.function_name
             agg_alias_sql[alias] = translate_expression(item.expression, context, segment="select")
+
     if with_clause.where_clause:
-        expr = with_clause.where_clause.expression
-        if has_agg and agg_aliases and _references_agg_alias(expr, agg_aliases):
-            context.having_conditions.append(
-                _translate_having_expr(expr, agg_aliases, agg_alias_sql, context)
-            )
-        else:
-            context.where_conditions.append(
-                translate_boolean_expression(expr, context)
-            )
+        # Temporarily add WITH clause aliases to variable_aliases so the WHERE clause can see them.
+        # This implements correct Cypher scoping: WITH WHERE sees both old variables and new aliases.
+        old_variable_aliases = context.variable_aliases.copy()
+        context.variable_aliases = {**old_variable_aliases, **with_item_aliases}
+
+        try:
+            expr = with_clause.where_clause.expression
+            if has_agg and agg_aliases and _references_agg_alias(expr, agg_aliases):
+                context.having_conditions.append(
+                    _translate_having_expr(expr, agg_aliases, agg_alias_sql, context)
+                )
+            else:
+                context.where_conditions.append(
+                    translate_boolean_expression(expr, context)
+                )
+        finally:
+            # Restore the original variable_aliases; the WITH handler will set up the proper stage bindings
+            context.variable_aliases = old_variable_aliases
 
 
 def _references_agg_alias(expr, agg_aliases: set) -> bool:
