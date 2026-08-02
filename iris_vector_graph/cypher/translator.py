@@ -3624,6 +3624,8 @@ def translate_merge_clause(merge, context, metadata):
                         context.input_params.get(f"__create_id_{var_name}")
                         or context.input_params.get(var_name)
                     )
+                    if not sql_alias and not actual_id:
+                        raise SyntaxError(f"Undefined variable: {var_name}")
                     k, v = item.expression.property_name, item.value
                     val = v.value if isinstance(v, ast.Literal) else v
                     if is_create:
@@ -3671,10 +3673,37 @@ def translate_merge_clause(merge, context, metadata):
                                 )
                     else:
                         if actual_id:
-                            context.add_dml(
-                                f'UPDATE {_table("rdf_props")} SET val = ? WHERE s = ? AND "key" = ?',
-                                [val, actual_id, k],
-                            )
+                            # actual_id is the new UUID — only present if node was just created.
+                            # ON MATCH fires for pre-existing nodes; find them via MERGE pattern.
+                            _on_mn = merge.pattern.nodes[0] if merge.pattern.nodes else None
+                            _on_es, _on_ep = _merge_pattern_existence_sql(_on_mn)
+                            _on_labels = _on_mn.labels if _on_mn else []
+                            _on_props = _on_mn.properties if _on_mn else {}
+                            if _on_labels or _on_props:
+                                # _on_es = "SELECT 1 FROM nodes _ml0 JOIN ..."
+                                _on_ns = _on_es.replace("SELECT 1 FROM ", "SELECT _ml0.node_id FROM ", 1)
+                                _on_fj = _on_es.replace("SELECT 1 ", "", 1)
+                                # UPDATE existing property row
+                                context.add_dml(
+                                    f'UPDATE {_table("rdf_props")} SET val = ? '
+                                    f'WHERE s IN ({_on_ns}) AND "key" = ?',
+                                    [val] + _on_ep + [k],
+                                )
+                                # INSERT property if not yet present on matched node.
+                                # Param order: k, val (for SELECT ?, ?), _on_ep (JOIN conditions), k (NOT EXISTS)
+                                context.add_dml(
+                                    f'INSERT INTO {_table("rdf_props")} (s, "key", val) '
+                                    f'SELECT _ml0.node_id, ?, ? {_on_fj} '
+                                    f'WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} '
+                                    f'WHERE s = _ml0.node_id AND "key" = ?)',
+                                    [k, val] + _on_ep + [k],
+                                )
+                            else:
+                                # No pattern constraints — update all nodes (degenerate MERGE (a)).
+                                context.add_dml(
+                                    f'UPDATE {_table("rdf_props")} SET val = ? WHERE "key" = ?',
+                                    [val, k],
+                                )
                         else:
                             # MATCH-bound node: use pre-MERGE MATCH context subquery.
                             from_parts = context.from_clauses[:_pre_from_len]
@@ -3719,15 +3748,30 @@ def translate_merge_clause(merge, context, metadata):
                             [label, actual_id],
                         )
                     else:
-                        # ON MATCH: add label to the pre-existing node.
-                        on_match_alias = context.variable_aliases.get(var_name, "")
-                        context.add_dml(
-                            f'INSERT INTO {_table("rdf_labels")} (s, label) '
-                            f'SELECT node_id, ? FROM {_table("nodes")} WHERE node_id = ? '
-                            f'AND NOT EXISTS (SELECT 1 FROM {_table("rdf_labels")} '
-                            f'WHERE s = ? AND label = ?)',
-                            [label, on_match_alias, on_match_alias, label],
-                        )
+                        # ON MATCH: add label to the pre-existing node identified by MERGE pattern.
+                        _lbl_mn = merge.pattern.nodes[0] if merge.pattern.nodes else None
+                        _lbl_es, _lbl_ep = _merge_pattern_existence_sql(_lbl_mn)
+                        _lbl_labels = _lbl_mn.labels if _lbl_mn else []
+                        _lbl_props = _lbl_mn.properties if _lbl_mn else {}
+                        if _lbl_labels or _lbl_props:
+                            # Find matched node via MERGE pattern, add label if not present.
+                            _lbl_ns = _lbl_es.replace("SELECT 1 FROM ", "SELECT _ml0.node_id FROM ", 1)
+                            context.add_dml(
+                                f'INSERT INTO {_table("rdf_labels")} (s, label) '
+                                f'SELECT q.node_id, ? FROM ({_lbl_ns}) q '
+                                f'WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_labels")} '
+                                f'WHERE s = q.node_id AND label = ?)',
+                                [label] + _lbl_ep + [label],
+                            )
+                        else:
+                            # No pattern constraints — add label to all nodes.
+                            context.add_dml(
+                                f'INSERT INTO {_table("rdf_labels")} (s, label) '
+                                f'SELECT node_id, ? FROM {_table("nodes")} '
+                                f'WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_labels")} '
+                                f'WHERE s = node_id AND label = ?)',
+                                [label, label],
+                            )
 
 
 def _translate_set_value(expr, context, target_prop: str) -> tuple:
