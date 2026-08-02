@@ -64,7 +64,7 @@ def test_translate_type_function():
     sql = "\n".join(sql_query.sql) if isinstance(sql_query.sql, list) else sql_query.sql
 
     # type(r) should reference the edge alias's p column
-    assert ".p AS type_res" in sql
+    assert ".p AS type_r_" in sql
     assert "rdf_edges" in sql or "MatchEdges" in sql
 
 
@@ -201,7 +201,7 @@ def test_undirected_with_node_props_uses_union_all():
     q = "MATCH (a)-[r]-(b) WHERE a.id = $x RETURN a.id, b.id, b.name, type(r)"
     r = translate_to_sql(parse_query(q), {"x": "hla-b27"})
     assert "UNION ALL" in r.sql
-    assert "e2._p AS type_res" in r.sql, "type(r) must use _p column alias in UNION subquery"
+    assert "e2._p AS type_r_" in r.sql, "type(r) must use _p column alias in UNION subquery"
 
 
 def test_undirected_typed_rel_uses_union_all():
@@ -221,7 +221,7 @@ def test_directed_outgoing_still_uses_single_join():
     r = translate_to_sql(parse_query(q), {"x": "hla-b27"})
     assert "UNION ALL" not in r.sql
     assert "rdf_edges" in r.sql
-    assert "e2.p AS type_res" in r.sql
+    assert "e2.p AS type_r_" in r.sql
 
 
 def test_directed_incoming_still_uses_single_join():
@@ -256,3 +256,26 @@ def test_gqs_oracle_pattern_parses():
     q = "MATCH (a)-[r]-(b) WHERE a.id = 1 RETURN count(*) MATCH (a)-[r2]-(b) WHERE a.id = 1 RETURN DISTINCT b.id"
     parsed = parse_query(q)
     assert len(parsed.subsequent_queries) >= 1
+
+def test_merge_relationship_with_labeled_nodes():
+    """Test MERGE with relationship creates idempotent INSERT and includes edge in SELECT."""
+    query = "MATCH (a:A), (b:B) MERGE (a)-[r:TYPE]->(b) RETURN count(r)"
+    parsed = parse_query(query)
+    result = translate_to_sql(parsed)
+
+    # Should generate INSERT and SELECT
+    assert len(result.sql) >= 2, f"Expected at least 2 SQL statements, got {len(result.sql)}"
+
+    insert_sql = result.sql[0]
+    select_sql = result.sql[1]
+
+    # INSERT should have idempotency guard
+    assert "INSERT INTO" in insert_sql, "INSERT statement missing"
+    assert "rdf_edges" in insert_sql, "INSERT should be to rdf_edges"
+    assert "NOT EXISTS" in insert_sql, f"INSERT missing NOT EXISTS guard: {insert_sql}"
+
+    # SELECT should join with rdf_edges to find the created/existing edge
+    assert "SELECT" in select_sql, "SELECT statement missing"
+    assert "rdf_edges" in select_sql, f"SELECT missing rdf_edges join: {select_sql}"
+    assert "e4 ON" in select_sql, "Edge alias should be referenced in JOIN ON clause"
+    assert "COUNT(e" in select_sql, "COUNT should reference edge alias"
