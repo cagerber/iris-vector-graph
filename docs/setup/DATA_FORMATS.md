@@ -156,13 +156,13 @@ results = engine.get_edges_in_window("sensor:A", "READS", ts_start=1746000000, t
 
 IVG node IDs are arbitrary strings (up to 256 chars). Common patterns:
 
-| Domain | Example IDs |
-|---|---|
-| Gene | `gene:BRCA1`, `ENSG00000012048` |
-| Protein | `uniprot:P38398` |
-| Drug | `drug:Olaparib`, `CHEMBL:CHEMBL2107776` |
-| Disease | `MESH:D001943`, `OMIM:604370` |
-| Ontology term | `NCIT:C84564`, `GO:0007049` |
+| Domain        | Example IDs                             |
+| ------------- | --------------------------------------- |
+| Gene          | `gene:BRCA1`, `ENSG00000012048`         |
+| Protein       | `uniprot:P38398`                        |
+| Drug          | `drug:Olaparib`, `CHEMBL:CHEMBL2107776` |
+| Disease       | `MESH:D001943`, `OMIM:604370`           |
+| Ontology term | `NCIT:C84564`, `GO:0007049`             |
 
 IVG does not enforce a namespace — use whatever convention is consistent within your dataset. IDs are case-sensitive (`NCIT:C84564` ≠ `ncit:c84564`) and stored using IRIS `%EXACT` collation.
 
@@ -170,13 +170,13 @@ IVG does not enforce a namespace — use whatever convention is consistent withi
 
 ## Format Selection Guide
 
-| Data Source | Recommended Method |
-|---|---|
-| OBO ontology (GO, NCI Thesaurus, ChEBI) | `engine.load_obo()` |
-| RDF triples | `engine.import_rdf()` |
-| CSV/TSV edge list | Parse in Python → `bulk_create_edges()` |
-| JSONL graph snapshot | `engine.import_graph_ndjson()` |
-| Existing IRIS SQL tables | `engine.map_sql_table()` / `map_sql_relationship()` |
-| Pre-computed embeddings | `engine.store_embeddings()` |
-| High-throughput streaming edges | `engine.bulk_ingest_edges()` + `rebuild_nkg()` |
-| Temporal time-series edges | `engine.bulk_create_edges_temporal()` |
+| Data Source                             | Recommended Method                                  |
+| --------------------------------------- | --------------------------------------------------- |
+| OBO ontology (GO, NCI Thesaurus, ChEBI) | `engine.load_obo()`                                 |
+| RDF triples                             | `engine.import_rdf()`                               |
+| CSV/TSV edge list                       | Parse in Python → `bulk_create_edges()`             |
+| JSONL graph snapshot                    | `engine.import_graph_ndjson()`                      |
+| Existing IRIS SQL tables                | `engine.map_sql_table()` / `map_sql_relationship()` |
+| Pre-computed embeddings                 | `engine.store_embeddings()`                         |
+| High-throughput streaming edges         | `engine.bulk_ingest_edges()` + `rebuild_nkg()`      |
+| Temporal time-series edges              | `engine.bulk_create_edges_temporal()`               |

@@ -217,6 +217,10 @@ class TranslationContext:
         self.rel_obj_aliases: Dict[int, str] = (
             {} if parent is None else parent.rel_obj_aliases.copy()
         )
+        # Maps anonymous node object id() → SQL alias (for chained anonymous node reuse)
+        self.node_obj_aliases: Dict[int, str] = (
+            {} if parent is None else parent.node_obj_aliases.copy()
+        )
         self.var_length_paths: List[dict] = (
             [] if parent is None else parent.var_length_paths
         )
@@ -2818,31 +2822,35 @@ def translate_match_clause(match_clause, context, metadata):
     for pattern in match_clause.patterns:
         if not pattern.nodes:
             continue
-        # Check within pattern
-        vars_in_pattern = set()
-        for node in pattern.nodes:
+        # Check for node back-references within a pattern chain (e.g. (n)-->(n) self-loop).
+        # These are VALID in Cypher — they constrain start/end to the same node.
+        # Track them so we can add self-loop WHERE constraints below.
+        node_vars_in_pattern: dict = {}  # var -> first index
+        self_loop_vars: set = set()  # vars that appear twice (back-reference)
+        for idx_n, node in enumerate(pattern.nodes):
             if node.variable:
-                if node.variable in vars_in_pattern:
-                    raise CypherParseError(
-                        f"VariableAlreadyBound: variable '{node.variable}' appears twice "
-                        f"in the same pattern"
-                    )
-                vars_in_pattern.add(node.variable)
+                if node.variable in node_vars_in_pattern:
+                    # Back-reference (self-loop) — valid in Cypher
+                    self_loop_vars.add(node.variable)
+                else:
+                    node_vars_in_pattern[node.variable] = idx_n
                 # Also check if this variable was already seen in this MATCH clause
-                if node.variable in vars_in_match:
+                if node.variable in vars_in_match and node.variable not in self_loop_vars:
                     raise CypherParseError(
                         f"VariableAlreadyBound: variable '{node.variable}' is already bound "
                         f"in this MATCH clause"
                     )
                 vars_in_match.add(node.variable)
+        # Track rel vars in a separate set (rel vars can't be duplicated)
+        rel_vars_in_pattern: set = set()
         for rel in pattern.relationships:
             if rel.variable:
-                if rel.variable in vars_in_pattern:
+                if rel.variable in rel_vars_in_pattern:
                     raise CypherParseError(
                         f"VariableAlreadyBound: variable '{rel.variable}' appears twice "
                         f"in the same pattern"
                     )
-                vars_in_pattern.add(rel.variable)
+                rel_vars_in_pattern.add(rel.variable)
                 # Also check if this variable was already seen in this MATCH clause
                 if rel.variable in vars_in_match:
                     raise CypherParseError(
@@ -2889,16 +2897,38 @@ def translate_match_clause(match_clause, context, metadata):
             else:
                 _ = context.next_alias("n")
         for i, rel in enumerate(pattern.relationships):
+            src_node = pattern.nodes[i]
+            tgt_node = pattern.nodes[i + 1]
             translate_relationship_pattern(
                 rel,
-                pattern.nodes[i],
-                pattern.nodes[i + 1],
+                src_node,
+                tgt_node,
                 context,
                 metadata,
                 optional=match_clause.optional,
             )
-            last_node = pattern.nodes[i + 1]
-            if last_node.variable:
+            last_node = tgt_node
+            is_back_ref = (
+                src_node.variable
+                and tgt_node.variable
+                and src_node.variable == tgt_node.variable
+            )
+            if is_back_ref:
+                # Self-loop: both ends are the same node — add edge self-loop constraint.
+                src_alias = context.variable_aliases.get(src_node.variable)
+                edge_alias = context.rel_obj_aliases.get(id(rel))
+                if src_alias and edge_alias:
+                    if rel.direction == ast.Direction.BOTH:
+                        # Undirected edge: _src and _dst are the same node
+                        context.where_conditions.append(
+                            f"{edge_alias}._src = {edge_alias}._dst"
+                        )
+                    else:
+                        # Directed edge: s and o_id are the same node
+                        context.where_conditions.append(
+                            f"{edge_alias}.s = {edge_alias}.o_id"
+                        )
+            elif last_node.variable:
                 translate_node_pattern(
                     last_node, context, metadata, optional=match_clause.optional
                 )
@@ -3319,7 +3349,14 @@ def _trp_setup_aliases(rel, source_node, target_node, context):
     is_anon_source = source_node.variable is None
     is_unbound_src = False
     if is_anon_source:
-        source_alias = context.next_alias("n")
+        # Reuse existing alias if this anonymous node object was already seen
+        # (e.g. as target of previous hop in a chain like ()-[]-(x)-[]-()).
+        node_id_key = id(source_node)
+        if node_id_key in context.node_obj_aliases:
+            source_alias = context.node_obj_aliases[node_id_key]
+            is_anon_source = False  # treat as bound — it has a backing JOIN
+        else:
+            source_alias = context.next_alias("n")
     else:
         existing = context.variable_aliases.get(source_node.variable)
         if existing is None:
@@ -3330,8 +3367,20 @@ def _trp_setup_aliases(rel, source_node, target_node, context):
             is_unbound_src = True
         else:
             source_alias = existing
-    is_new_target = target_node.variable not in context.variable_aliases
-    target_alias = context.register_variable(target_node.variable)
+    if target_node.variable is None:
+        # Anonymous target: use object-id keyed alias to avoid sharing None key
+        # across multiple anonymous nodes in a chain.
+        node_key = id(target_node)
+        if node_key in context.node_obj_aliases:
+            target_alias = context.node_obj_aliases[node_key]
+            is_new_target = False
+        else:
+            target_alias = context.next_alias("n")
+            context.node_obj_aliases[node_key] = target_alias
+            is_new_target = True
+    else:
+        is_new_target = target_node.variable not in context.variable_aliases
+        target_alias = context.register_variable(target_node.variable)
     edge_alias = (
         context.register_variable(rel.variable, prefix="e")
         if rel.variable
@@ -3475,6 +3524,7 @@ def _trp_mapped_relation(rel, source_node, target_node, context, source_alias, t
 def _trp_undirected_edge(
     rel, source_node, target_node, context,
     source_alias, target_alias, edge_alias, s_col, t_col, jt, is_new_target,
+    is_anon_source=False,
 ):
     """Handle undirected (BOTH direction) patterns via UNION ALL derived table."""
     # UNION ALL of two indexed scans replaces OR-join:
@@ -3488,20 +3538,61 @@ def _trp_undirected_edge(
             safe_ps = ", ".join(f"'{t.replace(chr(39), chr(39)+chr(39))}'" for t in rel.types)
             pred_filter = f" AND p IN ({safe_ps})"
     edges_tbl = _table("rdf_edges")
-    union_derived = (
-        f"(\n"
-        f"  SELECT s AS _src, p AS _p, o_id AS _dst\n"
-        f"  FROM {edges_tbl}\n"
-        f"  WHERE s = {source_alias}.{s_col}{pred_filter}\n"
-        f"  UNION ALL\n"
-        f"  SELECT o_id AS _src, p AS _p, s AS _dst\n"
-        f"  FROM {edges_tbl}\n"
-        f"  WHERE o_id = {source_alias}.{s_col}{pred_filter}\n"
-        f") {edge_alias}"
-    )
-    edge_cond = f"1=1"
-    target_on = f"{target_alias}.{t_col} = {edge_alias}._dst"
-    context.join_clauses.append(f"{jt} {union_derived} ON {edge_cond}")
+    if is_anon_source:
+        # No source node table to anchor on — scan the full edge table.
+        # Self-loops (s = o_id) must appear exactly once; non-self-loops appear twice
+        # (once forward, once reversed).  The guard "WHERE s != o_id" on the reversed
+        # half achieves this without needing DISTINCT.
+        where_fwd = f"WHERE 1=1{pred_filter}" if pred_filter else ""
+        where_rev = f"WHERE s != o_id{pred_filter}"
+        if where_fwd:
+            union_derived = (
+                f"(\n"
+                f"  SELECT s AS _src, p AS _p, o_id AS _dst\n"
+                f"  FROM {edges_tbl}\n"
+                f"  {where_fwd}\n"
+                f"  UNION ALL\n"
+                f"  SELECT o_id AS _src, p AS _p, s AS _dst\n"
+                f"  FROM {edges_tbl}\n"
+                f"  {where_rev}\n"
+                f") {edge_alias}"
+            )
+        else:
+            union_derived = (
+                f"(\n"
+                f"  SELECT s AS _src, p AS _p, o_id AS _dst FROM {edges_tbl}\n"
+                f"  UNION ALL\n"
+                f"  SELECT o_id AS _src, p AS _p, s AS _dst FROM {edges_tbl} WHERE s != o_id\n"
+                f") {edge_alias}"
+            )
+        edge_cond = "1=1"
+        target_on = f"{target_alias}.{t_col} = {edge_alias}._dst"
+        if not context.from_clauses:
+            context.from_clauses.append(f"{union_derived}")
+        else:
+            context.join_clauses.append(f"{jt} {union_derived} ON {edge_cond}")
+        # Apply source node labels via _src column (anonymous source has no node table)
+        for label in (source_node.labels or []):
+            l_alias = context.next_alias("l")
+            context.join_clauses.append(
+                f"{jt} {_table('rdf_labels')} {l_alias} "
+                f"ON {l_alias}.s = {edge_alias}._src AND {l_alias}.label = {context.add_join_param(label)}"
+            )
+    else:
+        union_derived = (
+            f"(\n"
+            f"  SELECT s AS _src, p AS _p, o_id AS _dst\n"
+            f"  FROM {edges_tbl}\n"
+            f"  WHERE s = {source_alias}.{s_col}{pred_filter}\n"
+            f"  UNION ALL\n"
+            f"  SELECT o_id AS _src, p AS _p, s AS _dst\n"
+            f"  FROM {edges_tbl}\n"
+            f"  WHERE o_id = {source_alias}.{s_col} AND s != o_id{pred_filter}\n"
+            f") {edge_alias}"
+        )
+        edge_cond = f"1=1"
+        target_on = f"{target_alias}.{t_col} = {edge_alias}._dst"
+        context.join_clauses.append(f"{jt} {union_derived} ON {edge_cond}")
     context._undirected_aliases.add(edge_alias)
     if is_new_target and not target_alias.startswith("Stage"):
         context.join_clauses.append(
@@ -3716,13 +3807,136 @@ def translate_relationship_pattern(
     s_col = _node_col(source_node.variable, source_alias)
     t_col = _node_col(target_node.variable, target_alias)
     jt = "LEFT OUTER JOIN" if optional else "JOIN"
+
+    # Stage-bound relationship: when the edge variable is already promoted to a CTE
+    # stage (alias = "StageN"), its edge identity is stored as __edge_<var>_s/p/o columns.
+    # Use those directly instead of re-joining rdf_edges with the wrong alias.
+    stage_names = {s.split(" AS (")[0].strip() for s in getattr(context, "stages", [])}
+    if rel.variable and edge_alias in stage_names and edge_alias.startswith("Stage"):
+        var_name = rel.variable
+        stage = edge_alias
+        s_col_stage = f"__edge_{var_name}_s"
+        o_col_stage = f"__edge_{var_name}_o"
+        # For OUTGOING (src)-[r]->(tgt): rdf_edges.s=src, rdf_edges.o_id=tgt
+        # For INCOMING (src)<-[r]-(tgt): rdf_edges.s=tgt, rdf_edges.o_id=src
+        # source_node is the LEFT node in the Cypher pattern.
+        if rel.direction == ast.Direction.OUTGOING:
+            # (source)-[r]->(target): source->s_col_stage, target->o_col_stage
+            src_edge_col, tgt_edge_col = s_col_stage, o_col_stage
+        else:
+            # (source)<-[r]-(target): source is on o_id side, target is on s side
+            src_edge_col, tgt_edge_col = o_col_stage, s_col_stage
+        # Build direction-check condition (must be satisfied for the edge to match).
+        # For OPTIONAL patterns this goes into the LEFT OUTER JOIN ON clause so that
+        # mismatch yields NULL rather than filtering out the whole row.
+        dir_checks = []
+        if not is_anon_source and not is_unbound_src:
+            src_id = (
+                f"{source_alias}.{source_node.variable}"
+                if source_alias.startswith("Stage")
+                else f"{source_alias}.node_id"
+            )
+            dir_checks.append(f"{src_id} = {stage}.{src_edge_col}")
+        if not is_new_target and target_node.variable:
+            tgt_id = (
+                f"{target_alias}.{target_node.variable}"
+                if target_alias.startswith("Stage")
+                else f"{target_alias}.node_id"
+            )
+            dir_checks.append(f"{tgt_id} = {stage}.{tgt_edge_col}")
+        dir_cond = " AND ".join(dir_checks) if dir_checks else "1=1"
+        # When optional and source was pre-registered by translate_node_pattern (is_unbound_src
+        # is False but source was not stage-bound), it got a CROSS JOIN.  Upgrade it to a LEFT
+        # OUTER JOIN anchored on the edge column so OPTIONAL semantics are preserved.
+        if optional and not is_unbound_src and not is_anon_source and not source_alias.startswith("Stage"):
+            nodes_tbl = _table("nodes")
+            cross_clause = f"CROSS JOIN {nodes_tbl} {source_alias}"
+            new_join_clauses = []
+            for jc in context.join_clauses:
+                if jc.strip() == cross_clause:
+                    new_join_clauses.append(
+                        f"LEFT OUTER JOIN {nodes_tbl} {source_alias} ON {source_alias}.node_id = {stage}.{src_edge_col}"
+                    )
+                else:
+                    new_join_clauses.append(jc)
+            context.join_clauses = new_join_clauses
+            # Remove the spurious WHERE condition that would nullify the LEFT OUTER JOIN
+            context.where_conditions = [
+                w for w in context.where_conditions
+                if not (f"{source_alias}.node_id = {stage}.{src_edge_col}" in w)
+            ]
+            # Label JOINs for the source were added (without WHERE) by translate_node_pattern.
+            # For a Stage-bound OPTIONAL pattern the label is still a strict filter:
+            # if the edge's source node doesn't carry the required label the pattern doesn't
+            # match and the whole OPTIONAL should yield NULL.  Enforce with WHERE IS NOT NULL.
+            for jc in context.join_clauses:
+                if (jc.startswith("LEFT OUTER JOIN") and
+                        _table("rdf_labels") in jc and
+                        f"{source_alias}.node_id" in jc):
+                    # Extract the label alias (first token after rdf_labels keyword)
+                    parts = jc.split()
+                    rdf_idx = next((i for i, p in enumerate(parts) if "rdf_labels" in p), None)
+                    if rdf_idx is not None and rdf_idx + 1 < len(parts):
+                        l_alias_found = parts[rdf_idx + 1]
+                        context.where_conditions.append(
+                            f"({l_alias_found}.s IS NOT NULL OR {source_alias}.node_id IS NULL)"
+                        )
+        # Register new target node if it is unbound — join via edge column.
+        # Include direction check in the ON clause so OPTIONAL semantics work.
+        if is_new_target and target_node.variable:
+            target_alias_fresh = context.next_alias("n")
+            context.variable_aliases[target_node.variable] = target_alias_fresh
+            on_cond = (
+                f"{target_alias_fresh}.node_id = {stage}.{tgt_edge_col}"
+                + (f" AND {dir_cond}" if dir_cond != "1=1" else "")
+            )
+            context.join_clauses.append(
+                f"{jt} {_table('nodes')} {target_alias_fresh} ON {on_cond}"
+            )
+            for label in (target_node.labels or []):
+                l_alias = context.next_alias("l")
+                context.join_clauses.append(
+                    f"{jt} {_table('rdf_labels')} {l_alias} "
+                    f"ON {l_alias}.s = {target_alias_fresh}.node_id AND {l_alias}.label = {context.add_join_param(label)}"
+                )
+                if not optional:
+                    context.where_conditions.append(f"{l_alias}.s IS NOT NULL")
+        elif dir_checks and optional:
+            # Target already bound and pattern is optional: use WHERE (filtering is OK here
+            # since a fully-bound pattern either matches or returns nothing / null-union handles it).
+            for chk in dir_checks:
+                context.where_conditions.append(chk)
+        elif dir_checks:
+            for chk in dir_checks:
+                context.where_conditions.append(chk)
+        # Register new source node if it is unbound.
+        if is_unbound_src and source_node.variable:
+            source_alias_fresh = context.next_alias("n")
+            context.variable_aliases[source_node.variable] = source_alias_fresh
+            on_cond = (
+                f"{source_alias_fresh}.node_id = {stage}.{src_edge_col}"
+                + (f" AND {dir_cond}" if dir_cond != "1=1" and not (is_new_target and target_node.variable) else "")
+            )
+            context.join_clauses.append(
+                f"{jt} {_table('nodes')} {source_alias_fresh} ON {on_cond}"
+            )
+            for label in (source_node.labels or []):
+                l_alias = context.next_alias("l")
+                context.join_clauses.append(
+                    f"{jt} {_table('rdf_labels')} {l_alias} "
+                    f"ON {l_alias}.s = {source_alias_fresh}.node_id AND {l_alias}.label = {context.add_join_param(label)}"
+                )
+                if not optional:
+                    context.where_conditions.append(f"{l_alias}.s IS NOT NULL")
+        return
     if _trp_temporal_edge(rel, source_node, target_node, context, source_alias, edge_alias, direction):
         return
     if _trp_mapped_relation(rel, source_node, target_node, context, source_alias, target_alias, optional):
         return
     if rel.direction == ast.Direction.BOTH:
         _trp_undirected_edge(rel, source_node, target_node, context,
-                              source_alias, target_alias, edge_alias, s_col, t_col, jt, is_new_target)
+                              source_alias, target_alias, edge_alias, s_col, t_col, jt, is_new_target,
+                              is_anon_source=is_anon_source)
         return
 
     # Direction-symmetry fix: when source is unbound but target is already bound,
@@ -4130,6 +4344,76 @@ def _boolean_expr_in(left, right_expr, context):
     return None
 
 
+def _rel_identity_comparison(op, left_expr, right_expr, context) -> Optional[str]:
+    """Generate relationship identity comparison (s, p, o triple match) for a = b / a <> b.
+
+    Returns SQL condition string if both operands are relationship variables, else None.
+    Handles three cases:
+      1. stage-edge vs current-edge: __edge_a_s = e.s AND __edge_a_p = e.p AND __edge_a_o = e.o_id
+      2. current-edge vs current-edge: e1.s = e2.s AND e1.p = e2.p AND e1.o_id = e2.o_id
+      3. current-edge vs stage-edge: same as case 1, reversed
+    """
+    def _get_edge_info(expr_var):
+        """Return (kind, alias, var_name) for a Variable that is an edge variable.
+        kind: 'stage' or 'current' or None
+        """
+        if not isinstance(expr_var, ast.Variable):
+            return None
+        var_name = expr_var.name
+        alias = context.variable_aliases.get(var_name)
+        if alias is None:
+            return None
+        edge_stage_vars = getattr(context, "edge_stage_variables", set())
+        if alias.startswith("Stage") and var_name in edge_stage_vars:
+            return ('stage', alias, var_name)
+        if alias.startswith("e") and not alias.startswith("Stage"):
+            is_undirected = alias in getattr(context, "_undirected_aliases", set())
+            return ('current', alias, var_name, is_undirected)
+        return None
+
+    left_info = _get_edge_info(left_expr)
+    right_info = _get_edge_info(right_expr)
+    if left_info is None or right_info is None:
+        return None
+
+    # Both are edge variables — generate triple comparison
+    op_str = "=" if op == ast.BooleanOperator.EQUALS else "<>"
+    join_str = " AND " if op == ast.BooleanOperator.EQUALS else " OR "
+
+    def _stage_cols(var_name):
+        return (
+            f"__edge_{var_name}_s",
+            f"__edge_{var_name}_p",
+            f"__edge_{var_name}_o",
+        )
+
+    def _current_cols(alias, is_undirected=False):
+        if is_undirected:
+            return (f"{alias}._src", f"{alias}._p", f"{alias}._dst")
+        return (f"{alias}.s", f"{alias}.p", f"{alias}.o_id")
+
+    if left_info[0] == 'stage':
+        ls, lp, lo = _stage_cols(left_info[2])
+    else:
+        ls, lp, lo = _current_cols(left_info[1], left_info[3] if len(left_info) > 3 else False)
+
+    if right_info[0] == 'stage':
+        rs, rp, ro = _stage_cols(right_info[2])
+    else:
+        rs, rp, ro = _current_cols(right_info[1], right_info[3] if len(right_info) > 3 else False)
+
+    parts = [
+        f"{ls} {op_str} {rs}",
+        f"{lp} {op_str} {rp}",
+        f"{lo} {op_str} {ro}",
+    ]
+    if op == ast.BooleanOperator.EQUALS:
+        return "(" + " AND ".join(parts) + ")"
+    else:
+        # NOT EQUALS: at least one component differs
+        return "(" + " OR ".join(parts) + ")"
+
+
 def translate_boolean_expression(expr, context) -> str:
     if isinstance(expr, ast.ExistsExpression):
         result = _boolean_expr_exists(expr, context)
@@ -4194,6 +4478,14 @@ def translate_boolean_expression(expr, context) -> str:
                 if isinstance(_rcoll, list) and len(_rcoll) == 0:
                     return "(1=0)"  # false
         return "NULL"
+    # Relationship identity comparison: a = b / a <> b where a and/or b are
+    # relationship variables. Relationship equality means same (s, p, o) triple.
+    # Stage edge variables store identity as __edge_{var}_s/p/o columns.
+    if op in (ast.BooleanOperator.EQUALS, ast.BooleanOperator.NOT_EQUALS):
+        rel_id_cond = _rel_identity_comparison(op, left_expr, right_expr, context)
+        if rel_id_cond is not None:
+            return rel_id_cond
+
     left_inlined = _inline_literal(left_expr)
     left = left_inlined if left_inlined is not None else translate_expression(left_expr, context, segment="where")
     # Wrap CASE WHEN expressions in parens — IRIS SQLCODE -25 if bare CASE ends before =
@@ -4608,6 +4900,13 @@ def _expr_map_projection(expr, context, segment):
 def _expr_map_literal(expr, context, segment):
     if not expr.entries:
         return "'{}'"
+    if _is_fully_literal(expr):
+        import json as _json
+        py_val = _literal_to_python(expr)
+        json_str = _json.dumps(py_val)
+        str_len = max(len(json_str) + 1, 256)
+        escaped = json_str.replace("'", "''")
+        return f"CAST('{escaped}' AS VARCHAR({str_len}))"
     parts = []
     for k, v in expr.entries.items():
         safe_k = k.replace("'", "''")
@@ -4718,7 +5017,34 @@ def _expr_variable(expr, context, segment):
     return f"{alias}.node_id"
 
 
+def _is_fully_literal(node):
+    """Return True if node is fully evaluable at translate-time (no variables/exprs)."""
+    if isinstance(node, ast.Literal):
+        v = node.value
+        if isinstance(v, list):
+            return all(_is_fully_literal(item) for item in v)
+        return True  # scalar Literal
+    if isinstance(node, ast.MapLiteral):
+        return all(_is_fully_literal(val) for val in node.entries.values())
+    return False
+
+
+def _literal_to_python(node):
+    """Extract Python value from a fully-literal AST node."""
+    if isinstance(node, ast.Literal):
+        v = node.value
+        if isinstance(v, list):
+            return [_literal_to_python(item) for item in v]
+        if v is True: return True
+        if v is False: return False
+        return v
+    if isinstance(node, ast.MapLiteral):
+        return {k: _literal_to_python(val) for k, val in node.entries.items()}
+    return None
+
+
 def _expr_literal(expr, context, segment):
+    import json as _json
     v = expr.value
     if v is True:
         return "1"
@@ -4727,14 +5053,12 @@ def _expr_literal(expr, context, segment):
     if v is None:
         return "NULL"
     if isinstance(v, list):
-        import json as _json
-        all_simple = all(
-            isinstance(item, ast.Literal) and isinstance(item.value, (int, float, str, bool, type(None)))
-            for item in v
-        )
-        if all_simple:
-            items = [item.value for item in v]
-            json_str = _json.dumps(items)
+        # When ALL items are fully literal (including nested lists/maps), serialize
+        # the whole structure as a JSON string.  This avoids IRIS embedding nested
+        # arrays as VARCHAR strings (e.g. JSON_ARRAY(CAST('[1,2]' AS VARCHAR)) → ["[1,2]"]).
+        if _is_fully_literal(expr):
+            py_val = _literal_to_python(expr)
+            json_str = _json.dumps(py_val)
             str_len = max(len(json_str) + 1, 256)
             escaped = json_str.replace("'", "''")
             return f"CAST('{escaped}' AS VARCHAR({str_len}))"
@@ -5954,7 +6278,15 @@ def _expr_to_cypher_text(expr) -> str:
         parts = [_expr_to_cypher_text(o) for o in expr.operands]
         return f" {op_str} ".join(parts)
     if isinstance(expr, ast.AggregationFunction):
-        if expr.argument is None and expr.function_name == "count":
+        # count(*) may be parsed as argument=Literal("*") or argument=None
+        is_count_star = (
+            expr.function_name == "count"
+            and (
+                expr.argument is None
+                or (isinstance(expr.argument, ast.Literal) and expr.argument.value == "*")
+            )
+        )
+        if is_count_star:
             return "count(*)"
         distinct = "DISTINCT " if expr.distinct else ""
         arg_text = _expr_to_cypher_text(expr.argument) if expr.argument is not None else "*"
@@ -5996,6 +6328,18 @@ def translate_return_clause(ret, context):
                 continue
             alias_name = context.variable_aliases.get(var_name)
             is_scalar = var_name in context.scalar_variables
+            # Stage-promoted edge variables (e.g. WITH r promoted to Stage1 with __edge_r_s/p/o)
+            # must NOT go through the node path — emit edge identity columns instead.
+            edge_stage_vars = getattr(context, "edge_stage_variables", set())
+            if alias_name and alias_name.startswith("Stage") and var_name in edge_stage_vars:
+                prefix = item.alias or var_name
+                p_col = f"__edge_{var_name}_p"
+                s_col = f"__edge_{var_name}_s"
+                o_col = f"__edge_{var_name}_o"
+                # Emit p (type) as the relationship identifier and s/p/o for identity.
+                context.select_items.append(f"{alias_name}.{p_col} AS {prefix}")
+                context.optional_null_row_items.append("NULL")
+                continue
             if alias_name == "scalar":
                 continue
             if alias_name and not alias_name.startswith("e") and not is_scalar:

@@ -105,20 +105,20 @@ Term-first `"tf"` subscript order enables O(postings) posting-list traversal via
 
 All classes in `Graph.KG` package. Pure ObjectScript + `$vectorop` — no `Language = python`.
 
-| Class | Purpose | Key Methods |
-|-------|---------|-------------|
-| **BM25Index** | Okapi BM25 lexical search | Build, Search, Insert, Drop, Info, SearchProc (`kg_BM25`) |
-| **VecIndex** | RP-tree ANN vector search | Create, Search, SearchJSON, SearchMultiJSON, InsertJSON, InsertBatchJSON, Build, Drop |
-| **IVFIndex** | IVFFlat vector search (k-means quantized) | Build, AddBatch, FinalizeIndex, Search, Drop, Info, SearchProc (`kg_IVF`) |
-| **PLAIDSearch** | PLAID multi-vector retrieval | StoreCentroids, StoreDocTokens, BuildInvertedIndex, Search, Insert, Info, Drop |
-| **TemporalIndex** | Time-indexed edge store | InsertEdge, BulkInsert, QueryWindow, QueryWindowInbound, GetAggregate, GetBucketGroups, GetDistinctCount, PurgeBefore |
-| **PageRank** | Personalized + Global PageRank | RunJson, PageRankGlobalJson |
-| **Algorithms** | Graph analytics | WCCJson, CDLPJson |
-| **Subgraph** | Bounded subgraph extraction | SubgraphJson, PPRGuidedJson |
-| **Traversal** | Graph build + BFS + fast-path traversal | BuildKG, BuildNKG, BFSFastJson, BFSFastJsonSorted, ReadBFSResults, ReadBFSPage, KHopCount, KHopNeighborIds, KHop2Count, KHop2NeighborIds, ShortestPathJson, DijkstraJson |
-| **EdgeScan** | Bulk edge ingestion | BulkIngestEdges, MatchEdges, WriteAdjacency, DeleteAdjacency |
-| **GraphIndex** | Functional index for ^NKG | InternNode, InternLabel, InsertIndex, DeleteIndex, UpdateStructuralHLL, EstimateHLL |
-| **NKGAccel** | Arno/integer-index BFS acceleration | BFSJson, BFSFastCountDistinct, KHopNeighborsSorted, CountDistinctKHop, BuildNKGRust |
+| Class             | Purpose                                   | Key Methods                                                                                                                                                              |
+| ----------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **BM25Index**     | Okapi BM25 lexical search                 | Build, Search, Insert, Drop, Info, SearchProc (`kg_BM25`)                                                                                                                |
+| **VecIndex**      | RP-tree ANN vector search                 | Create, Search, SearchJSON, SearchMultiJSON, InsertJSON, InsertBatchJSON, Build, Drop                                                                                    |
+| **IVFIndex**      | IVFFlat vector search (k-means quantized) | Build, AddBatch, FinalizeIndex, Search, Drop, Info, SearchProc (`kg_IVF`)                                                                                                |
+| **PLAIDSearch**   | PLAID multi-vector retrieval              | StoreCentroids, StoreDocTokens, BuildInvertedIndex, Search, Insert, Info, Drop                                                                                           |
+| **TemporalIndex** | Time-indexed edge store                   | InsertEdge, BulkInsert, QueryWindow, QueryWindowInbound, GetAggregate, GetBucketGroups, GetDistinctCount, PurgeBefore                                                    |
+| **PageRank**      | Personalized + Global PageRank            | RunJson, PageRankGlobalJson                                                                                                                                              |
+| **Algorithms**    | Graph analytics                           | WCCJson, CDLPJson                                                                                                                                                        |
+| **Subgraph**      | Bounded subgraph extraction               | SubgraphJson, PPRGuidedJson                                                                                                                                              |
+| **Traversal**     | Graph build + BFS + fast-path traversal   | BuildKG, BuildNKG, BFSFastJson, BFSFastJsonSorted, ReadBFSResults, ReadBFSPage, KHopCount, KHopNeighborIds, KHop2Count, KHop2NeighborIds, ShortestPathJson, DijkstraJson |
+| **EdgeScan**      | Bulk edge ingestion                       | BulkIngestEdges, MatchEdges, WriteAdjacency, DeleteAdjacency                                                                                                             |
+| **GraphIndex**    | Functional index for ^NKG                 | InternNode, InternLabel, InsertIndex, DeleteIndex, UpdateStructuralHLL, EstimateHLL                                                                                      |
+| **NKGAccel**      | Arno/integer-index BFS acceleration       | BFSJson, BFSFastCountDistinct, KHopNeighborsSorted, CountDistinctKHop, BuildNKGRust                                                                                      |
 
 ### Call Context Rule
 
@@ -148,57 +148,58 @@ The Cypher parser is a hand-written recursive-descent parser that translates ope
 
 ### Supported `ivg` procedures
 
-| Procedure | SQL Stored Proc | YIELD |
-|-----------|----------------|-------|
-| `ivg.vector.search` | `Graph_KG.kg_KNN_VEC` | `node, score` |
-| `ivg.neighbors` | `Graph_KG.kg_NEIGHBORS` | `neighbor` |
-| `ivg.ppr` | `Graph_KG.kg_PPR` | `node, score` |
-| `ivg.bm25.search` | `Graph_KG.kg_BM25` | `node, score` |
+| Procedure           | SQL Stored Proc         | YIELD         |
+| ------------------- | ----------------------- | ------------- |
+| `ivg.vector.search` | `Graph_KG.kg_KNN_VEC`   | `node, score` |
+| `ivg.neighbors`     | `Graph_KG.kg_NEIGHBORS` | `neighbor`    |
+| `ivg.ppr`           | `Graph_KG.kg_PPR`       | `node, score` |
+| `ivg.bm25.search`   | `Graph_KG.kg_BM25`      | `node, score` |
 
 ---
 
 ## Global Structure
 
-| Global | Purpose |
-|--------|---------|
-| `^KG("out", 0, s, p, o)` | Knowledge graph — outbound edges |
-| `^KG("in", 0, o, p, s)` | Knowledge graph — inbound edges |
-| `^KG("tout", ts, s, p, o)` | Temporal index — outbound, ordered by timestamp |
-| `^KG("tin", ts, o, p, s)` | Temporal index — inbound, ordered by timestamp |
-| `^KG("bucket", bucket, s)` | Pre-aggregated edge count per 5-minute bucket |
-| `^KG("tagg", bucket, s, p, key)` | Pre-aggregated COUNT/SUM/MIN/MAX/HLL per bucket |
-| `^KG("edgeprop", ts, s, p, o, key)` | Rich edge attributes |
-| `^NKG` | Integer adjacency index — enables Rust-accelerated graph algorithms |
-| `^VecIdx` | VecIndex RP-tree ANN |
-| `^PLAID` | PLAID multi-vector |
-| `^BM25Idx` | BM25 lexical search index |
+| Global                              | Purpose                                                             |
+| ----------------------------------- | ------------------------------------------------------------------- |
+| `^KG("out", 0, s, p, o)`            | Knowledge graph — outbound edges                                    |
+| `^KG("in", 0, o, p, s)`             | Knowledge graph — inbound edges                                     |
+| `^KG("tout", ts, s, p, o)`          | Temporal index — outbound, ordered by timestamp                     |
+| `^KG("tin", ts, o, p, s)`           | Temporal index — inbound, ordered by timestamp                      |
+| `^KG("bucket", bucket, s)`          | Pre-aggregated edge count per 5-minute bucket                       |
+| `^KG("tagg", bucket, s, p, key)`    | Pre-aggregated COUNT/SUM/MIN/MAX/HLL per bucket                     |
+| `^KG("edgeprop", ts, s, p, o, key)` | Rich edge attributes                                                |
+| `^NKG`                              | Integer adjacency index — enables Rust-accelerated graph algorithms |
+| `^VecIdx`                           | VecIndex RP-tree ANN                                                |
+| `^PLAID`                            | PLAID multi-vector                                                  |
+| `^BM25Idx`                          | BM25 lexical search index                                           |
 
 ## SQL Schema (Graph_KG)
 
-| Table | Purpose |
-|-------|---------|
-| `nodes` | Node registry (node_id PK) |
-| `rdf_edges` | Edges (s, p, o_id) |
-| `rdf_labels` | Node labels (s, label) |
-| `rdf_props` | Node properties (s, key, val) |
-| `kg_NodeEmbeddings` | HNSW vector index (id, emb VECTOR) |
+| Table               | Purpose                                    |
+| ------------------- | ------------------------------------------ |
+| `nodes`             | Node registry (node_id PK)                 |
+| `rdf_edges`         | Edges (s, p, o_id)                         |
+| `rdf_labels`        | Node labels (s, label)                     |
+| `rdf_props`         | Node properties (s, key, val)              |
+| `kg_NodeEmbeddings` | HNSW vector index (id, emb VECTOR)         |
 | `kg_EdgeEmbeddings` | Triple embeddings (s, p, o_id, emb VECTOR) |
-| `fhir_bridges` | ICD-10→MeSH clinical code mappings |
+| `fhir_bridges`      | ICD-10→MeSH clinical code mappings         |
 
 ## ObjectScript Classes
 
-| Class | Key Methods |
-|-------|-------------|
+| Class                    | Key Methods                                                                                                          |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------- |
 | `Graph.KG.TemporalIndex` | InsertEdge, BulkInsert, QueryWindow, GetVelocity, FindBursts, GetAggregate, GetBucketGroups, GetDistinctCount, Purge |
-| `Graph.KG.VecIndex` | Create, InsertJSON, Build, SearchJSON, SearchMultiJSON, InsertBatchJSON |
-| `Graph.KG.PLAIDSearch` | StoreCentroids, BuildInvertedIndex, Search |
-| `Graph.KG.PageRank` | RunJson, PageRankGlobalJson |
-| `Graph.KG.Algorithms` | WCCJson, CDLPJson |
-| `Graph.KG.Subgraph` | SubgraphJson, PPRGuidedJson |
-| `Graph.KG.Traversal` | BuildKG, BuildNKG, BFSFastJson, ShortestPathJson |
-| `Graph.KG.NKGAccel` | BetweennessGlobal, ClosenessGlobal, EigenvectorGlobal, Load, IsLoaded, WarmAdjCache |
-| `Graph.KG.BulkLoader` | BulkLoad |
-| `Graph.KG.BM25Index` | Build, Search, Insert, Drop |
-| `Graph.KG.IVFIndex` | Build, Search, Drop |
-| `Graph.KG.EdgeScan` | MatchEdges, WriteAdjacency, DeleteAdjacency |
+| `Graph.KG.VecIndex`      | Create, InsertJSON, Build, SearchJSON, SearchMultiJSON, InsertBatchJSON                                              |
+| `Graph.KG.PLAIDSearch`   | StoreCentroids, BuildInvertedIndex, Search                                                                           |
+| `Graph.KG.PageRank`      | RunJson, PageRankGlobalJson                                                                                          |
+| `Graph.KG.Algorithms`    | WCCJson, CDLPJson                                                                                                    |
+| `Graph.KG.Subgraph`      | SubgraphJson, PPRGuidedJson                                                                                          |
+| `Graph.KG.Traversal`     | BuildKG, BuildNKG, BFSFastJson, ShortestPathJson                                                                     |
+| `Graph.KG.NKGAccel`      | BetweennessGlobal, ClosenessGlobal, EigenvectorGlobal, Load, IsLoaded, WarmAdjCache                                  |
+| `Graph.KG.BulkLoader`    | BulkLoad                                                                                                             |
+| `Graph.KG.BM25Index`     | Build, Search, Insert, Drop                                                                                          |
+| `Graph.KG.IVFIndex`      | Build, Search, Drop                                                                                                  |
+| `Graph.KG.EdgeScan`      | MatchEdges, WriteAdjacency, DeleteAdjacency                                                                          |
+
 Note: IRIS xDBC protocol 65 does not support `?` params inside `WITH ... AS (...)` CTE bodies. Temporal Cypher uses derived table subqueries instead.

@@ -3,6 +3,7 @@
 **Problem**: `Password change required` error when connecting to IRIS database
 
 **Error Message**:
+
 ```
 RuntimeError: <COMMUNICATION LINK ERROR> Failed to connect to server
 Details: <COMMUNICATION ERROR> Invalid Message received
@@ -27,12 +28,14 @@ EOF
 ```
 
 **Why this works**:
+
 - Disables password expiration for all user accounts
 - No need to change passwords or update .env files
 - Persists across container restarts
 - Standard InterSystems recommended approach for development
 
 **For docker-compose automated setup**, add to your compose file:
+
 ```yaml
 services:
   iris:
@@ -42,6 +45,7 @@ services:
 ### Option 2: Reset Password via Management Portal
 
 1. **Access Management Portal**:
+
    ```bash
    # Standard IRIS
    open http://localhost:52773/csp/sys/UtilHome.csp
@@ -59,6 +63,7 @@ services:
    - Confirm new password
 
 4. **Update .env file**:
+
    ```bash
    # Edit .env
    IRIS_PASSWORD=your_new_password
@@ -67,6 +72,7 @@ services:
 ### Option 3: Reset Password via Docker Container
 
 1. **Access IRIS terminal**:
+
    ```bash
    # Standard IRIS
    docker exec -it iris iris session iris
@@ -76,6 +82,7 @@ services:
    ```
 
 2. **Change password in terminal**:
+
    ```objectscript
    // In IRIS terminal
    set sc = ##class(Security.Users).ChangePassword("_SYSTEM", "SYS", "NewPassword123")
@@ -107,11 +114,13 @@ docker-compose -f docker-compose.acorn.yml up -d
 For persistent containers where you want to bypass password change:
 
 1. **Access container**:
+
    ```bash
    docker exec -it iris bash
    ```
 
 2. **Edit iris.key** (if accessible):
+
    ```bash
    # This method is container/deployment specific
    # Consult InterSystems documentation for your version
@@ -120,6 +129,7 @@ For persistent containers where you want to bypass password change:
 ## Post-Reset Steps
 
 1. **Update environment variables**:
+
    ```bash
    # .env file
    IRIS_PASSWORD=your_new_password
@@ -129,6 +139,7 @@ For persistent containers where you want to bypass password change:
    ```
 
 2. **Test connection**:
+
    ```python
    import iris
 
@@ -138,6 +149,7 @@ For persistent containers where you want to bypass password change:
    ```
 
 3. **Update docker-compose.yml** (if using environment variables):
+
    ```yaml
    services:
      iris:
@@ -148,6 +160,7 @@ For persistent containers where you want to bypass password change:
 ## Password Requirements
 
 IRIS passwords typically must:
+
 - Be at least 8 characters long
 - Contain at least one uppercase letter
 - Contain at least one lowercase letter
@@ -155,6 +168,7 @@ IRIS passwords typically must:
 - Not match common passwords
 
 Example valid passwords:
+
 - `MyPassword123`
 - `IrisDb2024!`
 - `SecurePass99`
@@ -162,16 +176,21 @@ Example valid passwords:
 ## Common Issues
 
 ### Issue: "Password too simple"
+
 **Solution**: Use a more complex password meeting all requirements above
 
 ### Issue: "Cannot access Management Portal"
+
 **Solution**:
+
 1. Check IRIS is running: `docker ps | grep iris`
 2. Check correct port (52773 standard, 252773 ACORN-1)
 3. Try localhost instead of 127.0.0.1 or vice versa
 
 ### Issue: "Password changed but still getting error"
+
 **Solution**:
+
 1. Restart IRIS container: `docker restart iris`
 2. Clear connection cache: `rm -rf ~/.iris/cache/` (if exists)
 3. Verify .env file is in correct location and loaded

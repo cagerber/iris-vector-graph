@@ -22,12 +22,14 @@ open http://localhost:8200
 ## Features
 
 ### Financial Services Demo
+
 - **Real-time fraud scoring**: Submit transactions, get risk assessment <2s
 - **Bitemporal time-travel**: "What did we know at approval time?"
 - **Audit trails**: Complete version history with chargeback workflow
 - **Late arrival detection**: Flag suspicious settlement delays >24h
 
 ### Biomedical Demo
+
 - **Protein search**: Vector similarity + text search with RRF fusion
 - **Pathway queries**: Multi-hop protein interaction networks
 - **Interactive visualization**: D3.js force-directed graphs
@@ -61,9 +63,11 @@ See [STATUS.md](../../specs/005-interactive-demo-web/STATUS.md) for details.
 ## Implementation Guide
 
 For complete implementation patterns and examples, see:
+
 - [IMPLEMENTATION_GUIDE.md](../../specs/005-interactive-demo-web/IMPLEMENTATION_GUIDE.md)
 
 Key patterns:
+
 - **Models**: Pydantic with validators (fraud.py, biomedical.py)
 - **Services**: Resilient HTTP clients with circuit breaker (fraud_client.py)
 - **Routes**: FastHTML async endpoints (fraud.py, biomedical.py)

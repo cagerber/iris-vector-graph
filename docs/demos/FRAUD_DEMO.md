@@ -1,6 +1,6 @@
 # Fraud Detection Demo
 
-The fraud detection demo shows how IVG's graph engine enables real-time financial fraud detection — the same class of problem described in the AWS Neptune reference notebook [*Building a Fraud Graph Application on Amazon Neptune*](https://github.com/aws/graph-notebook/blob/main/src/graph_notebook/notebooks/01-Neptune-Database/03-Sample-Applications/01-Fraud-Graphs/01-Building-a-Fraud-Graph-Application.ipynb), which covers fraud rings (first-party fraud) and identity theft (third-party fraud) in credit card transaction data using Gremlin. The IVG demo implements the same patterns with Cypher on IRIS.
+The fraud detection demo shows how IVG's graph engine enables real-time financial fraud detection — the same class of problem described in the AWS Neptune reference notebook [_Building a Fraud Graph Application on Amazon Neptune_](https://github.com/aws/graph-notebook/blob/main/src/graph_notebook/notebooks/01-Neptune-Database/03-Sample-Applications/01-Fraud-Graphs/01-Building-a-Fraud-Graph-Application.ipynb), which covers fraud rings (first-party fraud) and identity theft (third-party fraud) in credit card transaction data using Gremlin. The IVG demo implements the same patterns with Cypher on IRIS.
 
 ## Running the Demo
 
@@ -22,12 +22,12 @@ open http://localhost:8200/fraud
 
 ### Four Pre-Built Scenarios
 
-| Scenario | Amount | Risk Level | Key Signal |
-|----------|--------|-----------|------------|
-| Legitimate purchase | $149.99 | LOW | Trusted device, known merchant |
-| Suspicious activity | $8,500 | HIGH | New merchant + foreign IP |
-| High-risk transaction | $25,000 | CRITICAL | Tor browser + crypto exchange |
-| Late arrival | ~$200 | MEDIUM | 72-hour settlement delay |
+| Scenario              | Amount  | Risk Level | Key Signal                     |
+| --------------------- | ------- | ---------- | ------------------------------ |
+| Legitimate purchase   | $149.99 | LOW        | Trusted device, known merchant |
+| Suspicious activity   | $8,500  | HIGH       | New merchant + foreign IP      |
+| High-risk transaction | $25,000 | CRITICAL   | Tor browser + crypto exchange  |
+| Late arrival          | ~$200   | MEDIUM     | 72-hour settlement delay       |
 
 ### Fraud Detection Patterns
 
@@ -84,12 +84,12 @@ RETURN s.score ORDER BY s.system_time DESC LIMIT 1
 
 Traditional fraud detection uses flat tables with hand-crafted features. Graph traversal finds **structural patterns** that flat models miss:
 
-| Pattern | Flat model | Graph |
-|---------|-----------|-------|
-| Shared device across accounts | Requires self-join on account table | 1-hop traversal from device node |
-| 4-hop money laundering chain | 4 nested JOINs, exponential cost | Variable-length path `*1..4` |
-| Fraud ring (6 accounts, shared IP) | Requires separate graph computation offline | Real-time community detection |
-| Velocity (5 txns in 10 min) | Possible with window functions | Same — temporal edges + time filter |
+| Pattern                            | Flat model                                  | Graph                               |
+| ---------------------------------- | ------------------------------------------- | ----------------------------------- |
+| Shared device across accounts      | Requires self-join on account table         | 1-hop traversal from device node    |
+| 4-hop money laundering chain       | 4 nested JOINs, exponential cost            | Variable-length path `*1..4`        |
+| Fraud ring (6 accounts, shared IP) | Requires separate graph computation offline | Real-time community detection       |
+| Velocity (5 txns in 10 min)        | Possible with window functions              | Same — temporal edges + time filter |
 
 The AWS/Neptune case study ([Delivery Hero](https://aws.amazon.com/blogs/database/empowering-fraud-detection-at-delivery-hero-with-amazon-neptune/)) found graph traversal ran at **15ms** vs. expensive MySQL JOINs and blocked **32% more fraudulent purchases**. IVG achieves the same patterns with Cypher on IRIS, with the added benefit of vector similarity search for anomaly detection in the same engine.
 
@@ -97,7 +97,7 @@ The AWS/Neptune case study ([Delivery Hero](https://aws.amazon.com/blogs/databas
 
 ```
 Account -[:USES]-> Device
-Account -[:USES]-> IPAddress  
+Account -[:USES]-> IPAddress
 Account -[:HAS_SCORE]-> RiskScore
 Transaction -[:FROM]-> Account
 Transaction -[:TO]-> Merchant

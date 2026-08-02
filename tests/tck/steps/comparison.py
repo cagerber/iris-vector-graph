@@ -209,8 +209,9 @@ def _remap_node_columns(actual_row: dict, tck_columns: list[str], actual_columns
             node_id = actual_row.get(id_key)
             node_labels = actual_row.get(labels_key)
             node_props = actual_row.get(props_key)
-            # All-None triplet = null node (from OPTIONAL MATCH with no results)
-            if node_id is None and node_labels is None and node_props is None:
+            # Null node from OPTIONAL MATCH: id is None and labels/props are empty
+            _empty = ("[]", "null", None)
+            if node_id is None and (node_labels is None or node_labels in _empty) and (node_props is None or node_props in _empty):
                 result[col] = None
             else:
                 result[col] = {

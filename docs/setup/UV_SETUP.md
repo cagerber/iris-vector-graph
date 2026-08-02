@@ -57,13 +57,13 @@ uv sync --extra dev --extra performance
 
 ## Available Dependency Groups
 
-| Group | Purpose | Dependencies |
-|-------|---------|-------------|
-| **dev** | Development tools | pytest, black, isort, flake8, mypy |
-| **performance** | Performance monitoring | psutil, memory-profiler |
-| **visualization** | Graph visualization | matplotlib, plotly, graphviz |
-| **ml** | Machine learning | scikit-learn, scipy, torch |
-| **biodata** | Biomedical data sources | biopython, bioservices, mygene |
+| Group             | Purpose                 | Dependencies                       |
+| ----------------- | ----------------------- | ---------------------------------- |
+| **dev**           | Development tools       | pytest, black, isort, flake8, mypy |
+| **performance**   | Performance monitoring  | psutil, memory-profiler            |
+| **visualization** | Graph visualization     | matplotlib, plotly, graphviz       |
+| **ml**            | Machine learning        | scikit-learn, scipy, torch         |
+| **biodata**       | Biomedical data sources | biopython, bioservices, mygene     |
 
 ## Common Commands
 
@@ -191,21 +191,25 @@ uv run black scripts/ tests/ && uv run flake8 scripts/ tests/ && uv run mypy scr
 ## Benefits of UV
 
 ### 🚀 **Speed**
+
 - **10-100x faster** than pip for dependency resolution
 - **Parallel downloads** and installations
 - **Lockfile-based** reproducible builds
 
 ### 🔒 **Reliability**
+
 - **Dependency resolution** prevents conflicts
 - **Lockfile guarantees** exact reproducibility
 - **Cross-platform compatibility**
 
 ### 🛠️ **Developer Experience**
+
 - **Single tool** for virtual environments and packages
 - **npm-like commands** familiar to web developers
 - **Automatic environment detection**
 
 ### 📦 **Project Benefits**
+
 - **Faster CI/CD** pipeline execution
 - **Consistent environments** across team members
 - **Simplified onboarding** for new developers
@@ -234,6 +238,7 @@ conda list --export | grep -v conda-forge | uv add
 ### Common Issues
 
 **Environment not found:**
+
 ```bash
 # Recreate virtual environment
 rm -rf .venv
@@ -241,12 +246,14 @@ uv sync
 ```
 
 **Package conflicts:**
+
 ```bash
 # Force dependency resolution
 uv sync --resolution=highest
 ```
 
 **Missing system dependencies:**
+
 ```bash
 # Install system packages (Ubuntu/Debian)
 sudo apt-get update
@@ -278,12 +285,12 @@ conn.close()
 
 ## Performance Comparison
 
-| Operation | pip | UV | Speedup |
-|-----------|-----|----| --------|
-| **Install from lockfile** | 45s | 1.2s | **37x** |
+| Operation                 | pip  | UV   | Speedup |
+| ------------------------- | ---- | ---- | ------- |
+| **Install from lockfile** | 45s  | 1.2s | **37x** |
 | **Dependency resolution** | 120s | 2.8s | **43x** |
-| **Environment creation** | 15s | 0.8s | **19x** |
-| **Package updates** | 60s | 3.1s | **19x** |
+| **Environment creation**  | 15s  | 0.8s | **19x** |
+| **Package updates**       | 60s  | 3.1s | **19x** |
 
 ## Configuration
 

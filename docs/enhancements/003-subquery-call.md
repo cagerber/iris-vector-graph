@@ -131,25 +131,25 @@ Phase 2: implement batched execution via Python-side chunking of result sets.
 
 ## Scope Rules
 
-| Variable | Visible inside subquery? |
-|----------|--------------------------|
-| Outer variable (no WITH) | ❌ No — independent subquery |
-| Outer variable (WITH p) | ✅ Yes — correlated subquery |
+| Variable                       | Visible inside subquery?            |
+| ------------------------------ | ----------------------------------- |
+| Outer variable (no WITH)       | ❌ No — independent subquery        |
+| Outer variable (WITH p)        | ✅ Yes — correlated subquery        |
 | Subquery output (YIELD/RETURN) | ✅ Yes — available in outer clauses |
-| Subquery internal variables | ❌ No — scoped to subquery only |
+| Subquery internal variables    | ❌ No — scoped to subquery only     |
 
 ---
 
 ## Files to Change
 
-| File | Change |
-|------|--------|
-| `iris_vector_graph/cypher/ast.py` | Add `SubqueryCall`; extend `QueryPart` |
-| `iris_vector_graph/cypher/lexer.py` | Ensure `{` / `}` tokens are handled in clause context |
-| `iris_vector_graph/cypher/parser.py` | Parse `CALL { ... }` and `CALL { WITH x ... }` blocks |
-| `iris_vector_graph/cypher/translator.py` | Render as CTE (independent) or LATERAL join (correlated) |
-| `tests/unit/test_subquery_call.py` | Unit: parse independent + correlated; IN TRANSACTIONS |
-| `tests/integration/test_subquery_call_e2e.py` | E2E: independent + correlated against live IRIS |
+| File                                          | Change                                                   |
+| --------------------------------------------- | -------------------------------------------------------- |
+| `iris_vector_graph/cypher/ast.py`             | Add `SubqueryCall`; extend `QueryPart`                   |
+| `iris_vector_graph/cypher/lexer.py`           | Ensure `{` / `}` tokens are handled in clause context    |
+| `iris_vector_graph/cypher/parser.py`          | Parse `CALL { ... }` and `CALL { WITH x ... }` blocks    |
+| `iris_vector_graph/cypher/translator.py`      | Render as CTE (independent) or LATERAL join (correlated) |
+| `tests/unit/test_subquery_call.py`            | Unit: parse independent + correlated; IN TRANSACTIONS    |
+| `tests/integration/test_subquery_call_e2e.py` | E2E: independent + correlated against live IRIS          |
 
 ---
 
@@ -160,7 +160,7 @@ Phase 2: implement batched execution via Python-side chunking of result sets.
 - [ ] Parser handles `CALL { WITH x MATCH ... RETURN ... }` (correlated)
 - [ ] Independent subquery translates to CTE in IRIS SQL
 - [ ] Correlated subquery translates to LATERAL join (IRIS 2023.1+) with scalar
-  subquery fallback for single-column aggregates
+      subquery fallback for single-column aggregates
 - [ ] `IN TRANSACTIONS` parsed and treated as no-op in Phase 1
 - [ ] Subquery output variables available in outer RETURN/WHERE
 - [ ] Outer variables NOT visible inside subquery unless imported via WITH
@@ -172,11 +172,13 @@ Phase 2: implement batched execution via Python-side chunking of result sets.
 ## Phasing
 
 **Phase 1 (MVP)**:
+
 - Independent subquery → CTE translation
 - `IN TRANSACTIONS` parsed, no-op
 - Correlated single-column aggregate → scalar subquery in SELECT
 
 **Phase 2**:
+
 - Full LATERAL join for multi-column correlated subqueries
 - `IN TRANSACTIONS OF N ROWS` batched execution
 - Nested subqueries (`CALL { CALL { ... } }`)
@@ -185,6 +187,6 @@ Phase 2: implement batched execution via Python-side chunking of result sets.
 
 ## Reference
 
-- openCypher spec §7 Subqueries: https://opencypher.org/
+- openCypher spec §7 Subqueries: <https://opencypher.org/>
 - IRIS SQL LATERAL join: IRIS 2023.1 SQL Reference, §JOIN syntax
-- Neo4j subquery docs: https://neo4j.com/docs/cypher-manual/current/subqueries/
+- Neo4j subquery docs: <https://neo4j.com/docs/cypher-manual/current/subqueries/>

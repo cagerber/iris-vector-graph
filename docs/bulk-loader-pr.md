@@ -20,11 +20,11 @@ index. At high cardinality (200K+ distinct nodes), every INSERT must probe all
 index trees. The existing `schema.get_bulk_insert_sql()` makes this worse by
 adding a `WHERE NOT EXISTS` correlated subquery per row.
 
-| Method | Speed | Notes |
-|--------|-------|-------|
-| `engine.create_edge()` per-row | ~18 rows/s | FK check + index + commit |
-| `get_bulk_insert_sql()` | ~100 rows/s | Correlated subquery per row |
-| **BulkLoader** | **46,000 rows/s** | `%NOINDEX` + batch `%BuildIndices` |
+| Method                         | Speed             | Notes                              |
+| ------------------------------ | ----------------- | ---------------------------------- |
+| `engine.create_edge()` per-row | ~18 rows/s        | FK check + index + commit          |
+| `get_bulk_insert_sql()`        | ~100 rows/s       | Correlated subquery per row        |
+| **BulkLoader**                 | **46,000 rows/s** | `%NOINDEX` + batch `%BuildIndices` |
 
 ### How it works
 
@@ -72,7 +72,7 @@ python -m iris_vector_graph.bulk_loader /tmp/graph.pkl \
 ### Post-load verification (all passed)
 
 - UNIQUE constraint enforced (duplicate insert rejected)
-- COUNT(*) == COUNT(1) on all 4 tables (bitmap extent intact)
+- COUNT(\*) == COUNT(1) on all 4 tables (bitmap extent intact)
 - Indexed point lookups: 0.2-0.5ms
 - Cross-index consistency: 20 random edges found identically via all indexes
 - BFS/Subgraph/PPR traversals: 0.15-0.4ms
@@ -101,15 +101,15 @@ use `%NOINDEX`.
 `schema.py` defines 6 indexes for `rdf_edges` via `ensure_indexes()`, but the
 live container only has 3:
 
-| Index | Status | Columns |
-|-------|--------|---------|
-| `uspo` | present | `(s, p, oid)` UNIQUE |
-| `idxedgesoid` | present | `(oid)` |
-| `DDLBEIndex` | present | bitmap extent |
-| `idx_edges_s` | **missing** | `(s)` |
-| `idx_edges_p` | **missing** | `(p)` |
-| `idx_edges_s_p` | **missing** | `(s, p)` |
-| `idx_edges_p_oid` | **missing** | `(p, o_id)` |
+| Index             | Status      | Columns              |
+| ----------------- | ----------- | -------------------- |
+| `uspo`            | present     | `(s, p, oid)` UNIQUE |
+| `idxedgesoid`     | present     | `(oid)`              |
+| `DDLBEIndex`      | present     | bitmap extent        |
+| `idx_edges_s`     | **missing** | `(s)`                |
+| `idx_edges_p`     | **missing** | `(p)`                |
+| `idx_edges_s_p`   | **missing** | `(s, p)`             |
+| `idx_edges_p_oid` | **missing** | `(p, o_id)`          |
 
 ### Root cause
 
@@ -133,15 +133,15 @@ The DDL ALTER path cannot modify the ObjectScript-defined `Edge` class.
 The `uspo` UNIQUE index on `(s, p, oid)` already serves lookups by `s` and by
 `(s, p)` as prefix matches. Measured query times:
 
-| Query | Min time | Index used |
-|-------|----------|-----------|
-| `WHERE s = ?` | 0.30ms | `uspo` prefix |
-| `WHERE s = ? AND p = ?` | 0.28ms | `uspo` prefix |
-| `WHERE o_id = ?` | 0.29ms | `idxedgesoid` |
-| `WHERE p = ?` (TOP 10) | 0.52ms | skip-scan on `uspo` |
-| `WHERE p = ? AND o_id = ?` | 0.29ms | skip-scan |
-| `SELECT DISTINCT p` | 92ms | full index scan (inherent) |
-| `COUNT(*)` | 0.25ms | `DDLBEIndex` bitmap |
+| Query                      | Min time | Index used                 |
+| -------------------------- | -------- | -------------------------- |
+| `WHERE s = ?`              | 0.30ms   | `uspo` prefix              |
+| `WHERE s = ? AND p = ?`    | 0.28ms   | `uspo` prefix              |
+| `WHERE o_id = ?`           | 0.29ms   | `idxedgesoid`              |
+| `WHERE p = ?` (TOP 10)     | 0.52ms   | skip-scan on `uspo`        |
+| `WHERE p = ? AND o_id = ?` | 0.29ms   | skip-scan                  |
+| `SELECT DISTINCT p`        | 92ms     | full index scan (inherent) |
+| `COUNT(*)`                 | 0.25ms   | `DDLBEIndex` bitmap        |
 
 All point queries are sub-millisecond. The missing indexes would start mattering
 at 1M+ edges where skip-scan cost grows.
@@ -170,16 +170,16 @@ DDL-created `Graph.KG.rdfedges`.
 
 ## 3. Other Changes in This Branch
 
-| File | Change |
-|------|--------|
-| `iris_src/Graph/KG/Meta.cls` | Added `GetKG()` / `GetNKG()` for Python-side global reads |
-| `iris_src/Graph/KG/ArnoAccel.cls` | `BumpVersion()` increments `^NKG("$meta","version")` |
-| `iris_src/Graph/KG/BenchFormat.cls` | `Kill ^NKG` alongside `Kill ^KG` |
-| `iris_src/Graph/KG/Loader.cls` | `Kill ^NKG` alongside `Kill ^KG` |
-| `iris_src/Graph/KG/Subgraph.cls` | Em-dash → `--` in comments (encoding safety) |
-| `iris_src/Graph/KG/Traversal.cls` | Em-dash → `--` in comments (encoding safety) |
-| `iris_vector_graph/schema.py` | Added `nkg_built` capability detection |
-| `iris_vector_graph/capabilities.py` | Minor cleanup |
+| File                                | Change                                                    |
+| ----------------------------------- | --------------------------------------------------------- |
+| `iris_src/Graph/KG/Meta.cls`        | Added `GetKG()` / `GetNKG()` for Python-side global reads |
+| `iris_src/Graph/KG/ArnoAccel.cls`   | `BumpVersion()` increments `^NKG("$meta","version")`      |
+| `iris_src/Graph/KG/BenchFormat.cls` | `Kill ^NKG` alongside `Kill ^KG`                          |
+| `iris_src/Graph/KG/Loader.cls`      | `Kill ^NKG` alongside `Kill ^KG`                          |
+| `iris_src/Graph/KG/Subgraph.cls`    | Em-dash → `--` in comments (encoding safety)              |
+| `iris_src/Graph/KG/Traversal.cls`   | Em-dash → `--` in comments (encoding safety)              |
+| `iris_vector_graph/schema.py`       | Added `nkg_built` capability detection                    |
+| `iris_vector_graph/capabilities.py` | Minor cleanup                                             |
 
 ---
 
@@ -198,7 +198,7 @@ graph-traversable by attaching them to specific edges.
 - Adds **one new SQL table** (`rdf_reifications`) and **one new ObjectScript class**
 - **Zero changes** to existing tables, `Edge.cls`, or `GraphIndex`
 - Each reification row = a triple `(edge_id, predicate, value)` that makes a
-  statement *about* an edge
+  statement _about_ an edge
 - Enables KBAC: `(:e1, auth:readableBy, "analyst")`, `(:e1, prov:source, "PMID:12345")`
 - W3C RDF 1.2 compliant (Working Draft, 28 March 2026)
 - ~3 days estimated implementation effort
@@ -222,18 +222,18 @@ See **[`docs/cypher-gap-recommendations.md`](cypher-gap-recommendations.md)** fo
 a detailed "Steve-and-Dan perspective" on implementing 10 missing Cypher features
 ranked by biomedical impact:
 
-| Priority | Feature | Effort | Status |
-|----------|---------|--------|--------|
-| P0 | COUNT(DISTINCT) | XS | Probably already works -- verify |
-| P0 | CAST/type coercion fixes | S | 10-line translator fix |
-| P1 | CASE WHEN expressions | S | 1:1 SQL mapping |
-| P1 | Variable-length paths `[*1..3]` | L | Hybrid BFSFast CTE bridge |
-| P2 | UNION / UNION ALL | M | Parser + SQL assembly |
-| P2 | EXISTS {} pattern predicate | M | Correlated subquery |
-| P2 | Pattern comprehension | M | Correlated JSON_ARRAYAGG |
-| P3 | Quantified paths `->+` | S | Desugar to var-length (needs P1) |
-| P3 | REDUCE() path scoring | M | Python post-processing |
-| P4 | FOREACH | S | Desugar to UNWIND |
+| Priority | Feature                         | Effort | Status                           |
+| -------- | ------------------------------- | ------ | -------------------------------- |
+| P0       | COUNT(DISTINCT)                 | XS     | Probably already works -- verify |
+| P0       | CAST/type coercion fixes        | S      | 10-line translator fix           |
+| P1       | CASE WHEN expressions           | S      | 1:1 SQL mapping                  |
+| P1       | Variable-length paths `[*1..3]` | L      | Hybrid BFSFast CTE bridge        |
+| P2       | UNION / UNION ALL               | M      | Parser + SQL assembly            |
+| P2       | EXISTS {} pattern predicate     | M      | Correlated subquery              |
+| P2       | Pattern comprehension           | M      | Correlated JSON_ARRAYAGG         |
+| P3       | Quantified paths `->+`          | S      | Desugar to var-length (needs P1) |
+| P3       | REDUCE() path scoring           | M      | Python post-processing           |
+| P4       | FOREACH                         | S      | Desugar to UNWIND                |
 
 Key architectural decision: **IRIS does not support recursive CTEs**, so
 variable-length paths must use the existing `BFSFastJson` ObjectScript method

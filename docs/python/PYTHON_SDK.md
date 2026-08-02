@@ -141,11 +141,11 @@ engine.execute_cypher(
 
 ### API summary
 
-- `bm25_build(name, text_props, k1=1.5, b=0.75) -> dict`  — `{"indexed", "avgdl", "vocab_size"}`
+- `bm25_build(name, text_props, k1=1.5, b=0.75) -> dict` — `{"indexed", "avgdl", "vocab_size"}`
 - `bm25_search(name, query, k=10) -> list[tuple[str, float]]`
 - `bm25_insert(name, doc_id, text) -> bool`
 - `bm25_drop(name) -> None`
-- `bm25_info(name) -> dict`  — `{}` if index not found
+- `bm25_info(name) -> dict` — `{}` if index not found
 
 ---
 
@@ -310,12 +310,12 @@ guided  = ops.kg_PPR_GUIDED_SUBGRAPH(seed_ids=["doc:1"], top_k=50, max_hops=5)
 
 ## 11) Cypher `ivg` Procedures
 
-| Procedure | Signature | YIELD |
-|-----------|-----------|-------|
+| Procedure           | Signature                               | YIELD         |
+| ------------------- | --------------------------------------- | ------------- |
 | `ivg.vector.search` | `(label, property, query_input, limit)` | `node, score` |
-| `ivg.neighbors` | `(sources, predicate, direction)` | `neighbor` |
-| `ivg.ppr` | `(seeds, alpha, max_iter)` | `node, score` |
-| `ivg.bm25.search` | `(name, query, k)` | `node, score` |
+| `ivg.neighbors`     | `(sources, predicate, direction)`       | `neighbor`    |
+| `ivg.ppr`           | `(seeds, alpha, max_iter)`              | `node, score` |
+| `ivg.bm25.search`   | `(name, query, k)`                      | `node, score` |
 
 ```python
 # BM25 lexical search in Cypher
@@ -362,6 +362,7 @@ python3 -m uvicorn iris_vector_graph.cypher_api:app --port 8000
 ```
 
 This starts:
+
 - HTTP API on port 8000 (`/api/cypher`, `/db/neo4j/tx/commit`)
 - Neo4j Browser at `http://localhost:8000/browser/`
 - Bolt WebSocket on port 8000 (Neo4j Browser connects via `bolt://localhost:8000`)
@@ -398,15 +399,15 @@ with driver.session() as s:
 
 ### Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `IRIS_HOST` | (required) | IRIS hostname |
-| `IRIS_PORT` | `1972` | IRIS SuperServer port |
-| `IRIS_NAMESPACE` | `USER` | IRIS namespace |
-| `IRIS_USERNAME` | `_SYSTEM` | IRIS username |
-| `IRIS_PASSWORD` | `SYS` | IRIS password |
-| `IVG_API_KEY` | (empty=no auth) | API key for `/api/*` and `/db/*` HTTP routes |
-| `BOLT_TCP_PORT` | `7687` | TCP Bolt listener port |
+| Variable         | Default         | Description                                  |
+| ---------------- | --------------- | -------------------------------------------- |
+| `IRIS_HOST`      | (required)      | IRIS hostname                                |
+| `IRIS_PORT`      | `1972`          | IRIS SuperServer port                        |
+| `IRIS_NAMESPACE` | `USER`          | IRIS namespace                               |
+| `IRIS_USERNAME`  | `_SYSTEM`       | IRIS username                                |
+| `IRIS_PASSWORD`  | `SYS`           | IRIS password                                |
+| `IVG_API_KEY`    | (empty=no auth) | API key for `/api/*` and `/db/*` HTTP routes |
+| `BOLT_TCP_PORT`  | `7687`          | TCP Bolt listener port                       |
 
 ---
 
