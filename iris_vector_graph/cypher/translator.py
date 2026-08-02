@@ -4474,10 +4474,15 @@ def _boolean_expr_in(left, right_expr, context):
         if not non_null_items:
             # All null: x IN [null] = null (handled by caller null check for left=null, else null)
             return "NULL"
-        placeholders = ", ".join(
-            context.add_where_param(item.value if isinstance(item, ast.Literal) else item)
-            for item in non_null_items
-        )
+        def _serialize_in_item(item):
+            if isinstance(item, ast.Literal):
+                v = item.value
+                if isinstance(v, list):
+                    # Nested list → JSON string for VARCHAR comparison
+                    return context.add_where_param(json.dumps(_literal_to_python(item)))
+                return context.add_where_param(v)
+            return context.add_where_param(item)
+        placeholders = ", ".join(_serialize_in_item(item) for item in non_null_items)
         in_expr = f"{left} IN ({placeholders})"
         if null_items:
             # 3VL: if x matches → true; if x doesn't match and list has null → null
