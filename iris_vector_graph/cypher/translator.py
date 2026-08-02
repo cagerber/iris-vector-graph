@@ -3814,14 +3814,31 @@ def _trp_directed_edge(
             f"{jt} {_table('nodes')} {target_alias} ON {target_on}"
         )
     elif optional:
-        # For OPTIONAL MATCH with an already-bound target, the equality check must not
-        # filter out rows where the OPTIONAL pattern failed entirely (LEFT OUTER JOIN
-        # returned null for the source of this edge).
-        # Guard: allow the row when source_alias.s_col IS NULL (meaning the prior pattern
-        # step didn't match at all).  This is different from "edge's far-end is null"
-        # which would allow partial matches (source found, but target not reachable).
-        if not is_anon_source and source_alias and not source_alias.startswith("Stage"):
-            null_guard = f"{source_alias}.{s_col} IS NULL"
+        # For OPTIONAL MATCH with an already-bound target, choose null guard:
+        # - If source was introduced WITHIN this optional match (not pre-bound),
+        #   use "source IS NULL": the source is only non-null when the full path
+        #   was found, so "source IS NULL" correctly allows the null row when the
+        #   optional pattern partially fails (source found but target unreachable).
+        # - If source was bound BEFORE this optional match began (pre-bound),
+        #   use "edge IS NULL": the source legitimately has a value even when the
+        #   edge doesn't exist (e.g. second OPTIONAL MATCH extending a prior result).
+        prebound = getattr(context, "optional_prebound_aliases", set())
+        if (
+            not is_anon_source
+            and source_alias
+            and not source_alias.startswith("Stage")
+        ):
+            if source_alias in prebound:
+                # Source was bound before this OPTIONAL — use edge null guard
+                if f"{edge_alias}.o_id" in target_on:
+                    null_guard = f"{edge_alias}.o_id IS NULL"
+                elif f"{edge_alias}.s" in target_on:
+                    null_guard = f"{edge_alias}.s IS NULL"
+                else:
+                    null_guard = None
+            else:
+                # Source was introduced within this OPTIONAL — use source null guard
+                null_guard = f"{source_alias}.{s_col} IS NULL"
         else:
             null_guard = None
         if null_guard:
@@ -4377,6 +4394,22 @@ def _boolean_expr_logical(op, expr, context):
 
 
 def _boolean_expr_in(left, right_expr, context):
+    if isinstance(right_expr, ast.SubscriptExpression):
+        inner_sql = translate_expression(right_expr.expression, context, segment="where")
+        idx = right_expr.index
+        if isinstance(idx, ast.Literal) and isinstance(idx.value, int):
+            i = idx.value
+            ij_alias = context.next_alias("ij")
+            sub_arr_sql = f"(SELECT __sa FROM JSON_TABLE({inner_sql}, '$[{i}]' COLUMNS(__sa VARCHAR(4096) PATH '$')) __jt_sa)"
+            return f"{left} IN (SELECT __iv FROM JSON_TABLE({sub_arr_sql}, '$[*]' COLUMNS(__iv VARCHAR(1000) PATH '$')) {ij_alias})"
+        idx_sql = translate_expression(idx, context, segment="where")
+        sub_arr_sql = f"SQLUser.JSON_VALUE({inner_sql}, '$[' || CAST(({idx_sql}) AS VARCHAR) || ']')"
+        ij_alias = context.next_alias("ij")
+        return f"{left} IN (SELECT __iv FROM JSON_TABLE({sub_arr_sql}, '$[*]' COLUMNS(__iv VARCHAR(1000) PATH '$')) {ij_alias})"
+    if isinstance(right_expr, ast.SliceExpression):
+        slice_sql = translate_expression(right_expr, context, segment="where")
+        ij_alias = context.next_alias("ij")
+        return f"{left} IN (SELECT __iv FROM JSON_TABLE({slice_sql}, '$[*]' COLUMNS(__iv VARCHAR(1000) PATH '$')) {ij_alias})"
     if isinstance(right_expr, ast.Literal) and isinstance(right_expr.value, list):
         items = right_expr.value
         # Separate null items from non-null items for 3VL: x IN [a, null, b]
@@ -4507,6 +4540,15 @@ def translate_boolean_expression(expr, context) -> str:
             prop_expr = translate_expression(expr, context, segment="where")
             # Convert VARCHAR '1'/'0' to boolean: property = '1'
             return f"({prop_expr} = '1')"
+        # Quantifier expressions (any/all/none/single) return a CASE WHEN 0/1/NULL
+        # expression. When used as a standalone boolean predicate in WHERE, wrap with
+        # = 1 so IRIS treats it as a proper predicate.  When used as an operand in a
+        # comparison (e.g. none(...) = (NOT any(...))), translate_expression is called
+        # directly (not via here), so it gets the raw CASE expression — valid as a
+        # scalar in a comparison.
+        if isinstance(expr, ast.ListPredicateExpression):
+            case_sql = translate_expression(expr, context, segment="where")
+            return f"({case_sql} = 1)"
         return translate_expression(expr, context, segment="where")
     op = expr.operator
     logical = _boolean_expr_logical(op, expr, context)
@@ -4740,27 +4782,59 @@ def _expr_list_predicate(expr, context, segment):
         where_pred = "1 = 1"
     elif where_pred in ("0", "1=0", "FALSE"):
         where_pred = "1 = 0"
+    elif where_pred.startswith("CASE WHEN ") and where_pred.endswith(" END"):
+        # Nested quantifier: a CASE WHEN 0/1/NULL expression used as a WHERE predicate.
+        # IRIS requires a comparison predicate, not a bare CASE WHEN. Add = 1 to coerce.
+        where_pred = f"({where_pred} = 1)"
     elif where_pred and not any(op in where_pred for op in ("=", "<", ">", " IN ", " IS ", " LIKE ", " NOT ")):
         # Bare column reference (e.g. lp0.x) — treat as truth test
         where_pred = f"{where_pred} = 1"
-    count_alias = context.next_alias("lpc")
-    inner = (
+    null_alias = context.next_alias("lpn")
+    non_null_alias = context.next_alias("lpnn")
+    satisfy_sql = (
         f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {alias}"
         f" WHERE {where_pred}"
     )
-    all_count = f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {count_alias}"
+    null_count_sql = f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {null_alias} WHERE {null_alias}.{var} IS NULL"
+    # 3VL (three-valued logic) semantics for quantifiers with null-containing lists:
+    # - any:    true  if any non-null element satisfies pred;
+    #           null  if none satisfy but nulls exist (unknown if null would satisfy);
+    #           false otherwise
+    # - none:   false if any non-null element satisfies pred;
+    #           null  if none satisfy but nulls exist;
+    #           true  otherwise (no elements satisfy and no nulls)
+    # - all:    false if any non-null element fails pred;
+    #           null  if all non-null satisfy but nulls exist;
+    #           true  otherwise
+    # - single: true  if exactly one non-null satisfies pred (ignore nulls for now);
+    #           null  if zero satisfy and nulls exist;
+    #           false otherwise
     if expr.quantifier == "all":
-        pred = f"(({inner}) = ({all_count}))"
+        # false if any non-null element fails; null if all pass but nulls present; true otherwise
+        non_null_count_sql = f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {non_null_alias} WHERE {non_null_alias}.{var} IS NOT NULL"
+        return (
+            f"CASE WHEN (({satisfy_sql}) < ({non_null_count_sql})) THEN 0"
+            f" WHEN (({null_count_sql}) > 0) THEN NULL"
+            f" ELSE 1 END"
+        )
     elif expr.quantifier == "none":
-        pred = f"(({inner}) = 0)"
+        return (
+            f"CASE WHEN (({satisfy_sql}) > 0) THEN 0"
+            f" WHEN (({null_count_sql}) > 0) THEN NULL"
+            f" ELSE 1 END"
+        )
     elif expr.quantifier == "single":
-        pred = f"(({inner}) = 1)"
+        return (
+            f"CASE WHEN (({satisfy_sql}) = 1) THEN 1"
+            f" WHEN (({satisfy_sql}) = 0) AND (({null_count_sql}) > 0) THEN NULL"
+            f" ELSE 0 END"
+        )
     else:  # any
-        pred = f"(({inner}) > 0)"
-    # In SELECT/scalar context IRIS needs a value, not a predicate — wrap in CASE WHEN
-    if segment in ("select", "inline", None):
-        return f"CASE WHEN {pred} THEN 1 ELSE 0 END"
-    return pred
+        return (
+            f"CASE WHEN (({satisfy_sql}) > 0) THEN 1"
+            f" WHEN (({null_count_sql}) > 0) THEN NULL"
+            f" ELSE 0 END"
+        )
 
 
 def _expr_list_comprehension(expr, context, segment):
@@ -5040,11 +5114,26 @@ def _expr_slice(expr, context, segment):
     base_sql = translate_expression(expr.expression, context, segment=segment)
     start_val = expr.start.value if isinstance(expr.start, ast.Literal) else None
     end_val = expr.end.value if isinstance(expr.end, ast.Literal) else None
+    jt_alias = context.next_alias("slc")
     if start_val is not None and end_val is not None:
-        return f"SUBSTRING({base_sql}, {int(start_val) + 1}, {int(end_val) - int(start_val)})"
-    start_sql = translate_expression(expr.start, context, segment=segment)
-    end_sql = translate_expression(expr.end, context, segment=segment)
-    return f"SUBSTRING({base_sql}, ({start_sql}) + 1, ({end_sql}) - ({start_sql}))"
+        s = int(start_val)
+        e = int(end_val)
+        if e <= s:
+            return _EMPTY_JSON_ARRAY
+        return (
+            f"(SELECT JSON_ARRAYAGG(elem) FROM "
+            f"(SELECT elem, ROW_NUMBER() OVER() AS rn "
+            f"FROM JSON_TABLE({base_sql}, '$[*]' COLUMNS(elem VARCHAR(1000) PATH '$')) {jt_alias}) __sliced "
+            f"WHERE rn > {s} AND rn <= {e})"
+        )
+    start_sql = translate_expression(expr.start, context, segment=segment) if expr.start is not None else "0"
+    end_sql = translate_expression(expr.end, context, segment=segment) if expr.end is not None else f"SQLUser.JSON_ARRAYLENGTH({base_sql})"
+    return (
+        f"(SELECT JSON_ARRAYAGG(elem) FROM "
+        f"(SELECT elem, ROW_NUMBER() OVER() AS rn "
+        f"FROM JSON_TABLE({base_sql}, '$[*]' COLUMNS(elem VARCHAR(1000) PATH '$')) {jt_alias}) __sliced "
+        f"WHERE rn > ({start_sql}) AND rn <= ({end_sql}))"
+    )
 
 
 def _expr_property_access(expr, context, segment):
@@ -6060,23 +6149,44 @@ def _expr_fn_keys(args):
     return f"COALESCE((SELECT JSON_ARRAYAGG(rp.\"key\") FROM {_table('rdf_props')} rp WHERE rp.s = {id_expr}), CAST('[]' AS VARCHAR(256)))"
 
 
+_EMPTY_JSON_ARRAY = "CAST('[]' AS VARCHAR(256))"
+
+
 def _expr_fn_range(args_exprs):
     if len(args_exprs) < 2:
-        return "JSON_ARRAY()"
+        return _EMPTY_JSON_ARRAY
     try:
         start = int(args_exprs[0].value) if isinstance(args_exprs[0], ast.Literal) else None
         end = int(args_exprs[1].value) if isinstance(args_exprs[1], ast.Literal) else None
-        step = (
-            int(args_exprs[2].value)
-            if len(args_exprs) > 2 and isinstance(args_exprs[2], ast.Literal)
-            else 1
-        )
+        step_arg = args_exprs[2] if len(args_exprs) > 2 else None
+        if step_arg is not None:
+            if (not isinstance(step_arg, ast.Literal)
+                    or not isinstance(step_arg.value, int)
+                    or isinstance(step_arg.value, bool)):
+                raise ValueError("range() step must be an integer")
+            step = int(step_arg.value)
+        else:
+            step = 1
+        if isinstance(args_exprs[0], ast.Literal):
+            v0 = args_exprs[0].value
+            if not isinstance(v0, int) or isinstance(v0, bool):
+                raise ValueError("range() start must be an integer")
+        if isinstance(args_exprs[1], ast.Literal):
+            v1 = args_exprs[1].value
+            if not isinstance(v1, int) or isinstance(v1, bool):
+                raise ValueError("range() end must be an integer")
+        if step == 0:
+            raise ValueError("range() step cannot be zero (NumberOutOfRange)")
         if start is not None and end is not None:
             vals = list(range(start, end + (1 if step > 0 else -1), step))
+            if not vals:
+                return _EMPTY_JSON_ARRAY
             return f"JSON_ARRAY({', '.join(str(v) for v in vals)})"
-    except (TypeError, ValueError):
+    except ValueError:
+        raise
+    except TypeError:
         pass
-    return f"JSON_ARRAY()"
+    return _EMPTY_JSON_ARRAY
 
 
 def _expr_fn_list_ops(fn, args, args_exprs):
@@ -6321,11 +6431,22 @@ _IRIS_RESERVED = frozenset({
     "union","insert","update","delete","create","drop","alter","set",
     "table","schema","column","row","data","id","user","date","time",
     "result","results","null","true","false","top","exists","not","and","or",
+    "input",
 })
 
 
 def _safe_alias(a: str) -> str:
-    return f'"{a}"' if a and a.lower() in _IRIS_RESERVED else a
+    if not a:
+        return a
+    lower = a.lower()
+    if lower in _IRIS_RESERVED:
+        return f'"{a}"'
+    # IRIS tokenizer splits identifiers that start with a reserved keyword token.
+    # e.g. "inputList" is tokenized as keyword INPUT + identifier List.
+    for rw in _IRIS_RESERVED:
+        if lower.startswith(rw) and len(lower) > len(rw):
+            return f'"{a}"'
+    return a
 
 
 def _expr_to_cypher_text(expr) -> str:
