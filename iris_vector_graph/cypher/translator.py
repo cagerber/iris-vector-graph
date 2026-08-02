@@ -274,6 +274,11 @@ class TranslationContext:
         self.optional_null_row_labels: List[tuple] = []
         # Parallel list of SQL values for the null row, one per select item.
         self.optional_null_row_items: List[str] = []
+        # OPTIONAL MATCH intermediate-node null-gating: maps node_alias → edge_alias.
+        # When the gating edge is null (second-hop path failed), the intermediate node
+        # should appear as null in SELECT even though it was joined via the first hop.
+        # Set by _trp_directed_edge when multi-hop optional with bound end node detected.
+        self.opt_intermediate_nulled: Dict[str, str] = {}
         # Variable type tracking for semantic validation.
         # Maps variable name → "node" | "relationship" | "scalar"
         # Used to enforce type consistency and detect VariableTypeConflict/VariableAlreadyBound errors.
@@ -2977,9 +2982,18 @@ def translate_match_clause(match_clause, context, metadata):
                         prev_s = f"{prev_ea}.s"
                         prev_p = f"{prev_ea}.p"
                         prev_o = f"{prev_ea}.o_id"
-                    context.where_conditions.append(
+                    # Isomorphic-edge exclusion: the same physical edge cannot be
+                    # traversed twice.  When in an OPTIONAL MATCH, either edge may be
+                    # null (LEFT OUTER JOIN returned no row).  NULL comparisons evaluate
+                    # to NULL rather than FALSE, which would incorrectly filter null rows.
+                    # Guard with IS NULL checks so null hops always pass the constraint.
+                    is_opt = match_clause.optional
+                    excl = (
                         f"NOT ({new_s} = {prev_s} AND {new_p} = {prev_p} AND {new_o} = {prev_o})"
                     )
+                    if is_opt:
+                        excl = f"({excl} OR {new_s} IS NULL OR {prev_s} IS NULL)"
+                    context.where_conditions.append(excl)
             if new_ea:
                 new_is_und = new_ea in context._undirected_aliases
                 _pattern_edge_aliases.append((new_ea, new_is_und))
@@ -3793,6 +3807,41 @@ def _trp_apply_anon_source_constraints(source_node, edge_alias, src_col, context
             context.where_conditions.append(f"{p_alias}.val = {val_sql}")
 
 
+def _trp_move_target_cond_to_edge_join(context, edge_alias, target_on, source_alias):
+    """Move a bound-target equality condition from WHERE into the edge JOIN ON clause.
+
+    Used for multi-hop OPTIONAL MATCH where source was introduced within the same
+    optional pattern.  Adding the target condition to the edge ON means the edge is
+    null when the path fails, while the intermediate source node (null-gated via
+    opt_intermediate_nulled) is nulled in SELECT when the edge is null.
+
+    Also registers source_alias → edge_alias in opt_intermediate_nulled so that
+    translate_return_clause can emit a CASE expression rather than a bare node_id.
+    """
+    # Find the edge join clause and append the target condition to its ON clause
+    for i, jc in enumerate(context.join_clauses):
+        # Match the clause containing this edge alias (e.g. "LEFT OUTER JOIN rdf_edges e9 ON ...")
+        # or the derived JSON_TABLE variant ("LEFT OUTER JOIN (...) e9 ON ...")
+        if f") {edge_alias} ON " in jc or f"rdf_edges {edge_alias} ON " in jc:
+            context.join_clauses[i] = jc + f" AND {target_on}"
+            break
+    else:
+        # Fallback: edge JOIN not found (e.g. edgescan with derived table) — add WHERE guard
+        if f"{edge_alias}.o_id" in target_on:
+            null_guard = f"{edge_alias}.o_id IS NULL"
+        elif f"{edge_alias}.s" in target_on:
+            null_guard = f"{edge_alias}.s IS NULL"
+        else:
+            null_guard = None
+        if null_guard:
+            context.where_conditions.append(f"({target_on} OR {null_guard})")
+        else:
+            context.where_conditions.append(target_on)
+        return  # Don't register null-gating if we fell back to WHERE
+    # Register null-gating: source node is null when edge is null
+    context.opt_intermediate_nulled[source_alias] = edge_alias
+
+
 def _trp_directed_edge(
     rel, source_node, target_node, context,
     source_alias, target_alias, edge_alias, s_col, t_col,
@@ -3815,13 +3864,15 @@ def _trp_directed_edge(
         )
     elif optional:
         # For OPTIONAL MATCH with an already-bound target, choose null guard:
-        # - If source was introduced WITHIN this optional match (not pre-bound),
-        #   use "source IS NULL": the source is only non-null when the full path
-        #   was found, so "source IS NULL" correctly allows the null row when the
-        #   optional pattern partially fails (source found but target unreachable).
-        # - If source was bound BEFORE this optional match began (pre-bound),
-        #   use "edge IS NULL": the source legitimately has a value even when the
-        #   edge doesn't exist (e.g. second OPTIONAL MATCH extending a prior result).
+        # - If source was introduced WITHIN this optional match (not pre-bound):
+        #   The bound-target equality goes into the edge JOIN ON clause (not WHERE),
+        #   and the source node is null-gated by that edge (opt_intermediate_nulled).
+        #   This correctly nulls out intermediate nodes when the full path fails,
+        #   e.g. OPTIONAL MATCH (a)-->(b)-->(c_bound): b=null when c unreachable.
+        # - If source was bound BEFORE this optional match (pre-bound):
+        #   Use "edge IS NULL" guard in WHERE: the source legitimately has a value
+        #   even when the edge doesn't exist, e.g. OPTIONAL MATCH (x)-[r]->(b_bound)
+        #   where x was found by a prior OPTIONAL MATCH.
         prebound = getattr(context, "optional_prebound_aliases", set())
         if (
             not is_anon_source
@@ -3829,20 +3880,24 @@ def _trp_directed_edge(
             and not source_alias.startswith("Stage")
         ):
             if source_alias in prebound:
-                # Source was bound before this OPTIONAL — use edge null guard
+                # Source was bound before this OPTIONAL — use edge null guard in WHERE
                 if f"{edge_alias}.o_id" in target_on:
                     null_guard = f"{edge_alias}.o_id IS NULL"
                 elif f"{edge_alias}.s" in target_on:
                     null_guard = f"{edge_alias}.s IS NULL"
                 else:
                     null_guard = None
+                if null_guard:
+                    context.where_conditions.append(f"({target_on} OR {null_guard})")
+                else:
+                    context.where_conditions.append(target_on)
             else:
-                # Source was introduced within this OPTIONAL — use source null guard
-                null_guard = f"{source_alias}.{s_col} IS NULL"
-        else:
-            null_guard = None
-        if null_guard:
-            context.where_conditions.append(f"({target_on} OR {null_guard})")
+                # Source was introduced within this OPTIONAL — move target equality
+                # into the edge JOIN ON (no WHERE), and null-gate source via this edge.
+                # This avoids filtering the base row when the full path fails.
+                _trp_move_target_cond_to_edge_join(
+                    context, edge_alias, target_on, source_alias
+                )
         else:
             context.where_conditions.append(target_on)
     else:
@@ -4593,6 +4648,34 @@ def translate_boolean_expression(expr, context) -> str:
         rel_id_cond = _rel_identity_comparison(op, left_expr, right_expr, context)
         if rel_id_cond is not None:
             return rel_id_cond
+        # Constant folding: both sides are fully literal lists/maps — evaluate in Python
+        # (SQL string comparison can't produce NULL for Cypher three-valued list equality)
+        is_list_or_map = lambda e: (
+            (isinstance(e, ast.Literal) and isinstance(e.value, list))
+            or isinstance(e, ast.MapLiteral)
+        )
+        if right_expr is not None and is_list_or_map(left_expr) and is_list_or_map(right_expr):
+            if _is_fully_literal(left_expr) and _is_fully_literal(right_expr):
+                lv = _literal_to_python(left_expr)
+                rv = _literal_to_python(right_expr)
+                result = _cypher_eq(lv, rv)
+                if result is None:
+                    return "NULL"
+                bool_val = result if op == ast.BooleanOperator.EQUALS else not result
+                return "(1=1)" if bool_val else "(1=0)"
+        # Scalar literal type-mismatch: Cypher is strongly typed, string != number
+        if right_expr is not None and isinstance(left_expr, ast.Literal) and isinstance(right_expr, ast.Literal):
+            lv, rv = left_expr.value, right_expr.value
+            if lv is not None and rv is not None and not isinstance(lv, bool) and not isinstance(rv, bool):
+                # string vs numeric: always false in Cypher (no implicit coercion)
+                lv_str = isinstance(lv, str)
+                rv_str = isinstance(rv, str)
+                lv_num = isinstance(lv, (int, float))
+                rv_num = isinstance(rv, (int, float))
+                if (lv_str and rv_num) or (lv_num and rv_str):
+                    is_eq = False
+                    bool_val = is_eq if op == ast.BooleanOperator.EQUALS else not is_eq
+                    return "(1=1)" if bool_val else "(1=0)"
 
     left_inlined = _inline_literal(left_expr)
     left = left_inlined if left_inlined is not None else translate_expression(left_expr, context, segment="where")
@@ -4623,6 +4706,35 @@ def translate_boolean_expression(expr, context) -> str:
     raise ValueError(f"Unsupported operator: {op}")
 
 
+def _cypher_eq(a, b):
+    """Three-valued Cypher equality. Returns True, False, or None (null)."""
+    if a is None or b is None:
+        return None
+    if isinstance(a, list) and isinstance(b, list):
+        if len(a) != len(b):
+            return False
+        result = True
+        for x, y in zip(a, b):
+            eq = _cypher_eq(x, y)
+            if eq is False:
+                return False
+            if eq is None:
+                result = None  # might still be false from later items
+        return result
+    if isinstance(a, dict) and isinstance(b, dict):
+        if set(a.keys()) != set(b.keys()):
+            return False
+        result = True
+        for k in a:
+            eq = _cypher_eq(a[k], b[k])
+            if eq is False:
+                return False
+            if eq is None:
+                result = None
+        return result
+    return a == b
+
+
 def _inline_literal(expr) -> Optional[str]:
     if expr is None:
         return None
@@ -4634,6 +4746,9 @@ def _inline_literal(expr) -> Optional[str]:
             return "1" if v else "0"
         if isinstance(v, (int, float)):
             return str(v)
+        if isinstance(v, list):
+            # List literals need full translate_expression (json.dumps path)
+            return None
         return f"'{str(v)}'"
     return None
 
@@ -6155,26 +6270,32 @@ _EMPTY_JSON_ARRAY = "CAST('[]' AS VARCHAR(256))"
 def _expr_fn_range(args_exprs):
     if len(args_exprs) < 2:
         return _EMPTY_JSON_ARRAY
+    # Type-check BEFORE int() conversion: int() raises TypeError for list/map/str args,
+    # which would be swallowed by 'except TypeError: pass'. Check types explicitly first.
+    # Also catch non-Literal AST nodes that are clearly wrong types (MapLiteral, etc.).
+    for _i, _arg in enumerate(args_exprs[:3]):
+        if isinstance(_arg, ast.MapLiteral):
+            raise ValueError(
+                f"range() argument {_i} must be an integer, got 'Map'"
+            )
+        if isinstance(_arg, ast.Literal):
+            _v = _arg.value
+            if isinstance(_v, list):
+                raise ValueError(
+                    f"range() argument {_i} must be an integer, got 'List'"
+                )
+            if not isinstance(_v, int) or isinstance(_v, bool):
+                raise ValueError(
+                    f"range() argument {_i} must be an integer, got {type(_v).__name__!r}"
+                )
     try:
         start = int(args_exprs[0].value) if isinstance(args_exprs[0], ast.Literal) else None
         end = int(args_exprs[1].value) if isinstance(args_exprs[1], ast.Literal) else None
         step_arg = args_exprs[2] if len(args_exprs) > 2 else None
         if step_arg is not None:
-            if (not isinstance(step_arg, ast.Literal)
-                    or not isinstance(step_arg.value, int)
-                    or isinstance(step_arg.value, bool)):
-                raise ValueError("range() step must be an integer")
             step = int(step_arg.value)
         else:
             step = 1
-        if isinstance(args_exprs[0], ast.Literal):
-            v0 = args_exprs[0].value
-            if not isinstance(v0, int) or isinstance(v0, bool):
-                raise ValueError("range() start must be an integer")
-        if isinstance(args_exprs[1], ast.Literal):
-            v1 = args_exprs[1].value
-            if not isinstance(v1, int) or isinstance(v1, bool):
-                raise ValueError("range() end must be an integer")
         if step == 0:
             raise ValueError("range() step cannot be zero (NumberOutOfRange)")
         if start is not None and end is not None:
@@ -6435,15 +6556,19 @@ _IRIS_RESERVED = frozenset({
 })
 
 
+# IRIS tokenizer splits identifiers that start with certain reserved keyword tokens.
+# e.g. "inputList" is tokenized as keyword INPUT + identifier List.
+# Only add keywords here that are confirmed to cause IRIS tokenizer splitting.
+_IRIS_RESERVED_PREFIX_MATCH = frozenset({"input"})
+
+
 def _safe_alias(a: str) -> str:
     if not a:
         return a
     lower = a.lower()
     if lower in _IRIS_RESERVED:
         return f'"{a}"'
-    # IRIS tokenizer splits identifiers that start with a reserved keyword token.
-    # e.g. "inputList" is tokenized as keyword INPUT + identifier List.
-    for rw in _IRIS_RESERVED:
+    for rw in _IRIS_RESERVED_PREFIX_MATCH:
         if lower.startswith(rw) and len(lower) > len(rw):
             return f'"{a}"'
     return a
@@ -6553,12 +6678,21 @@ def translate_return_clause(ret, context):
                 continue
             if alias_name and not alias_name.startswith("e") and not is_scalar:
                 prefix = item.alias or var_name
-                node_expr = (
-                    var_name
-                    if alias_name.startswith("Stage")
-                    or alias_name in _PROC_CTE_ALIASES
-                    else f"{alias_name}.node_id"
-                )
+                if alias_name.startswith("Stage") or alias_name in _PROC_CTE_ALIASES:
+                    node_expr = var_name
+                else:
+                    # Check if this node is null-gated by a downstream optional edge.
+                    # When multi-hop OPTIONAL MATCH fails the second hop, the intermediate
+                    # node (e.g. b in OPTIONAL MATCH (a)-->(b)-->(c)) must appear as null
+                    # even though it was left-outer-joined via the first hop.
+                    gate_edge = context.opt_intermediate_nulled.get(alias_name)
+                    if gate_edge:
+                        node_expr = (
+                            f"CASE WHEN {gate_edge}.s IS NULL "
+                            f"THEN NULL ELSE {alias_name}.node_id END"
+                        )
+                    else:
+                        node_expr = f"{alias_name}.node_id"
                 context.select_items.append(f"{node_expr} AS {prefix}_id")
                 context.select_items.append(
                     f"{labels_subquery(node_expr)} AS {prefix}_labels"
