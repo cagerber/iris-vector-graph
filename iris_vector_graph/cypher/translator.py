@@ -3957,50 +3957,33 @@ def _expr_arith(expr, context, segment):
     return f"({left} {op} {right})"
 
 
-def _infer_list_col_type(source_expr):
-    """Infer the best JSON_TABLE column type for a list source expression."""
-    if not (isinstance(source_expr, ast.Literal) and isinstance(source_expr.value, list)):
-        return "VARCHAR(1000)"
-    items = source_expr.value
-    has_float = False
-    has_int = False
-    for item in items:
-        if not isinstance(item, ast.Literal):
-            return "VARCHAR(1000)"
-        v = item.value
-        if v is None:
-            continue
-        if isinstance(v, bool):
-            return "VARCHAR(1000)"
-        if isinstance(v, float):
-            has_float = True
-        elif isinstance(v, int):
-            has_int = True
-        else:
-            return "VARCHAR(1000)"
-    if has_float:
-        return "DOUBLE"
-    if has_int:
-        return "BIGINT"
-    return "VARCHAR(1000)"
-
-
 def _expr_list_predicate(expr, context, segment):
     source_sql = translate_expression(expr.source, context, segment=segment)
     var = sanitize_identifier(expr.variable)
     alias = context.next_alias("lp")
-    col_type = _infer_list_col_type(expr.source)
+    # Always use VARCHAR(1000) — IRIS JSON_TABLE BIGINT/DOUBLE columns fail to
+    # match bind-param floats/ints due to IRIS internal type precision.
+    # VARCHAR comparisons work when params are stringified (done below).
+    col_type = "VARCHAR(1000)"
     context.variable_aliases[expr.variable] = f"{alias}"
-    if col_type in ("BIGINT", "DOUBLE"):
-        context.scalar_variables.discard(expr.variable)
-    else:
-        context.scalar_variables.add(expr.variable)
+    context.scalar_variables.add(expr.variable)
+    # Snapshot param lists so we can stringify newly added numeric params.
+    _sp_len = len(context.select_params)
+    _wp_len = len(context.where_params)
     # Use translate_boolean_expression for proper SQL predicates — IRIS requires
     # comparison predicates in WHERE, not CASE WHEN boolean expressions.
     if isinstance(expr.predicate, ast.BooleanExpression):
         pred_sql = translate_boolean_expression(expr.predicate, context)
     else:
         pred_sql = translate_expression(expr.predicate, context, segment="where")
+    # Convert newly added int/float params to str so VARCHAR column comparison works.
+    for _lst in (context.select_params, context.where_params):
+        _snap = _sp_len if _lst is context.select_params else _wp_len
+        for _i in range(_snap, len(_lst)):
+            if isinstance(_lst[_i], float):
+                _lst[_i] = str(_lst[_i])
+            elif isinstance(_lst[_i], int) and not isinstance(_lst[_i], bool):
+                _lst[_i] = str(_lst[_i])
     del context.variable_aliases[expr.variable]
     context.scalar_variables.discard(expr.variable)
     pred_with_alias = pred_sql
