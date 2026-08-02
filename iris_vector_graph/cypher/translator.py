@@ -2192,9 +2192,18 @@ def _tts_transactional_result(cypher_query, context, metadata, order_by_items):
 
 
 def _tts_collect_path_funcs(cypher_query, vl):
-    """Collect RETURN path functions for shortest-path queries. Mutates vl[0]."""
-    if not (vl and (vl[0].get("shortest") or vl[0].get("all_shortest")) and cypher_query.return_clause):
+    """Collect RETURN path functions for var-length path queries. Mutates vl[0].
+
+    Fires for both shortest-path and regular variable-length paths when path
+    functions (length, nodes, relationships) or the path variable itself appear
+    in the RETURN clause.
+    """
+    if not (vl and cypher_query.return_clause):
         return
+    # Only fire when the query has a named path with path-function returns,
+    # OR it is a shortest-path query.  Skip plain var-length queries with no
+    # path functions (they use the faster labeled-BFS path instead).
+    is_shortest = vl[0].get("shortest") or vl[0].get("all_shortest")
 
     path_funcs = []
     path_var = vl[0].get("target_var") or vl[0].get("source_var")
@@ -2222,6 +2231,10 @@ def _tts_collect_path_funcs(cypher_query, vl):
                     path_funcs.append(expr.function_name.lower())
     if path_funcs:
         vl[0]["return_path_funcs"] = path_funcs
+    elif not is_shortest:
+        # For non-shortest var-length paths with no path-function returns,
+        # don't set return_path_funcs — use the faster labeled-BFS path.
+        return
 
 
 def _build_bolt_column_types(cypher_query, context) -> List[str]:
@@ -3381,43 +3394,72 @@ def translate_set_clause(set_cl, context, metadata):
                 prop_name,
                 item.value,
             )
-            cte, subquery, subparams = context.build_dml_subquery(
-                select_override=f"SELECT {alias}.node_id"
-            )
-            val_sql, val_params, is_expr = _translate_set_value(v, context, k)
-            if is_expr:
-                # Expression value: inline SQL in UPDATE SET clause.
-                # val_sql uses `val` for same-property refs (safe in UPDATE context).
-                context.add_dml(
-                    f'{cte}UPDATE {_table("rdf_props")} SET val = {val_sql} WHERE s IN ({subquery}) AND "key" = ?',
-                    val_params + subparams + [k],
-                )
-                # For INSERT (when property doesn't exist), build an insert-safe expression
-                # where `val` is replaced by a correlated subquery from rdf_props.
-                safe_k = k.replace("'", "''")
-                insert_val_sql = val_sql.replace(
-                    "CAST(val AS NUMERIC)",
-                    f"CAST((SELECT _iv.val FROM {_table('rdf_props')} _iv WHERE _iv.s = {_table('nodes')}.node_id AND _iv.\"key\" = '{safe_k}') AS NUMERIC)",
-                )
-                context.add_dml(
-                    f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) '
-                    f'SELECT node_id, ?, {insert_val_sql} FROM {_table("nodes")} '
-                    f'WHERE node_id IN ({subquery}) AND NOT EXISTS ('
-                    f'SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?'
-                    f')',
-                    [k] + val_params + subparams + [k],
-                )
+            # Detect edge alias: relationship variables use aliases starting with 'e' but not 'ES_'
+            is_edge = alias and alias.startswith('e') and not alias.startswith('ES_')
+            if is_edge:
+                # Relationship property SET: UPDATE rdf_edges qualifiers JSON blob
+                # Null value means remove the property (Cypher semantics)
+                val_sql, val_params, is_expr = _translate_set_value(v, context, k)
+                val_for_json = val_params[0] if val_params and not is_expr else None
+                if val_for_json is None:
+                    # null → remove the key from qualifiers
+                    cte, subquery, subparams = context.build_dml_subquery(
+                        select_override=f"SELECT {alias}.edge_id"
+                    )
+                    context.add_dml(
+                        f'{cte}UPDATE {_table("rdf_edges")} SET qualifiers = '
+                        f'SQLUser.CypherFn_IVGJSONREMOVE(qualifiers, ?) '
+                        f'WHERE edge_id IN ({subquery})',
+                        [k] + subparams,
+                    )
+                else:
+                    cte, subquery, subparams = context.build_dml_subquery(
+                        select_override=f"SELECT {alias}.edge_id"
+                    )
+                    context.add_dml(
+                        f'{cte}UPDATE {_table("rdf_edges")} SET qualifiers = '
+                        f'SQLUser.CypherFn_IVGJSONSET(qualifiers, ?, ?) '
+                        f'WHERE edge_id IN ({subquery})',
+                        [k, str(val_for_json)] + subparams,
+                    )
             else:
-                # Literal / parameter value
-                val = val_params[0] if val_params else None
-                context.add_dml(
-                    f'{cte}UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
-                    [val] + subparams + [k],
+                cte, subquery, subparams = context.build_dml_subquery(
+                    select_override=f"SELECT {alias}.node_id"
                 )
-                context.add_dml(
-                    f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
-                    [k, val] + subparams + [k],
-                )
+                val_sql, val_params, is_expr = _translate_set_value(v, context, k)
+                if is_expr:
+                    # Expression value: inline SQL in UPDATE SET clause.
+                    # val_sql uses `val` for same-property refs (safe in UPDATE context).
+                    context.add_dml(
+                        f'{cte}UPDATE {_table("rdf_props")} SET val = {val_sql} WHERE s IN ({subquery}) AND "key" = ?',
+                        val_params + subparams + [k],
+                    )
+                    # For INSERT (when property doesn't exist), build an insert-safe expression
+                    # where `val` is replaced by a correlated subquery from rdf_props.
+                    safe_k = k.replace("'", "''")
+                    insert_val_sql = val_sql.replace(
+                        "CAST(val AS NUMERIC)",
+                        f"CAST((SELECT _iv.val FROM {_table('rdf_props')} _iv WHERE _iv.s = {_table('nodes')}.node_id AND _iv.\"key\" = '{safe_k}') AS NUMERIC)",
+                    )
+                    context.add_dml(
+                        f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) '
+                        f'SELECT node_id, ?, {insert_val_sql} FROM {_table("nodes")} '
+                        f'WHERE node_id IN ({subquery}) AND NOT EXISTS ('
+                        f'SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?'
+                        f')',
+                        [k] + val_params + subparams + [k],
+                    )
+                else:
+                    # Literal / parameter value
+                    val = val_params[0] if val_params else None
+                    context.add_dml(
+                        f'{cte}UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
+                        [val] + subparams + [k],
+                    )
+                    context.add_dml(
+                        f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
+                        [k, val] + subparams + [k],
+                    )
         elif isinstance(item.expression, ast.Variable):
             alias, label = (
                 context.variable_aliases.get(item.expression.name),
@@ -3458,13 +3500,27 @@ def translate_remove_clause(remove, context, metadata):
                 context.variable_aliases.get(item.expression.variable),
                 prop_name,
             )
-            cte, subquery, subparams = context.build_dml_subquery(
-                select_override=f"SELECT {alias}.node_id"
-            )
-            context.add_dml(
-                f'{cte}DELETE FROM {_table("rdf_props")} WHERE s IN ({subquery}) AND "key" = ?',
-                subparams + [k],
-            )
+            # Detect edge alias: relationship variables use aliases starting with 'e' but not 'ES_'
+            is_edge = alias and alias.startswith('e') and not alias.startswith('ES_')
+            if is_edge:
+                # Relationship property REMOVE: update qualifiers JSON to remove the key
+                cte, subquery, subparams = context.build_dml_subquery(
+                    select_override=f"SELECT {alias}.edge_id"
+                )
+                context.add_dml(
+                    f'{cte}UPDATE {_table("rdf_edges")} SET qualifiers = '
+                    f'SQLUser.CypherFn_IVGJSONREMOVE(qualifiers, ?) '
+                    f'WHERE edge_id IN ({subquery})',
+                    [k] + subparams,
+                )
+            else:
+                cte, subquery, subparams = context.build_dml_subquery(
+                    select_override=f"SELECT {alias}.node_id"
+                )
+                context.add_dml(
+                    f'{cte}DELETE FROM {_table("rdf_props")} WHERE s IN ({subquery}) AND "key" = ?',
+                    subparams + [k],
+                )
 
 
 def translate_match_clause(match_clause, context, metadata):
@@ -3586,15 +3642,27 @@ def translate_match_clause(match_clause, context, metadata):
                 edge_alias = context.rel_obj_aliases.get(id(rel))
                 if src_alias and edge_alias:
                     if rel.direction == ast.Direction.BOTH:
-                        # Undirected edge: _src and _dst are the same node
-                        context.where_conditions.append(
-                            f"{edge_alias}._src = {edge_alias}._dst"
-                        )
+                        # Undirected edge: _src and _dst are the same node.
+                        # For OPTIONAL MATCH the edge may be NULL — allow NULL to pass.
+                        if match_clause.optional:
+                            context.where_conditions.append(
+                                f"({edge_alias}._src IS NULL OR {edge_alias}._src = {edge_alias}._dst)"
+                            )
+                        else:
+                            context.where_conditions.append(
+                                f"{edge_alias}._src = {edge_alias}._dst"
+                            )
                     else:
-                        # Directed edge: s and o_id are the same node
-                        context.where_conditions.append(
-                            f"{edge_alias}.s = {edge_alias}.o_id"
-                        )
+                        # Directed edge: s and o_id are the same node.
+                        # For OPTIONAL MATCH the edge may be NULL — allow NULL to pass.
+                        if match_clause.optional:
+                            context.where_conditions.append(
+                                f"({edge_alias}.s IS NULL OR {edge_alias}.s = {edge_alias}.o_id)"
+                            )
+                        else:
+                            context.where_conditions.append(
+                                f"{edge_alias}.s = {edge_alias}.o_id"
+                            )
             elif last_node.variable:
                 translate_node_pattern(
                     last_node, context, metadata, optional=match_clause.optional
@@ -3897,6 +3965,13 @@ def translate_node_pattern(node, context, metadata, optional=False):
                 )
                 if not optional:
                     context.where_conditions.append(f"{l_alias}.s IS NOT NULL")
+                else:
+                    # Optional non-anchor target with label constraint: if the node was
+                    # reached (node_id IS NOT NULL) the label must match; otherwise the
+                    # edge is treated as non-matching (null result).
+                    context.where_conditions.append(
+                        f"({alias}.node_id IS NULL OR {l_alias}.s IS NOT NULL)"
+                    )
             for k, v in node.properties.items():
                 val_sql = translate_expression(v, context, segment="where")
                 if k == "node_id":
@@ -3970,6 +4045,15 @@ def translate_node_pattern(node, context, metadata, optional=False):
             )
             if not optional or is_anchor_optional:
                 context.where_conditions.append(f"{l_alias}.s IS NOT NULL")
+            elif optional and not is_anchor_optional:
+                # Non-anchor optional target with label constraint: if the node was
+                # reached (node_id IS NOT NULL) the label must match; otherwise treat
+                # the edge as non-matching (null result).  This enforces Cypher semantics:
+                # a label constraint on an optional target node filters out edges that
+                # reach a node without the required label.
+                context.where_conditions.append(
+                    f"({alias}.node_id IS NULL OR {l_alias}.s IS NOT NULL)"
+                )
         else:
             for label in node.labels:
                 l_alias = context.next_alias("l")
@@ -3979,6 +4063,13 @@ def translate_node_pattern(node, context, metadata, optional=False):
                 )
                 if not optional or is_anchor_optional:
                     context.where_conditions.append(f"{l_alias}.s IS NOT NULL")
+                elif optional and not is_anchor_optional:
+                    # Non-anchor optional target with label constraint: if the node was
+                    # reached (node_id IS NOT NULL) the label must match; otherwise the
+                    # edge is treated as non-matching (null result).
+                    context.where_conditions.append(
+                        f"({alias}.node_id IS NULL OR {l_alias}.s IS NOT NULL)"
+                    )
                 if is_anchor_optional:
                     context.optional_null_row_labels.append(label)
     for k, v in node.properties.items():
@@ -4576,12 +4667,27 @@ def _trp_directed_edge(
                 # constraint into the edge LEFT OUTER JOIN ON clause so that when
                 # a→c edge doesn't exist, e9 is NULL (r IS NULL) rather than
                 # polluting the result with spurious non-matching edge rows.
-                # The (target_on OR null_guard) pattern in WHERE was incorrect:
+                # The (target_on OR null_guard) pattern in WHERE is incorrect:
                 # it is trivially true when the LEFT JOIN returns no row (e9.o_id IS NULL),
                 # which prevents proper null-propagation for r IS NULL checks.
-                _trp_move_target_cond_to_edge_join(
-                    context, edge_alias, target_on, source_alias
-                )
+                # Do NOT register source in opt_intermediate_nulled — the source was
+                # bound by the outer MATCH and should never be NULL.
+                for i, jc in enumerate(context.join_clauses):
+                    if f") {edge_alias} ON " in jc or f"rdf_edges {edge_alias} ON " in jc:
+                        context.join_clauses[i] = jc + f" AND {target_on}"
+                        break
+                else:
+                    # Fallback if edge JOIN not found (edgescan path)
+                    if f"{edge_alias}.o_id" in target_on:
+                        null_guard = f"{edge_alias}.o_id IS NULL"
+                    elif f"{edge_alias}.s" in target_on:
+                        null_guard = f"{edge_alias}.s IS NULL"
+                    else:
+                        null_guard = None
+                    if null_guard:
+                        context.where_conditions.append(f"({target_on} OR {null_guard})")
+                    else:
+                        context.where_conditions.append(target_on)
             else:
                 # Source was introduced within this OPTIONAL — move target equality
                 # into the edge JOIN ON (no WHERE), and null-gate source via this edge.
@@ -5886,73 +5992,143 @@ def _expr_list_predicate(expr, context, segment):
         f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {alias}"
         f" WHERE {where_pred}"
     )
-    # 3VL (three-valued logic): instead of counting null *elements*, count elements where the
-    # predicate itself evaluates to SQL NULL (unknown). For IS NULL / IS NOT NULL predicates,
-    # null elements give a definitive TRUE/FALSE — not unknown — so they must not be counted
-    # as uncertain. Using "(pred) IS NULL" as the WHERE condition captures only truly uncertain
-    # evaluations regardless of what the predicate looks like.
+    # 3VL (three-valued logic): use definite-fail count instead of null-element count.
+    # Counting null *elements* is wrong when the predicate handles nulls definitively
+    # (e.g., x IS NULL evaluates to TRUE for null elements — not uncertain).
     #
-    # - any:    true  if any element satisfies pred (pred = true);
-    #           null  if none satisfy but some uncertain evaluations exist;
+    # Instead we count elements where the predicate is definitely FALSE using
+    #   NOT (where_pred)
+    # SQL semantics: NOT TRUE=FALSE, NOT FALSE=TRUE, NOT NULL=NULL.
+    # So "WHERE NOT (pred)" counts only definite-false rows; null elements where pred
+    # is uncertain (NULL) are excluded by SQL's three-valued WHERE semantics.
+    #
+    # uncertain = total - satisfy - definite_fail   (all rows are satisfy | dfail | uncertain)
+    #
+    # - any:    true  if satisfy > 0;
+    #           null  if satisfy = 0 AND uncertain > 0;
     #           false otherwise
-    # - none:   false if any element satisfies pred;
-    #           null  if none satisfy but some uncertain evaluations exist;
-    #           true  otherwise
-    # - all:    false if any element definitely fails pred (satisfy < total - uncertain);
-    #           null  if all non-uncertain satisfy but uncertain evaluations exist;
-    #           true  otherwise
-    # - single: true  if exactly one satisfies AND no uncertain evaluations;
-    #           null  if uncertain > 0 AND satisfy <= 1 (uncertain could make it 0 or 2+);
-    #           false otherwise (satisfy >= 2, or satisfy = 0 with no uncertainty)
-    unc_alias = context.next_alias("lpu")
-    unc_pred = pred_with_alias.replace(f"{alias}.", f"{unc_alias}.")
-    uncertain_sql = (
-        f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {unc_alias}"
-        f" WHERE ({unc_pred}) IS NULL"
+    # - none:   false if satisfy > 0;
+    #           null  if satisfy = 0 AND uncertain > 0;
+    #           true  if satisfy = 0 AND uncertain = 0
+    # - all:    false if definite_fail > 0;
+    #           null  if definite_fail = 0 AND uncertain > 0;
+    #           true  if definite_fail = 0 AND uncertain = 0
+    # - single: false if satisfy >= 2;
+    #           true  if satisfy = 1 AND uncertain = 0;
+    #           null  if uncertain > 0 AND satisfy <= 1;
+    #           false if satisfy = 0 AND uncertain = 0
+    dfail_alias = context.next_alias("lpd")
+    where_pred_dfail = where_pred.replace(f"{alias}.", f"{dfail_alias}.")
+    dfail_sql = (
+        f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {dfail_alias}"
+        f" WHERE NOT ({where_pred_dfail})"
     )
+    total_alias = context.next_alias("lpt")
+    total_sql = (
+        f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {total_alias}"
+    )
+    # uncertain = total - satisfy - dfail (expressed as inline arithmetic of three subqueries)
+    uncertain_expr = f"(({total_sql}) - ({satisfy_sql}) - ({dfail_sql}))"
     if expr.quantifier == "all":
-        # Need total non-uncertain count to detect definite failures.
-        # false if satisfy < (total - uncertain); null if uncertain > 0; true otherwise.
-        total_alias = context.next_alias("lpt")
-        total_sql = f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {total_alias}"
         return (
-            f"CASE WHEN (({satisfy_sql}) + ({uncertain_sql})) < ({total_sql}) THEN 0"
-            f" WHEN (({uncertain_sql}) > 0) THEN NULL"
+            f"CASE WHEN (({dfail_sql}) > 0) THEN 0"
+            f" WHEN ({uncertain_expr} > 0) THEN NULL"
             f" ELSE 1 END"
         )
     elif expr.quantifier == "none":
         return (
             f"CASE WHEN (({satisfy_sql}) > 0) THEN 0"
-            f" WHEN (({uncertain_sql}) > 0) THEN NULL"
+            f" WHEN ({uncertain_expr} > 0) THEN NULL"
             f" ELSE 1 END"
         )
     elif expr.quantifier == "single":
-        # Avoid alias collision: generate separate query for the satisfy=1 check already
-        # uses {alias}; reuse uncertain_sql which uses unc_alias.
-        # true: exactly one satisfies AND zero uncertain
-        # null: uncertain > 0 AND satisfy <= 1 (still possible to be exactly one)
-        # false: satisfy >= 2 (definitely more than one); or satisfy=0, uncertain=0
-        sat_ge2_alias = context.next_alias("lp")
-        where_pred_ge2 = where_pred.replace(f"{alias}.", f"{sat_ge2_alias}.")
-        sat_ge2_sql = (
-            f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {sat_ge2_alias}"
-            f" WHERE {where_pred_ge2}"
+        # For the >= 2 check, reuse dfail_alias won't work (already used in dfail_sql),
+        # so generate a new alias for the second satisfy count.
+        sat2_alias = context.next_alias("lps")
+        where_pred_sat2 = where_pred.replace(f"{alias}.", f"{sat2_alias}.")
+        sat2_sql = (
+            f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {sat2_alias}"
+            f" WHERE {where_pred_sat2}"
         )
         return (
-            f"CASE WHEN (({sat_ge2_sql}) >= 2) THEN 0"
-            f" WHEN (({satisfy_sql}) = 1) AND (({uncertain_sql}) = 0) THEN 1"
-            f" WHEN (({uncertain_sql}) > 0) THEN NULL"
+            f"CASE WHEN (({sat2_sql}) >= 2) THEN 0"
+            f" WHEN (({satisfy_sql}) = 1) AND ({uncertain_expr} = 0) THEN 1"
+            f" WHEN ({uncertain_expr} > 0) THEN NULL"
             f" ELSE 0 END"
         )
     else:  # any
         return (
             f"CASE WHEN (({satisfy_sql}) > 0) THEN 1"
-            f" WHEN (({uncertain_sql}) > 0) THEN NULL"
+            f" WHEN ({uncertain_expr} > 0) THEN NULL"
             f" ELSE 0 END"
         )
 
 
+def _list_comprehension_type_check(expr):
+    """Check if a list comprehension's projection would receive invalid types.
+
+    For type-conversion functions (toInteger, toFloat, toString, toBoolean),
+    raise a TypeError if the source list literal contains any element whose
+    type cannot be accepted by that function (e.g. list/map/node inside toInteger).
+    This preserves Cypher's strict type semantics: toInteger([]) → TypeError.
+    """
+    if not expr.projection:
+        return
+    if not isinstance(expr.source, ast.Literal) or not isinstance(expr.source.value, list):
+        return
+    if not isinstance(expr.projection, ast.FunctionCall):
+        return
+    fn = expr.projection.function_name.lower()
+    if fn not in ("tointeger", "tofloat", "tostring", "toboolean"):
+        return
+    source_list = expr.source.value
+    for item in source_list:
+        # Determine the "kind" of this list element
+        if isinstance(item, ast.MapLiteral):
+            kind = "map"
+        elif isinstance(item, ast.Literal):
+            v = item.value
+            if isinstance(v, list):
+                kind = "list"
+            elif isinstance(v, dict):
+                kind = "map"
+            elif isinstance(v, bool):
+                kind = "bool"
+            elif isinstance(v, (int, float)):
+                kind = "number"
+            elif isinstance(v, str):
+                kind = "string"
+            else:
+                kind = "null"
+        elif isinstance(item, ast.Variable):
+            # Node/relationship/path variable — always invalid for scalar converters
+            kind = "node_or_rel"
+        else:
+            # Complex expression (FunctionCall, etc.) — conservatively assume valid
+            continue
+        if fn == "toboolean":
+            # toBoolean accepts: bool, string. Rejects: int, float, list, map, node, rel, path
+            if kind in ("number", "list", "map", "node_or_rel"):
+                raise TypeError(
+                    f"InvalidArgumentValue: toBoolean() requires a boolean or string argument, got {kind}"
+                )
+        elif fn in ("tointeger", "tofloat"):
+            # toInteger/toFloat accept: int, float, string. Reject: bool, list, map, node, rel, path
+            if kind in ("bool", "list", "map", "node_or_rel"):
+                raise TypeError(
+                    f"InvalidArgumentValue: {fn}() requires a numeric or string argument, got {kind}"
+                )
+        elif fn == "tostring":
+            # toString accepts: int, float, bool, string. Rejects: list, map, node, rel, path
+            if kind in ("list", "map", "node_or_rel"):
+                raise TypeError(
+                    f"InvalidArgumentValue: toString() requires a scalar argument, got {kind}"
+                )
+
+
 def _expr_list_comprehension(expr, context, segment):
+    # Type-check projection against source list elements for conversion functions.
+    _list_comprehension_type_check(expr)
     source_sql = translate_expression(expr.source, context, segment="inline")
     var = sanitize_identifier(expr.variable)
     alias = context.next_alias("lc")
@@ -6336,10 +6512,12 @@ def _extract_temporal_component(base_sql: str, temporal_type: str, prop_name: st
             # Minutes from time part (after H or start)
             m_start = f"CASE WHEN {h_in_t} > 0 THEN {h_in_t} + 1 ELSE 1 END"
             m_val = f"CASE WHEN {m_in_t} > 0 THEN CAST(SUBSTRING({time_part_sql}, {m_start}, {m_in_t} - {m_start}) AS INTEGER) ELSE 0 END"
-            # Seconds from time part (after M or H or start, before S or .)
+            # Seconds from time part (after M or H or start, before S - use full float including fractional)
             s_start = f"CASE WHEN {m_in_t} > 0 THEN {m_in_t} + 1 WHEN {h_in_t} > 0 THEN {h_in_t} + 1 ELSE 1 END"
-            s_end = f"CASE WHEN {dot_in_t} > 0 AND ({s_in_t} = 0 OR {dot_in_t} < {s_in_t}) THEN {dot_in_t} WHEN {s_in_t} > 0 THEN {s_in_t} ELSE LENGTH({time_part_sql}) + 1 END"
-            s_val = f"CASE WHEN {s_in_t} > 0 THEN CAST(SUBSTRING({time_part_sql}, {s_start}, {s_end} - {s_start}) AS INTEGER) ELSE 0 END"
+            # s_end must reach S to capture full float like "-59.9" (not just "-59" by stopping at dot)
+            s_end_full = f"CASE WHEN {s_in_t} > 0 THEN {s_in_t} ELSE LENGTH({time_part_sql}) + 1 END"
+            # Use FLOOR for seconds to handle negative fractional: FLOOR(-59.9) = -60
+            s_val = f"CASE WHEN {s_in_t} > 0 THEN CAST(FLOOR(CAST(SUBSTRING({time_part_sql}, {s_start}, {s_end_full} - {s_start}) AS FLOAT)) AS INTEGER) ELSE 0 END"
 
             return f"CASE WHEN {t_pos} > 0 THEN ({h_val}) * 3600 + ({m_val}) * 60 + ({s_val}) ELSE 0 END"
 
@@ -6347,26 +6525,24 @@ def _extract_temporal_component(base_sql: str, temporal_type: str, prop_name: st
             # Fractional nanoseconds of the seconds component
             # For PT22H → 0
             # For PT23H59M59.9S → 900000000
-            # For PT-23H-59M-59.9S → 100000000 (this is weird — from test data)
-            # Actually: the nanoseconds of the whole seconds number
+            # For PT-23H-59M-59.9S → 100000000
+            # Cypher spec: nanoseconds is the positive offset from the floor second.
+            # For negative fractional seconds: floor(-59.9) = -60, offset = 0.1s = 100000000 ns
+            # i.e., nanos = 1_000_000_000 - frac_ns when seconds component is negative
             time_part_sql = f"CASE WHEN {t_pos} > 0 THEN SUBSTRING({base_sql}, {t_pos} + 1, 9999) ELSE '' END"
+            h_in_t = f"CHARINDEX('H', {time_part_sql})"
+            m_in_t = f"CHARINDEX('M', {time_part_sql})"
             s_in_t = f"CHARINDEX('S', {time_part_sql})"
             dot_in_t = f"CHARINDEX('.', {time_part_sql})"
-            # Extract fraction: between '.' and 'S'
-            frac_sql = (
-                f"CASE WHEN {dot_in_t} > 0 AND {s_in_t} > {dot_in_t} THEN "
-                f"  CAST(RPAD(SUBSTRING({time_part_sql}, {dot_in_t} + 1, {s_in_t} - {dot_in_t} - 1), 9, '0') AS BIGINT)"
-                f" ELSE 0 END"
-            )
-            # For negative durations with fractional seconds, the ns might be positive
-            # (e.g., PT-23H-59M-59.9S has nanosecondsOfSecond = 100000000 per test)
-            # This means: if the second fractional part is negative, complement it
-            # Actually looking at the test: PT-23H-59M-59.9S → dur.seconds=-86400, dur.nanosecondsOfSecond=100000000
-            # Cypher spec: for negative durations, nanoseconds = (1_000_000_000 - frac_ns) when frac!=0
-            # Simplified: just return abs(frac * 10^9_remainder)
+            # Determine start of seconds component (after M, or H, or beginning)
+            s_start2 = f"CASE WHEN {m_in_t} > 0 THEN {m_in_t} + 1 WHEN {h_in_t} > 0 THEN {h_in_t} + 1 ELSE 1 END"
+            # Check if seconds component starts with '-'
+            s_is_neg = f"CASE WHEN {dot_in_t} > 0 AND {s_in_t} > {dot_in_t} AND SUBSTRING({time_part_sql}, {s_start2}, 1) = '-' THEN 1 ELSE 0 END"
+            # Fractional nanoseconds (raw, from digits after dot before S)
+            raw_frac_ns = f"CAST(RPAD(SUBSTRING({time_part_sql}, {dot_in_t} + 1, {s_in_t} - {dot_in_t} - 1), 9, '0') AS BIGINT)"
             return (
                 f"CASE WHEN {dot_in_t} > 0 AND {s_in_t} > {dot_in_t} THEN "
-                f"  ABS(CAST(RPAD(SUBSTRING({time_part_sql}, {dot_in_t} + 1, {s_in_t} - {dot_in_t} - 1), 9, '0') AS BIGINT))"
+                f"  CASE WHEN {s_is_neg} = 1 THEN 1000000000 - {raw_frac_ns} ELSE {raw_frac_ns} END"
                 f" ELSE 0 END"
             )
 
@@ -6567,6 +6743,12 @@ def _expr_subscript(expr, context, segment):
                     f"THEN SQLUser.CypherFn_IVGTYPEERROR('Non-integer index type for list subscript') "
                     f"ELSE NULL END"
                 )
+            # If the index variable is in input_params and is an integer, inline it
+            # to avoid using ? inside JSON path string concat (IRIS rejects that form).
+            if idx_var_name in context.input_params:
+                pval = context.input_params[idx_var_name]
+                if isinstance(pval, int) and not isinstance(pval, bool):
+                    return f"SQLUser.JSON_VALUE({base_sql}, '$[{pval}]')"
         idx_sql = translate_expression(idx, context, segment=segment)
         return f"SQLUser.JSON_VALUE({base_sql}, '$.' || CAST(({idx_sql}) AS VARCHAR))"
     base_sql = translate_expression(base, context, segment=segment)
@@ -6772,6 +6954,38 @@ def _expr_aggregation(expr, context, segment):
         if expr.function_name.upper() == "COLLECT"
         else expr.function_name.upper()
     )
+    # collect(nodeVar) — emit structured JSON objects instead of bare node_id strings,
+    # so the result set carries enough data for node-pattern comparison.
+    if (fn == "JSON_ARRAYAGG"
+            and expr.argument
+            and isinstance(expr.argument, ast.Variable)):
+        var_name = expr.argument.name
+        alias = context.variable_aliases.get(var_name)
+        edge_stage_vars = getattr(context, "edge_stage_variables", set())
+        is_scalar = var_name in context.scalar_variables
+        is_edge = alias and (alias.startswith("e") and not alias.startswith("ES_"))
+        is_edge_stage = var_name in edge_stage_vars
+        if alias and not is_scalar and not is_edge and not is_edge_stage:
+            # Determine node_id expression for this variable
+            if alias in context.mapped_node_aliases:
+                mapping = context.mapped_node_aliases[alias]
+                id_col = sanitize_identifier(mapping['id_column'])
+                node_id_expr = f"{alias}.{id_col}"
+            elif alias.startswith("Stage"):
+                # Stage CTE: column name is the safe alias of the variable
+                node_id_expr = _safe_alias(var_name)
+            else:
+                node_id_expr = f"{alias}.node_id"
+            lbl_sql = labels_subquery(node_id_expr)
+            props_sql = properties_subquery(node_id_expr)
+            # Build JSON object string via concatenation (avoids IRIS JSON_OBJECT bug)
+            node_json = (
+                f"'{{\"_id\":\"' || {node_id_expr} || '\",' "
+                f"|| '\"_labels\":' || {lbl_sql} || ',' "
+                f"|| '\"_props\":' || COALESCE({props_sql}, '[]') || '}}'"
+            )
+            distinct_kw = "DISTINCT " if expr.distinct else ""
+            return f"JSON_ARRAYAGG({distinct_kw}{node_json})"
     return f"{fn}({'DISTINCT ' if expr.distinct else ''}{arg})"
 
 
@@ -8850,6 +9064,14 @@ def translate_return_clause(ret, context):
                 continue
             alias_name = context.variable_aliases.get(var_name)
             is_scalar = var_name in context.scalar_variables
+            # Variable-length relationship list variable: the engine fills in the actual
+            # relationship path list after BFS traversal.  Emit NULL as a placeholder
+            # column that the engine replaces.
+            if alias_name == "__vl_rel__":
+                col_alias = item.alias or var_name
+                context.select_items.append(f"NULL AS {_safe_alias(col_alias)}")
+                context.optional_null_row_items.append("NULL")
+                continue
             # Stage-promoted edge variables (e.g. WITH r promoted to Stage1 with __edge_r_s/p/o)
             # must NOT go through the node path — emit edge identity columns instead.
             edge_stage_vars = getattr(context, "edge_stage_variables", set())
@@ -9037,6 +9259,14 @@ def translate_with_clause(with_clause, context):
                 context.non_integer_index_vars.add(alias)
         elif isinstance(item.expression, ast.MapLiteral):
             context.non_integer_index_vars.add(alias)
+        elif isinstance(item.expression, ast.Variable):
+            # Also check input_params for parameter variables bound to non-integer types.
+            # e.g. WITH $idx AS idx where $idx is a boolean/float/string/list/map.
+            _param_name = item.expression.name
+            if _param_name in context.input_params:
+                _pval = context.input_params[_param_name]
+                if isinstance(_pval, bool) or isinstance(_pval, float) or isinstance(_pval, str) or isinstance(_pval, (list, dict)):
+                    context.non_integer_index_vars.add(alias)
 
         # Edge variables: expose qualifiers JSON so downstream r.prop works via JSON_VALUE(r, '$.prop')
         if (isinstance(item.expression, ast.Variable)
