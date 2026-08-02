@@ -8034,28 +8034,32 @@ def _parse_duration_string(s):
     m_frac = minutes - m_int
     seconds = seconds + m_frac * 60
 
-    s_int = int(seconds)
-    s_frac = seconds - s_int
-    rem_ns = round(s_frac * 1_000_000_000)
+    # Use truncating-toward-zero division for signed seconds/nanoseconds normalization
+    s_total_ns = round(seconds * 1_000_000_000)
+    s_int = int(s_total_ns / 1_000_000_000)  # truncates toward zero
+    rem_ns = s_total_ns - s_int * 1_000_000_000  # same sign as s_total_ns or 0
 
-    # Normalize seconds → minutes → hours → days
-    extra_s = rem_ns // 1_000_000_000
-    rem_ns = rem_ns % 1_000_000_000
-    s_int += extra_s
-    extra_m = s_int // 60
-    s_int = s_int % 60
+    # Normalize seconds → minutes → hours → days (truncating toward zero)
+    extra_m = int(s_int / 60)
+    s_int = s_int - extra_m * 60
     m_int += extra_m
-    extra_h = m_int // 60
-    m_int = m_int % 60
+    extra_h = int(m_int / 60)
+    m_int = m_int - extra_h * 60
     h_int += extra_h
-    extra_d = h_int // 24
-    h_int = h_int % 24
+    extra_d = int(h_int / 24)
+    h_int = h_int - extra_d * 24
     d_int += extra_d
 
     return _format_duration(int(years), mo_int, d_int, h_int, m_int, s_int, rem_ns)
 
 
 def _format_duration(yr_int, mo_int, d_int, h_int, m_int, s_int, rem_ns):
+    """Format a duration as ISO 8601 string.
+
+    s_int and rem_ns must have the same sign (or one be zero) — use truncating division
+    when extracting them from total nanoseconds to guarantee this invariant.
+    rem_ns may be negative when representing negative fractional seconds.
+    """
     date_part = ""
     if yr_int:
         date_part += f"{yr_int}Y"
@@ -8068,9 +8072,17 @@ def _format_duration(yr_int, mo_int, d_int, h_int, m_int, s_int, rem_ns):
         time_part += f"{h_int}H"
     if m_int:
         time_part += f"{m_int}M"
-    if rem_ns > 0:
-        ns_str = f"{rem_ns:09d}".rstrip('0')
-        time_part += f"{s_int}.{ns_str}S"
+    if rem_ns != 0:
+        abs_rem = abs(rem_ns)
+        ns_str = f"{abs_rem:09d}".rstrip('0')
+        if s_int == 0 and rem_ns < 0:
+            # e.g. s_int=0, rem_ns=-1_000_000 → "-0.001S"
+            time_part += f"-0.{ns_str}S"
+        else:
+            # s_int carries the sign; rem_ns has same sign or zero
+            # e.g. s_int=-1, rem_ns=-999_000_000 → "-1.999S"
+            # e.g. s_int=1, rem_ns=999_000_000 → "1.999S"
+            time_part += f"{s_int}.{ns_str}S"
     elif s_int:
         time_part += f"{s_int}S"
     if not date_part and not time_part:
@@ -8212,8 +8224,64 @@ def _build_date_sql_from_dynamic_base(map_expr, context, target_fn="date"):
     # base temporal string starts with "YYYY-MM-DD"
     # -------------------------------------------------------
     if target_fn == "date" and base_key in ("date", "localdatetime", "datetime"):
-        if "week" in overrides or "ordinalDay" in overrides or "quarter" in overrides:
-            return None  # complex; skip for now
+        if "week" in overrides:
+            # ISO week override: compute Monday of ISO week W in the base year,
+            # then offset by (dayOfWeek-1) from base date
+            # ISO week 1 = week containing Jan 4. First Mon of ISO week year:
+            # DATEADD(day, -DATEPART(weekday, CAST(year||'-01-04' AS DATE)) + 2, CAST(year||'-01-04' AS DATE))
+            # But IRIS weekday: 1=Sun, 2=Mon, ..., 7=Sat
+            # We want Mon (2 in IRIS). Offset to Monday: -DATEPART(weekday,x) + 2
+            # Then add (week-1)*7 days and (dayOfWeek - 1) days
+            week_val = overrides["week"]
+            year_sql_raw = f"SUBSTRING({base_sql}, 1, 4)"
+            # dayOfWeek from base date (ISO: Mon=1..Sun=7). IRIS weekday: Sun=1..Sat=7
+            # Convert: ISO dow = (IRIS_dow + 5) % 7 + 1 where IRIS_dow=1..7
+            base_iris_dow = f"DATEPART('weekday', CAST({base_sql} AS DATE))"
+            base_iso_dow = f"(({base_iris_dow} + 5) % 7 + 1)"
+            # First Monday of ISO week 1 of the year:
+            jan4_str = f"CAST({year_sql_raw} || '-01-04' AS DATE)"
+            jan4_iris_dow = f"DATEPART('weekday', {jan4_str})"
+            first_mon = f"DATEADD('day', -({jan4_iris_dow} - 2 + 7) % 7, {jan4_str})"
+            # Target date = first_mon + (week-1)*7 + (base_iso_dow - 1) days
+            target_date = f"DATEADD('day', ({week_val} - 1) * 7 + ({base_iso_dow} - 1), {first_mon})"
+            return (
+                f"(LPAD(CAST(DATEPART('year', {target_date}) AS VARCHAR(6)), 4, '0') || '-' || "
+                f"LPAD(CAST(DATEPART('month', {target_date}) AS VARCHAR(4)), 2, '0') || '-' || "
+                f"LPAD(CAST(DATEPART('day', {target_date}) AS VARCHAR(4)), 2, '0'))"
+            )
+        if "ordinalDay" in overrides:
+            # ordinalDay override: result = Jan 1 of base year + (ordinalDay - 1) days
+            ordinal_val = overrides["ordinalDay"]
+            year_sql_raw = f"SUBSTRING({base_sql}, 1, 4)"
+            jan1 = f"CAST({year_sql_raw} || '-01-01' AS DATE)"
+            target_date = f"DATEADD('day', {ordinal_val} - 1, {jan1})"
+            return (
+                f"(LPAD(CAST(DATEPART('year', {target_date}) AS VARCHAR(6)), 4, '0') || '-' || "
+                f"LPAD(CAST(DATEPART('month', {target_date}) AS VARCHAR(4)), 2, '0') || '-' || "
+                f"LPAD(CAST(DATEPART('day', {target_date}) AS VARCHAR(4)), 2, '0'))"
+            )
+        if "quarter" in overrides:
+            # quarter override: preserve dayOfQuarter from base date, move to target quarter.
+            # dayOfQuarter = DATEDIFF(day, first_day_of_base_quarter, base_date) + 1
+            # first_day_of_target_quarter = CAST(year || '-MM-01' AS DATE) where MM = (q-1)*3+1
+            quarter_val = overrides["quarter"]
+            new_q_start_month = (quarter_val - 1) * 3 + 1
+            new_q_start_month_str = f"'{new_q_start_month:02d}'"
+            year_sql_raw = f"SUBSTRING({base_sql}, 1, 4)"
+            base_month_sql = f"CAST(SUBSTRING({base_sql}, 6, 2) AS INTEGER)"
+            # base_quarter = (month - 1) / 3 + 1
+            # IRIS uses float division by default; CAST to INTEGER to floor
+            base_q_start_month_sql = f"(CAST(({base_month_sql} - 1) / 3 AS INTEGER) * 3 + 1)"
+            base_q_start = f"CAST({year_sql_raw} || '-' || LPAD(CAST({base_q_start_month_sql} AS VARCHAR(3)), 2, '0') || '-01' AS DATE)"
+            base_date = f"CAST(SUBSTRING({base_sql}, 1, 10) AS DATE)"
+            day_of_quarter = f"(DATEDIFF('day', {base_q_start}, {base_date}) + 1)"
+            new_q_start = f"CAST({year_sql_raw} || '-' || {new_q_start_month_str} || '-01' AS DATE)"
+            target_date = f"DATEADD('day', {day_of_quarter} - 1, {new_q_start})"
+            return (
+                f"(LPAD(CAST(DATEPART('year', {target_date}) AS VARCHAR(6)), 4, '0') || '-' || "
+                f"LPAD(CAST(DATEPART('month', {target_date}) AS VARCHAR(4)), 2, '0') || '-' || "
+                f"LPAD(CAST(DATEPART('day', {target_date}) AS VARCHAR(4)), 2, '0'))"
+            )
         year_sql = _int_field("year", f"CAST(SUBSTRING({base_sql}, 1, 4) AS INTEGER)")
         month_sql = _int_field("month", f"CAST(SUBSTRING({base_sql}, 6, 2) AS INTEGER)")
         day_sql = _int_field("day", f"CAST(SUBSTRING({base_sql}, 9, 2) AS INTEGER)")
@@ -8529,6 +8597,9 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
             parsed = _parse_date_string(args_exprs[0].value)
             if parsed:
                 return f"'{parsed[0]:04d}-{parsed[1]:02d}-{parsed[2]:02d}'"
+        # Variable arg: may be a datetime/localdatetime — extract first 10 chars (YYYY-MM-DD)
+        if args_exprs and isinstance(args_exprs[0], ast.Variable):
+            return f"SUBSTRING({args[0]}, 1, 10)"
         return args[0]
     if fn in ("localdatetime",):
         if not args:
@@ -8597,6 +8668,24 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
                 if fn == "time" and not any(c in parsed for c in "Z+-"):
                     parsed = parsed + "Z"
                 return f"'{parsed}'"
+        # Variable arg: may be datetime/localdatetime (extract time part) or time/localtime
+        if args_exprs and isinstance(args_exprs[0], ast.Variable):
+            base = args[0]
+            # Extract time portion: if contains 'T', take substring after 'T'; else use as-is
+            # Strip trailing timezone for localtime output
+            time_expr = (
+                f"CASE WHEN CHARINDEX('T', {base}) > 0 "
+                f"THEN SUBSTRING({base}, CHARINDEX('T', {base}) + 1) "
+                f"ELSE {base} END"
+            )
+            if fn == "localtime":
+                # Strip timezone suffix (Z or +/-HH:MM)
+                time_expr = (
+                    f"CASE WHEN CHARINDEX('T', {base}) > 0 "
+                    f"THEN REGEXP_REPLACE(SUBSTRING({base}, CHARINDEX('T', {base}) + 1), '[Z+\\-]\\d{{2}}.*$', '') "
+                    f"ELSE REGEXP_REPLACE({base}, '[Z+\\-]\\d{{2}}.*$', '') END"
+                )
+            return time_expr
         return args[0]
     if fn == "duration":
         if not args:
@@ -8639,27 +8728,29 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
             m_frac = minutes - m_int
             seconds = seconds + m_frac * 60
 
-            # sub-second to nanoseconds
-            total_ns = round(ms_d * 1_000_000 + us_d * 1_000 + ns_d)
-            # Convert fractional seconds to nanoseconds
-            s_int = int(seconds)
-            s_frac = seconds - s_int
-            total_ns += round(s_frac * 1_000_000_000)
-            # Normalize nanoseconds → seconds
-            extra_s = total_ns // 1_000_000_000
-            rem_ns = total_ns % 1_000_000_000
-            s_int += extra_s
-            # Normalize seconds → minutes
-            extra_m = s_int // 60
-            s_int = s_int % 60
+            # Combine seconds + sub-second components into a single signed nanosecond value.
+            # Use truncating (toward-zero) division so s_int and rem_ns have the same sign.
+            subsec_ns = round(ms_d * 1_000_000 + us_d * 1_000 + ns_d)
+            # Include fractional seconds
+            s_whole = int(seconds)  # truncate toward zero
+            s_frac = seconds - s_whole
+            subsec_ns += round(s_frac * 1_000_000_000)
+            # Total signed nanoseconds for the seconds component
+            s_total_ns = s_whole * 1_000_000_000 + subsec_ns
+            # Truncating division toward zero:
+            s_int = int(s_total_ns / 1_000_000_000)  # int() truncates toward zero
+            rem_ns = s_total_ns - s_int * 1_000_000_000  # same sign as s_total_ns or 0
+            # Normalize seconds → minutes (truncating toward zero)
+            extra_m = int(s_int / 60)
+            s_int = s_int - extra_m * 60
             m_int += extra_m
-            # Normalize minutes → hours
-            extra_h = m_int // 60
-            m_int = m_int % 60
+            # Normalize minutes → hours (truncating toward zero)
+            extra_h = int(m_int / 60)
+            m_int = m_int - extra_h * 60
             h_int += extra_h
-            # Normalize hours → days
-            extra_d = h_int // 24
-            h_int = h_int % 24
+            # Normalize hours → days (truncating toward zero)
+            extra_d = int(h_int / 24)
+            h_int = h_int - extra_d * 24
             d_int += extra_d
 
             result_str = _format_duration(int(years), mo_int, d_int, h_int, m_int, s_int, rem_ns)
@@ -10366,6 +10457,7 @@ def translate_return_clause(ret, context):
                     )
 
     agg_aliases: set = set()
+    _used_ret_aliases: set = set()  # deduplicate auto-generated RETURN aliases
     for item in ret.items:
         if isinstance(item.expression, ast.Variable):
             var_name = item.expression.name
@@ -10459,7 +10551,7 @@ def translate_return_clause(ret, context):
             if isinstance(item.expression, ast.PropertyReference):
                 alias = f"{item.expression.variable}_{item.expression.property_name}"
                 cypher_col = f"{item.expression.variable}.{item.expression.property_name}"
-                context.column_name_map[alias] = cypher_col
+                # NOTE: column_name_map registration done below after alias deduplication
             elif isinstance(item.expression, ast.Variable):
                 alias = item.expression.name
             elif isinstance(
@@ -10476,8 +10568,7 @@ def translate_return_clause(ret, context):
                         alias = f"{item.expression.function_name}_res"
                 else:
                     alias = f"{item.expression.function_name}_res"
-                if cypher_text and cypher_text != alias:
-                    context.column_name_map[alias] = cypher_text
+                # NOTE: column_name_map registration done below after alias deduplication
             else:
                 cypher_text = _expr_to_cypher_text(item.expression)
                 if cypher_text:
@@ -10486,11 +10577,21 @@ def translate_return_clause(ret, context):
                     alias = _re_alias.sub(r'[^A-Za-z0-9_]', '_', cypher_text)
                     if alias and alias[0].isdigit():
                         alias = f"_{alias}"
-                    # Register the mapping so the engine can rename after execution
-                    if alias and cypher_text != alias:
-                        context.column_name_map[alias] = cypher_text
+                    # NOTE: do NOT register column_name_map here — done below after dedup
         if alias:
-            context.select_items.append(f"{sql} AS {_safe_alias(alias).replace('.', '_')}")
+            # Deduplicate auto-generated aliases (e.g. x > d and x < d both → x___d)
+            safe = _safe_alias(alias).replace('.', '_')
+            if safe in _used_ret_aliases:
+                _dedup_n = 2
+                while f"{safe}_{_dedup_n}" in _used_ret_aliases:
+                    _dedup_n += 1
+                safe = f"{safe}_{_dedup_n}"
+            _used_ret_aliases.add(safe)
+            # Register column_name_map with the FINAL (deduplicated) alias
+            cypher_text_final = _expr_to_cypher_text(item.expression)
+            if cypher_text_final and cypher_text_final != safe:
+                context.column_name_map[safe] = cypher_text_final
+            context.select_items.append(f"{sql} AS {safe}")
         else:
             context.select_items.append(sql)
         # If there's aggregation in the RETURN clause and this item does not contain
