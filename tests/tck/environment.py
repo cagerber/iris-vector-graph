@@ -9,7 +9,7 @@ from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
-# Named graphs: session-scoped fixture graphs pre-built once in before_all.
+# Named graphs: scenario-scoped fixtures rebuilt as needed.
 NAMED_GRAPHS = {
     "binary-tree-1": "TCK_BINARY_TREE_1",
     "binary-tree-2": "TCK_BINARY_TREE_2",
@@ -42,13 +42,15 @@ CREATE
 
 
 def before_all(context):
-    """Session setup: connect to ivg-iris, create named graph fixtures."""
+    """Session setup: connect to ivg-iris, initialize schema only."""
     container_name = os.environ.get("IVG_CONTAINER", "ivg-iris")
     port = int(os.environ.get("IVG_PORT", "21972"))
 
     conn = _connect(container_name, port)
     context.conn = conn
     context.named_graphs = dict(NAMED_GRAPHS)
+    # Cache: graph_name -> label, only when currently built in DB
+    context._named_graph_labels = {}
 
     from iris_vector_graph.engine import IRISGraphEngine
     context.engine = IRISGraphEngine(conn, embedding_dimension=768)
@@ -57,9 +59,8 @@ def before_all(context):
     except Exception as e:
         logger.warning("Schema init: %s", e)
 
-    # Pre-build named graph fixtures
-    for graph_name, label in NAMED_GRAPHS.items():
-        _ensure_named_graph(context, graph_name, label)
+    # Clean up any leftover data from previous test sessions
+    _flush_all_tck_data(context)
 
 
 def before_scenario(context, scenario):
@@ -67,18 +68,28 @@ def before_scenario(context, scenario):
     context.params = {}
     context.last_result = None
     context.last_error = None
+    context._used_named_graph = None  # track if this scenario uses a named graph
 
 
 def after_scenario(context, scenario):
     label = getattr(context, "scenario_label", None)
-    if label and not label.startswith("TCK_BINARY_TREE"):
-        _teardown_label(context, label)
+    if label:
+        if label.startswith("TCK_BINARY_TREE"):
+            # Named-graph scenario: tear down this scenario's named graph data
+            _teardown_label(context, label)
+            # Remove from the built-cache so next scenario recreates if needed
+            if hasattr(context, "_named_graph_labels"):
+                context._named_graph_labels = {
+                    k: v for k, v in context._named_graph_labels.items()
+                    if v != label
+                }
+        else:
+            _teardown_label(context, label)
 
 
 def after_all(context):
-    # Clean up named graph fixtures
-    for label in NAMED_GRAPHS.values():
-        _teardown_label(context, label)
+    # Final cleanup
+    _flush_all_tck_data(context)
     with contextlib.suppress(Exception):
         context.conn.close()
 
@@ -100,6 +111,34 @@ def _connect(container_name: str, port: int):
         ) from e
 
 
+def _db_schema(context) -> str:
+    """Return the schema prefix used by this engine (e.g. 'Graph_KG' or 'SQLUser')."""
+    engine = getattr(context, "engine", None)
+    if engine is None:
+        return "SQLUser"
+    return getattr(engine, "_schema_prefix", "SQLUser")
+
+
+def _flush_all_tck_data(context):
+    """Delete all TCK data from the DB (for session start/end cleanup).
+
+    Delete order must respect FK constraints: rdf_props/rdf_labels/rdf_edges
+    must be deleted before nodes (FK rdf_labels.s -> nodes.node_id).
+    """
+    with contextlib.suppress(Exception):
+        store = getattr(context.engine, "_store", None)
+        if store and hasattr(store, "conn"):
+            schema = _db_schema(context)
+            cursor = store.conn.cursor()
+            # Delete in FK-safe order: dependents first
+            cursor.execute(f"DELETE FROM {schema}.rdf_props")
+            cursor.execute(f"DELETE FROM {schema}.rdf_labels")
+            cursor.execute(f"DELETE FROM {schema}.rdf_edges")
+            cursor.execute(f"DELETE FROM {schema}.nodes")
+            store.conn.commit()
+            cursor.close()
+
+
 def _teardown_label(context, label: str):
     with contextlib.suppress(Exception):
         context.engine.execute_cypher(
@@ -110,10 +149,11 @@ def _teardown_label(context, label: str):
     with contextlib.suppress(Exception):
         store = getattr(context.engine, "_store", None)
         if store and hasattr(store, "conn"):
+            schema = _db_schema(context)
             cursor = store.conn.cursor()
             cursor.execute(
-                "DELETE FROM SQLUser.nodes WHERE node_id NOT IN "
-                "(SELECT DISTINCT s FROM SQLUser.rdf_labels)"
+                f"DELETE FROM {schema}.nodes WHERE node_id NOT IN "
+                f"(SELECT DISTINCT s FROM {schema}.rdf_labels)"
             )
             store.conn.commit()
 

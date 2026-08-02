@@ -3630,7 +3630,7 @@ def _trp_undirected_edge(
             )
     else:
         # Bound source: filter by source node id in the JOIN condition.
-        src_filter = f"{cte_name}._src = {source_alias}.{s_col}"
+        src_filter = f"{edge_alias}._src = {source_alias}.{s_col}"
         context.join_clauses.append(f"{jt} {cte_name} {edge_alias} ON {src_filter}")
 
     context._undirected_aliases.add(edge_alias)
@@ -6151,6 +6151,14 @@ def _expr_function_call(expr, context, segment):
     if fn == "labels":
         return labels_subquery(args[0] if args else "NULL")
     if fn == "properties":
+        if expr.arguments:
+            arg0 = expr.arguments[0]
+            # properties(map) — just return the map itself
+            if isinstance(arg0, ast.MapLiteral):
+                return args[0]
+            # properties(null) — return null
+            if isinstance(arg0, ast.Literal) and arg0.value is None:
+                return "NULL"
         return properties_subquery(args[0] if args else "NULL")
 
     # size(x) where x is a scalar list-predicate variable (VARCHAR holding either a
