@@ -1604,6 +1604,12 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
     # sort_projections: list of (alias, sql_expr) for complex ORDER BY expressions that
     # need to be projected into the inner SELECT so the outer ORDER BY can reference them.
     sort_projections: list = []
+    # Track params added by sort expression translation (correlated subquery key names).
+    # These params appear in the SQL BEFORE the FROM clause (injected into SELECT list)
+    # but are added to join_params AFTER MATCH-clause params. We track them separately
+    # so we can fix the params order after build_stage_sql.
+    sort_expr_params: list = []
+    import re as _re_ob
     if part.with_clause.order_by_clause:
         for item in part.with_clause.order_by_clause.items:
             direction = "ASC" if item.ascending else "DESC"
@@ -1638,14 +1644,18 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
                     }
                     if prev_ob_map:
                         context._orderby_alias_sql.update(prev_ob_map)
+                    # Snapshot join_params length before translating — sort expr adds new params here.
+                    _join_params_before = len(context.join_params)
                     # Use segment="inline" so numeric literals become inline constants.
                     # Property references add JOINs to context (join_params) as needed.
                     expr = translate_expression(item.expression, context, segment="inline")
+                    # Capture params added by this sort expression (will appear in SQL before FROM).
+                    _new_sort_params = context.join_params[_join_params_before:]
+                    sort_expr_params.extend(_new_sort_params)
                     context._orderby_alias_sql = prev_ob_map
-                    # If the expression references JOIN aliases (p\d+.val), it cannot be used
-                    # directly in ORDER BY on the outer subquery — project it as a sort column.
-                    import re as _re_ob
-                    if _re_ob.search(r'\bp\d+\.val\b', expr):
+                    # If the expression references JOIN aliases (p\d+.val) or a correlated
+                    # rdf_props subquery, it cannot be used in OVER() — project it as a sort column.
+                    if _re_ob.search(r'\bp\d+\.val\b', expr) or 'rdf_props' in expr:
                         sort_alias = f"__sort{len(sort_projections)}"
                         sort_projections.append((sort_alias, expr))
                         order_by_items.append(f"{sort_alias} {direction}")
@@ -1671,6 +1681,21 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
                 # Fallback: append to SELECT line
                 sql = sql + f", ({sort_expr}) AS {sort_alias}"
 
+        # Fix params order: sort expression params appear in SQL before the FROM/JOIN params.
+        # stage_params has them after JOIN params (since join_params order is MATCH-params first).
+        # Move sort_expr_params to the front of stage_params to match SQL ? positions.
+        if sort_expr_params:
+            remaining = [p for p in stage_params if p not in sort_expr_params]
+            # Rebuild: sort params first (SQL SELECT columns), then remaining (FROM/JOIN/WHERE)
+            # Use a more careful approach: remove sort_expr_params from their current positions.
+            _sp = list(stage_params)
+            for _p in sort_expr_params:
+                try:
+                    _sp.remove(_p)
+                except ValueError:
+                    pass
+            stage_params = sort_expr_params + _sp
+
     # Apply ORDER BY, SKIP, LIMIT from the WITH clause (if present).
     # IRIS does not allow ORDER BY directly in a CTE body — it must be inside a subquery wrapper.
     limit = _resolve_pagination_value(part.with_clause.limit, context)
@@ -1679,27 +1704,20 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
     if order_by_items or limit is not None or skip is not None:
         has_join = "\nJOIN " in sql or " JOIN " in sql
 
+        # ORDER BY items here are safe to use in OVER() — sort columns were projected as
+        # __sort_N aliases above (sort_projections), so no JOIN-level aliases remain.
+        rn_over = f"ORDER BY {', '.join(order_by_items)}" if order_by_items else ""
         if limit is not None and skip is not None:
             # SKIP+LIMIT: ROW_NUMBER subquery (no FETCH FIRST, no ORDER BY in CTE body)
-            if order_by_items:
-                inner = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
-            else:
-                inner = sql
             sql = (
                 f"SELECT * FROM (\n"
-                f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({inner}) __q\n"
-                f") __paged WHERE __rn > {skip} AND __rn <= {skip + limit}"
+                f"SELECT ROW_NUMBER() OVER({rn_over}) AS __rn, __q.* FROM ({sql}) __q\n"
+                f") __paged WHERE __rn > {skip} AND __rn <= {skip + limit} ORDER BY __rn"
             )
         elif limit is not None:
             if order_by_items:
-                # Need subquery to hold ORDER BY + TOP together
-                inner = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
-                head, sep, rest = inner.partition("SELECT ")
-                if rest[:9].upper().startswith("DISTINCT "):
-                    rest = "DISTINCT " + f"TOP {limit} " + rest[9:]
-                else:
-                    rest = f"TOP {limit} " + rest
-                sql = head + sep + rest
+                # ORDER BY + LIMIT: TOP N wrapper with ORDER BY on outer
+                sql = f"SELECT TOP {limit} * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
             elif has_join:
                 # JOIN CTE: inject TOP to avoid qaqpre FETCH FIRST crash
                 head, sep, rest = sql.partition("SELECT ")
@@ -1712,19 +1730,12 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
                 sql += f"\nFETCH FIRST {limit} ROWS ONLY"
         elif skip is not None:
             # SKIP only
-            if order_by_items:
-                inner = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
-                sql = (
-                    f"SELECT * FROM (\n"
-                    f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({inner}) __q\n"
-                    f") __paged WHERE __rn > {skip}"
-                )
-            elif has_join:
+            if order_by_items or has_join:
                 # ROW_NUMBER on JOIN query to avoid OFFSET in CTE
                 sql = (
                     f"SELECT * FROM (\n"
-                    f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({sql}) __q\n"
-                    f") __paged WHERE __rn > {skip}"
+                    f"SELECT ROW_NUMBER() OVER({rn_over}) AS __rn, __q.* FROM ({sql}) __q\n"
+                    f") __paged WHERE __rn > {skip} ORDER BY __rn"
                 )
             else:
                 sql += f"\nOFFSET {skip} ROWS"
@@ -2383,6 +2394,37 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
                 f"\n{from_clause}), {pct_val}) AS {out_alias}"
             )
             p = []
+    # When fetch_first_unsafe and we have SKIP or LIMIT with ORDER BY that references
+    # JOIN aliases (p\d+.val), project those sort expressions as __sort_N columns so
+    # they survive the subquery wrapping in apply_pagination.
+    # Only needed when SKIP or LIMIT is present — without them, ORDER BY on JOIN aliases
+    # is valid directly on the base query.
+    engine = getattr(context, "_engine", None)
+    fetch_first_unsafe = bool(getattr(engine, "_fetch_first_unsafe", False))
+    _has_skip = cypher_query.skip is not None
+    _has_limit = cypher_query.limit is not None
+    if fetch_first_unsafe and order_by_items and (_has_skip or _has_limit):
+        import re as _re_sort
+        _join_alias_re = _re_sort.compile(r'\bp\d+\.val\b')
+        new_ob_items = []
+        sort_injections = []
+        for i, ob_item in enumerate(order_by_items):
+            # Extract expression part (before the trailing ASC/DESC)
+            _m = _re_sort.match(r'^(.*?)\s+(ASC|DESC)$', ob_item, _re_sort.IGNORECASE)
+            if _m and _join_alias_re.search(_m.group(1)):
+                sort_col = f"__sort{i}"
+                sort_injections.append((_m.group(1), sort_col))
+                new_ob_items.append(f"{sort_col} {_m.group(2)}")
+            else:
+                new_ob_items.append(ob_item)
+        if sort_injections:
+            order_by_items = new_ob_items
+            # Inject sort columns into base SELECT (before first \nFROM at top level)
+            _from_pat = _re_sort.search(r'\nFROM ', sql)
+            for sort_expr, sort_col in sort_injections:
+                if _from_pat:
+                    sql = sql[:_from_pat.start()] + f", {sort_expr} AS {sort_col}" + sql[_from_pat.start():]
+                    _from_pat = _re_sort.search(r'\nFROM ', sql)  # recompute after insert
     sql = apply_pagination(sql, cypher_query, context, order_by_items)
     vl = context.var_length_paths or None
 
@@ -2646,7 +2688,7 @@ def _preprocess_order_by_items(query, context, items, alias_to_sql, _proc_prefix
                     and item.expression.name in alias_to_sql):
                 expr = _proc_prefix_re.sub('', alias_to_sql[item.expression.name])
             else:
-                expr = translate_expression(item.expression, context, segment="where")
+                expr = translate_expression(item.expression, context, segment="select")
                 expr = _proc_prefix_re.sub('', expr)
         except ValueError:
             if (isinstance(item.expression, ast.Variable)
@@ -2658,11 +2700,12 @@ def _preprocess_order_by_items(query, context, items, alias_to_sql, _proc_prefix
     return items
 
 
-def _resolve_pagination_value(value, context: TranslationContext) -> Optional[int]:
+def _resolve_pagination_value(value, context: TranslationContext, clause: str = "SKIP/LIMIT") -> Optional[int]:
     """Resolve a SKIP/LIMIT value that may be an integer literal or a parameter variable."""
     if value is None:
         return None
     if isinstance(value, int):
+        _validate_pagination_int(value, clause)
         return value
     if isinstance(value, ast.Variable):
         resolved = context.input_params.get(value.name)
@@ -2670,8 +2713,32 @@ def _resolve_pagination_value(value, context: TranslationContext) -> Optional[in
             raise ValueError(
                 f"Parameter '${value.name}' used in SKIP/LIMIT but not provided in params dict"
             )
-        return int(resolved)
-    return int(value)
+        # Validate parameter type and value
+        if isinstance(resolved, float) and not resolved.is_integer():
+            raise SyntaxError(
+                f"InvalidArgumentType: {clause} requires an integer, got float: {resolved}"
+            )
+        resolved_int = int(resolved)
+        _validate_pagination_int(resolved_int, clause)
+        return resolved_int
+    # Non-constant expression in SKIP/LIMIT
+    if not isinstance(value, (int, float)):
+        raise SyntaxError(
+            f"NonConstantExpression: {clause} value must be a constant expression"
+        )
+    f_val = float(value)
+    if f_val != int(f_val):
+        raise SyntaxError(
+            f"InvalidArgumentType: {clause} requires an integer, got float: {value}"
+        )
+    return int(f_val)
+
+
+def _validate_pagination_int(value: int, clause: str) -> None:
+    if value < 0:
+        raise SyntaxError(
+            f"NegativeIntegerArgument: {clause} must be a non-negative integer, got: {value}"
+        )
 
 
 def apply_pagination(
@@ -2680,8 +2747,6 @@ def apply_pagination(
     context: TranslationContext,
     order_by_items: list = None,
 ) -> str:
-    if order_by_items:
-        sql += f"\nORDER BY {', '.join(order_by_items)}"
     limit = _resolve_pagination_value(query.limit, context)
     skip = _resolve_pagination_value(query.skip, context)
     if limit is not None or skip is not None:
@@ -2694,30 +2759,38 @@ def apply_pagination(
     engine = getattr(context, "_engine", None)
     fetch_first_unsafe = bool(getattr(engine, "_fetch_first_unsafe", False))
     if fetch_first_unsafe and sql.lstrip().upper().startswith("SELECT "):
+        # ORDER BY items here are safe to use in OVER() — sort columns have been projected
+        # as __sort_N aliases by the caller (see _tts_select_result) so no JOIN aliases remain.
+        rn_over = f"ORDER BY {', '.join(order_by_items)}" if order_by_items else ""
         if limit is not None and skip is not None:
-            # ROW_NUMBER subquery handles SKIP+LIMIT without FETCH FIRST/OFFSET
+            # ORDER BY __rn preserves the sort semantics for the caller
             sql = (
                 f"SELECT * FROM (\n"
-                f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({sql}) __q\n"
-                f") __paged WHERE __rn > {skip} AND __rn <= {skip + limit}"
+                f"SELECT ROW_NUMBER() OVER({rn_over}) AS __rn, __q.* FROM ({sql}) __q\n"
+                f") __paged WHERE __rn > {skip} AND __rn <= {skip + limit} ORDER BY __rn"
             )
             return sql
         if limit is not None and " TOP " not in sql.split("\n", 1)[0].upper():
-            # LIMIT only: inject TOP (no OFFSET needed)
-            head, sep, rest = sql.partition("SELECT ")
-            if rest[:9].upper().startswith("DISTINCT "):
-                rest = "DISTINCT " + f"TOP {limit} " + rest[9:]
+            # LIMIT only: inject TOP with ORDER BY on the outer query
+            if order_by_items:
+                sql = f"SELECT TOP {limit} * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
             else:
-                rest = f"TOP {limit} " + rest
-            return head + sep + rest
+                head, sep, rest = sql.partition("SELECT ")
+                if rest[:9].upper().startswith("DISTINCT "):
+                    rest = "DISTINCT " + f"TOP {limit} " + rest[9:]
+                else:
+                    rest = f"TOP {limit} " + rest
+                sql = head + sep + rest
+            return sql
         if skip is not None:
-            # SKIP only with unsafe FETCH FIRST: use ROW_NUMBER
             sql = (
                 f"SELECT * FROM (\n"
-                f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({sql}) __q\n"
-                f") __paged WHERE __rn > {skip}"
+                f"SELECT ROW_NUMBER() OVER({rn_over}) AS __rn, __q.* FROM ({sql}) __q\n"
+                f") __paged WHERE __rn > {skip} ORDER BY __rn"
             )
             return sql
+    if order_by_items:
+        sql += f"\nORDER BY {', '.join(order_by_items)}"
     if limit is not None:
         if limit == 0 and sql.lstrip().upper().startswith("SELECT "):
             # FETCH FIRST 0 ROWS ONLY hangs on IRIS 2026.x builds; use TOP 0 instead
@@ -7362,7 +7435,9 @@ def _expr_property_reference(expr, context, segment):
     # Use the variable name as the node_id column (it's projected as the variable alias in WITH).
     if segment == "inline":
         context.join_params.append(expr.property_name)
-        var_col = _safe_alias(expr.variable)
+        # Use the table alias (n0.node_id) not the SELECT alias (n) — SELECT aliases are
+        # not referenceable within the same SELECT's correlated subexpressions in IRIS SQL.
+        var_col = f"{alias}.node_id"
         return f"(SELECT val FROM {_table('rdf_props')} WHERE s = {var_col} AND \"key\" = ?)"
     if segment == "where":
         # Skip the structural guard when this property is also IS NULL / IS NOT NULL
