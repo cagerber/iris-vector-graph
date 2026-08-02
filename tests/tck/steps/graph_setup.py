@@ -53,8 +53,76 @@ def step_named_graph(context, graph_name):
 
 @step("there exists a procedure {procedure_sig}")
 def step_procedure_exists(context, procedure_sig):
-    # Procedure registration not supported in IVG — mark scenario @wip at runtime
-    context.scenario.skip(reason="procedure registration not supported")
+    """Register a test procedure with its signature and test data.
+
+    Format: test.name(arg1 :: TYPE1, arg2 :: TYPE2) :: (out1 :: TYPE1, out2 :: TYPE2):
+    Followed by a table with test data rows.
+
+    Example:
+      And there exists a procedure test.labels() :: (label :: STRING?):
+        | label |
+        | 'A'   |
+        | 'B'   |
+        | 'C'   |
+    """
+    import re
+
+    # Ensure procedure registry exists
+    if not hasattr(context, '_tck_procedures'):
+        context._tck_procedures = {}
+
+    # Parse the procedure signature
+    # Format: test.name(arg1 :: TYPE1, ...) :: (out1 :: TYPE1, ...)
+    match = re.match(
+        r'(\w+(?:\.\w+)*)\s*\((.*?)\)\s*::\s*\((.*?)\)',
+        procedure_sig.strip(),
+        re.VERBOSE
+    )
+    if not match:
+        raise ValueError(f"Invalid procedure signature: {procedure_sig}")
+
+    proc_name = match.group(1)
+    args_str = match.group(2).strip()
+    outputs_str = match.group(3).strip()
+
+    # Parse arguments: "name :: TYPE?, name2 :: TYPE?"
+    args = []
+    if args_str:
+        for arg_spec in args_str.split(','):
+            arg_spec = arg_spec.strip()
+            if '::' in arg_spec:
+                arg_name, arg_type = arg_spec.split('::', 1)
+                args.append({
+                    'name': arg_name.strip(),
+                    'type': arg_type.strip()
+                })
+
+    # Parse outputs: "name :: TYPE?, name2 :: TYPE?"
+    outputs = []
+    if outputs_str:
+        for out_spec in outputs_str.split(','):
+            out_spec = out_spec.strip()
+            if '::' in out_spec:
+                out_name, out_type = out_spec.split('::', 1)
+                outputs.append({
+                    'name': out_name.strip(),
+                    'type': out_type.strip()
+                })
+
+    # Extract test data from table
+    rows = []
+    if context.table:
+        # behave gives us context.table with headings and rows
+        for row in context.table.rows:
+            # row is a dict with headings as keys
+            rows.append(dict(row))
+
+    # Register procedure
+    context._tck_procedures[proc_name] = {
+        'args': args,
+        'outputs': outputs,
+        'rows': rows,
+    }
 
 
 def _extract_match_bound_vars(query: str) -> set:

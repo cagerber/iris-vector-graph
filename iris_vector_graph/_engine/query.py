@@ -70,7 +70,7 @@ class QueryMixin:
         return self.execute_cypher(cypher_query, parameters=params)
     def execute_cypher(
         self, cypher_query: str, parameters: Dict[str, Any] = None,
-        read_only: bool = False,
+        read_only: bool = False, procedures: Dict[str, Any] = None,
     ) -> "IVGResult":
         """
         Execute a Cypher query by translating it to IRIS SQL.
@@ -79,6 +79,7 @@ class QueryMixin:
             cypher_query: Cypher query string
             parameters: Optional query parameters
             read_only: If True, rejects any mutation (CREATE/DELETE/SET/MERGE/REMOVE/FOREACH)
+            procedures: Optional dict of test procedures (for TCK harness): {name: {args, outputs, rows}}
 
         Returns:
             Dict containing 'columns', 'rows', and 'metadata'

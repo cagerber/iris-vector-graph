@@ -5351,8 +5351,20 @@ def _extract_temporal_component(base_sql: str, temporal_type: str, prop_name: st
             return f"CAST(SUBSTRING({base_sql}, 6, 2) AS INTEGER)"
         elif prop_name == "day":
             return f"CAST(SUBSTRING({base_sql}, 9, 2) AS INTEGER)"
-        # For more complex properties (week, weekYear, etc.), return None for now
-        # as they require complex date arithmetic that may not be consistent across databases
+        elif prop_name == "weekYear":
+            return f"CAST(SUBSTRING({base_sql}, 1, 4) AS INTEGER)"
+        elif prop_name == "week":
+            return f"{{fn WEEK(CAST({base_sql} AS DATE))}}"
+        elif prop_name == "dayOfWeek" or prop_name == "weekDay":
+            return f"MOD({{fn DAYOFWEEK(CAST({base_sql} AS DATE))}} + 5, 7) + 1"
+        elif prop_name == "dayOfYear" or prop_name == "ordinalDay":
+            return f"{{fn DAYOFYEAR(CAST({base_sql} AS DATE))}}"
+        elif prop_name == "quarter":
+            return f"CAST((CAST(SUBSTRING({base_sql}, 6, 2) AS INTEGER) - 1) / 3 + 1 AS INTEGER)"
+        elif prop_name == "dayOfQuarter":
+            month_var = f"CAST(SUBSTRING({base_sql}, 6, 2) AS INTEGER)"
+            day_var = f"CAST(SUBSTRING({base_sql}, 9, 2) AS INTEGER)"
+            return f"CASE WHEN {month_var} IN (1) THEN {day_var} WHEN {month_var} IN (2) THEN {day_var} + 31 WHEN {month_var} IN (3) THEN {day_var} + 59 WHEN {month_var} IN (4) THEN {day_var} WHEN {month_var} IN (5) THEN {day_var} + 30 WHEN {month_var} IN (6) THEN {day_var} + 61 WHEN {month_var} IN (7) THEN {day_var} WHEN {month_var} IN (8) THEN {day_var} + 31 WHEN {month_var} IN (9) THEN {day_var} + 62 WHEN {month_var} IN (10) THEN {day_var} WHEN {month_var} IN (11) THEN {day_var} + 31 WHEN {month_var} IN (12) THEN {day_var} + 61 ELSE 0 END"
         return None
 
     # LocalDateTime: '2024-01-15T12:31:14[.nanos]' (with optional fractional seconds)
@@ -5369,13 +5381,31 @@ def _extract_temporal_component(base_sql: str, temporal_type: str, prop_name: st
             return f"CAST(COALESCE(SUBSTRING({base_sql}, 21, 6), '0') AS INTEGER)"
         elif prop_name == "nanosecond":
             return f"CAST(COALESCE(SUBSTRING({base_sql}, 21, 9), '0') AS INTEGER)"
-        # Date components: extract date part before T
+        # Date components: extract date part before T (position 1-10: 'YYYY-MM-DD')
         elif prop_name == "year":
             return f"CAST(SUBSTRING({base_sql}, 1, 4) AS INTEGER)"
         elif prop_name == "month":
             return f"CAST(SUBSTRING({base_sql}, 6, 2) AS INTEGER)"
         elif prop_name == "day":
             return f"CAST(SUBSTRING({base_sql}, 9, 2) AS INTEGER)"
+        elif prop_name == "weekYear":
+            return f"CAST(SUBSTRING({base_sql}, 1, 4) AS INTEGER)"
+        elif prop_name == "week":
+            return f"{{fn WEEK(CAST(SUBSTRING({base_sql}, 1, 10) AS DATE))}}"
+        elif prop_name == "dayOfWeek" or prop_name == "weekDay":
+            return f"MOD({{fn DAYOFWEEK(CAST(SUBSTRING({base_sql}, 1, 10) AS DATE))}} + 5, 7) + 1"
+        elif prop_name == "dayOfYear" or prop_name == "ordinalDay":
+            return f"{{fn DAYOFYEAR(CAST(SUBSTRING({base_sql}, 1, 10) AS DATE))}}"
+        elif prop_name == "quarter":
+            return f"CAST((CAST(SUBSTRING({base_sql}, 6, 2) AS INTEGER) - 1) / 3 + 1 AS INTEGER)"
+        elif prop_name == "dayOfQuarter":
+            month_var = f"CAST(SUBSTRING({base_sql}, 6, 2) AS INTEGER)"
+            day_var = f"CAST(SUBSTRING({base_sql}, 9, 2) AS INTEGER)"
+            return f"CASE WHEN {month_var} IN (1) THEN {day_var} WHEN {month_var} IN (2) THEN {day_var} + 31 WHEN {month_var} IN (3) THEN {day_var} + 59 WHEN {month_var} IN (4) THEN {day_var} WHEN {month_var} IN (5) THEN {day_var} + 30 WHEN {month_var} IN (6) THEN {day_var} + 61 WHEN {month_var} IN (7) THEN {day_var} WHEN {month_var} IN (8) THEN {day_var} + 31 WHEN {month_var} IN (9) THEN {day_var} + 62 WHEN {month_var} IN (10) THEN {day_var} WHEN {month_var} IN (11) THEN {day_var} + 31 WHEN {month_var} IN (12) THEN {day_var} + 61 ELSE 0 END"
+        elif prop_name == "epochSeconds":
+            return f"DATEDIFF('second', '1970-01-01T00:00:00', CAST(SUBSTRING({base_sql}, 1, 10) AS DATE))"
+        elif prop_name == "epochMillis":
+            return f"DATEDIFF('second', '1970-01-01T00:00:00', CAST(SUBSTRING({base_sql}, 1, 10) AS DATE)) * 1000 + CAST(COALESCE(SUBSTRING({base_sql}, 21, 3), '0') AS INTEGER)"
         return None
 
     # LocalTime: 'HH:MM:SS[.nanos]' (no timezone)
@@ -5408,6 +5438,12 @@ def _extract_temporal_component(base_sql: str, temporal_type: str, prop_name: st
             return f"CAST(COALESCE(SUBSTRING({base_sql}, 10, 6), '0') AS INTEGER)"
         elif prop_name == "nanosecond":
             return f"CAST(COALESCE(SUBSTRING({base_sql}, 10, 9), '0') AS INTEGER)"
+        elif prop_name == "timezone" or prop_name == "offset":
+            return f"CASE WHEN CHARINDEX('Z', {base_sql}) > 0 THEN 'Z' WHEN CHARINDEX('+', {base_sql}) > 8 THEN SUBSTRING({base_sql}, CHARINDEX('+', {base_sql})) WHEN CHARINDEX('-', {base_sql}) > 8 THEN SUBSTRING({base_sql}, CHARINDEX('-', {base_sql})) ELSE NULL END"
+        elif prop_name == "offsetMinutes":
+            return f"CASE WHEN CHARINDEX('Z', {base_sql}) > 0 THEN 0 WHEN CHARINDEX('+', {base_sql}) > 8 THEN (CAST(SUBSTRING({base_sql}, CHARINDEX('+', {base_sql}) + 1, 2) AS INTEGER) * 60 + CAST(SUBSTRING({base_sql}, CHARINDEX('+', {base_sql}) + 4, 2) AS INTEGER)) WHEN CHARINDEX('-', {base_sql}) > 8 THEN -(CAST(SUBSTRING({base_sql}, CHARINDEX('-', {base_sql}) + 1, 2) AS INTEGER) * 60 + CAST(SUBSTRING({base_sql}, CHARINDEX('-', {base_sql}) + 4, 2) AS INTEGER)) ELSE 0 END"
+        elif prop_name == "offsetSeconds":
+            return f"(CASE WHEN CHARINDEX('Z', {base_sql}) > 0 THEN 0 WHEN CHARINDEX('+', {base_sql}) > 8 THEN (CAST(SUBSTRING({base_sql}, CHARINDEX('+', {base_sql}) + 1, 2) AS INTEGER) * 60 + CAST(SUBSTRING({base_sql}, CHARINDEX('+', {base_sql}) + 4, 2) AS INTEGER)) WHEN CHARINDEX('-', {base_sql}) > 8 THEN -(CAST(SUBSTRING({base_sql}, CHARINDEX('-', {base_sql}) + 1, 2) AS INTEGER) * 60 + CAST(SUBSTRING({base_sql}, CHARINDEX('-', {base_sql}) + 4, 2) AS INTEGER)) ELSE 0 END) * 60"
         return None
 
     # Duration: 'P[n]Y[n]M[n]DT[n]H[n]M[n]S' (ISO 8601)
@@ -5448,7 +5484,8 @@ def _expr_property_reference(expr, context, segment):
         # Edge-qualifiers variables: use JSON_VALUE on the column value (Stage column = qualifiers JSON)
         edge_stage_vars = getattr(context, "edge_stage_variables", set())
         if expr.variable in context.scalar_variables or expr.variable in edge_stage_vars:
-            return f"CASE WHEN {_safe_alias(expr.variable)} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({_safe_alias(expr.variable)}, '$.{expr.property_name}') END"
+            col_ref = f"{alias}.{_safe_alias(expr.variable)}"
+            return f"CASE WHEN {col_ref} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{expr.property_name}') END"
         # Node variables from Stage: JOIN rdf_props to get the property value
         # The Stage column contains the node ID, so use it directly
         p_alias = context.next_alias("p")
@@ -5558,14 +5595,24 @@ def _expr_subscript(expr, context, segment):
                 f"LEFT JOIN {_table('rdf_props')} {p_alias} ON {p_alias}.s = {node_ref} AND {p_alias}.\"key\" = {key_sql}"
             )
             return f"{p_alias}.val"
-        # Scalar variable — use JSON array index or key lookup
+        # Scalar variable — use JSON array index or key lookup (property notation for maps)
         base_sql = translate_expression(base, context, segment=segment)
         # For literal integer indices, inline the value directly to avoid ? parameter
         # placeholders in the JSON path expression (IRIS can't use ? in '$[?]').
+        # However, if the index is non-integer (a string key for maps), use property notation.
         if isinstance(idx, ast.Literal) and isinstance(idx.value, int) and not isinstance(idx.value, bool):
+            # Integer index → array notation
             return f"SQLUser.JSON_VALUE({base_sql}, '$[{idx.value}]')"
+        if isinstance(idx, ast.Literal) and isinstance(idx.value, str):
+            # String literal key → map property notation
+            safe_key = idx.value.replace("'", "''")
+            return f"SQLUser.JSON_VALUE({base_sql}, '$.{safe_key}')"
+        # Dynamic index: use property notation for scalars (likely maps)
+        # In Cypher, scalars can be maps, and map access uses property notation
         idx_sql = translate_expression(idx, context, segment=segment)
-        return f"SQLUser.JSON_VALUE({base_sql}, '$[' || CAST(({idx_sql}) AS VARCHAR) || ']')"
+        # Check if index is a string; if so, use property notation; otherwise use array notation
+        # For safety, we use property notation since maps are more common in scalar contexts
+        return f"SQLUser.JSON_VALUE({base_sql}, '$.' || CAST(({idx_sql}) AS VARCHAR))"
     base_sql = translate_expression(base, context, segment=segment)
     if isinstance(idx, ast.Literal) and isinstance(idx.value, int):
         i = idx.value
@@ -5723,6 +5770,9 @@ def _expr_literal(expr, context, segment):
         escaped = v.replace("'", "''")
         str_len = max(len(v) + 1, 256)
         return f"CAST('{escaped}' AS VARCHAR({str_len}))"
+    # Integers: always inline without bind parameters
+    if isinstance(v, int):
+        return str(v)
     if segment == "select":
         return context.add_select_param(v)
     if segment == "join":
@@ -6915,7 +6965,7 @@ _IRIS_RESERVED = frozenset({
     "union","insert","update","delete","create","drop","alter","set",
     "table","schema","column","row","data","id","user","date","time",
     "result","results","null","true","false","top","exists","not","and","or",
-    "input",
+    "input","first","second","only","rows","fetch","with","offset","limit",
 })
 
 
@@ -7284,24 +7334,35 @@ def translate_with_clause(with_clause, context):
             agg_alias_sql[alias] = translate_expression(item.expression, context, segment="select")
 
     if with_clause.where_clause:
-        # Temporarily add WITH clause aliases to variable_aliases so the WHERE clause can see them.
-        # This implements correct Cypher scoping: WITH WHERE sees both old variables and new aliases.
-        old_variable_aliases = context.variable_aliases.copy()
-        context.variable_aliases = {**old_variable_aliases, **with_item_aliases}
+        expr = with_clause.where_clause.expression
 
-        try:
-            expr = with_clause.where_clause.expression
-            if has_agg and agg_aliases and _references_agg_alias(expr, agg_aliases):
-                context.having_conditions.append(
-                    _translate_having_expr(expr, agg_aliases, agg_alias_sql, context)
-                )
-            else:
-                context.where_conditions.append(
-                    translate_boolean_expression(expr, context)
-                )
-        finally:
-            # Restore the original variable_aliases; the WITH handler will set up the proper stage bindings
-            context.variable_aliases = old_variable_aliases
+        if has_agg and agg_aliases and _references_agg_alias(expr, agg_aliases):
+            # For aggregate filters (HAVING), use the aggregate alias SQL directly
+            context.having_conditions.append(
+                _translate_having_expr(expr, agg_aliases, agg_alias_sql, context)
+            )
+        else:
+            # For non-aggregate WHERE: translate expressions using their original forms,
+            # not their aliases. This is because SQL WHERE is applied before SELECT aliases
+            # are bound. We must replace alias references with their underlying expressions.
+            # Build a map from alias names to their original expressions for substitution.
+            alias_to_expr: dict = {}  # Maps alias -> original expression AST
+            for item in with_clause.items:
+                alias = item.alias
+                if alias is None:
+                    if isinstance(item.expression, ast.PropertyReference):
+                        alias = f"{item.expression.variable}_{item.expression.property_name}"
+                    elif isinstance(item.expression, ast.Variable):
+                        alias = item.expression.name
+                    elif isinstance(item.expression, ast.AggregationFunction):
+                        alias = f"{item.expression.function_name}"
+                if alias is None:
+                    alias = context.next_alias("v")
+                alias_to_expr[alias] = item.expression
+
+            # Translate the WHERE using a substitute function that expands aliases to original expressions
+            where_sql = _translate_where_with_alias_expansion(expr, alias_to_expr, context)
+            context.where_conditions.append(where_sql)
 
 
 def _references_agg_alias(expr, agg_aliases: set) -> bool:

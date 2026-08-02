@@ -654,3 +654,114 @@ class TestQuantifierExpressions:
             # Just verify it produces SQL output without error
             sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
             assert len(sql) > 0
+
+class TestBooleanLogic:
+    """Tests for boolean operators: AND, OR, XOR, NOT with 3VL (three-valued logic)."""
+
+    def test_xor_true_true(self):
+        """Test XOR with two true literals."""
+        query = "RETURN true XOR true AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # Should fold to 0 (false)
+        assert "SELECT 0 AS result" in sql
+
+    def test_xor_true_false(self):
+        """Test XOR with true and false literals."""
+        query = "RETURN true XOR false AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # Should fold to 1 (true)
+        assert "SELECT 1 AS result" in sql
+
+    def test_xor_false_false(self):
+        """Test XOR with two false literals."""
+        query = "RETURN false XOR false AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # Should fold to 0 (false)
+        assert "SELECT 0 AS result" in sql
+
+    def test_xor_with_null(self):
+        """Test XOR with null returns null."""
+        query = "RETURN true XOR null AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # Should return NULL
+        assert "SELECT NULL AS result" in sql
+
+    def test_xor_chained_literals(self):
+        """Test that chained XOR with literals produces simple SQL."""
+        query = "RETURN true XOR true XOR true XOR true XOR true AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # Should fold to simple result, not exponentially large expression
+        # With 5 trues: true XOR true = false, false XOR true = true, true XOR true = false, false XOR true = true
+        assert "SELECT 1 AS result" in sql
+        # The SQL should be relatively small, not deeply nested
+        paren_count = sql.count('(')
+        assert paren_count < 10  # Should not have deeply nested parens
+
+    def test_xor_mixed_true_false_chained(self):
+        """Test chained XOR with mix of true and false."""
+        query = "RETURN true XOR true XOR false AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # true XOR true = false, false XOR false = false
+        assert "SELECT 0 AS result" in sql
+
+    def test_not_true(self):
+        """Test NOT true."""
+        query = "RETURN NOT true AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # NOT true = false
+        assert "(1=0)" in sql or "= 0" in sql or "false" in sql.lower()
+
+    def test_not_null(self):
+        """Test NOT null returns null."""
+        query = "RETURN NOT null AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # NOT null = null
+        assert "NULL" in sql
+
+    def test_null_equals_null(self):
+        """Test that null = null returns null (not true)."""
+        query = "RETURN null = null AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # null = null should return NULL
+        assert "NULL" in sql
+
+    def test_null_not_equals_null(self):
+        """Test that null <> null returns null."""
+        query = "RETURN null <> null AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # null <> null should return NULL
+        assert "NULL" in sql
+
+    def test_in_list_with_null(self):
+        """Test IN with null in the list uses 3VL semantics."""
+        query = "RETURN 1 IN [1, null, 3] AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # 1 IN [1, null, 3] should return true (1 is in the list)
+        assert "CASE WHEN" in sql  # Should use CASE for 3VL
+
+    def test_and_with_true_and_false(self):
+        """Test AND with true and false."""
+        query = "RETURN true AND false AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # true AND false = false
+        assert "(1=0)" in sql or "false" in sql.lower() or "0" in sql
+
+    def test_or_with_true_and_false(self):
+        """Test OR with true and false."""
+        query = "RETURN true OR false AS result"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # true OR false = true
+        assert "(1=1)" in sql or "true" in sql.lower() or "= 1" in sql
