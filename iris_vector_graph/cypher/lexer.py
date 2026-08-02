@@ -267,7 +267,11 @@ class Lexer:
                 self.cursor += 1
                 self.column += 1
                 if self.cursor < len(self.source):
-                    value += self.source[self.cursor]
+                    esc = self.source[self.cursor]
+                    value += {
+                        'n': '\n', 't': '\t', 'r': '\r',
+                        '\\': '\\', "'": "'", '"': '"', '`': '`',
+                    }.get(esc, esc)
             else:
                 value += self.source[self.cursor]
             self.cursor += 1

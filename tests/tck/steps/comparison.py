@@ -28,7 +28,9 @@ def _parse_tck_value(s: str) -> Any:
     if s == "false":
         return False
     if s.startswith("'") and s.endswith("'"):
-        return s[1:-1]
+        raw = s[1:-1]
+        # Process escape sequences: \n, \t, \r, \\
+        return raw.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace('\\\\', '\\')
     if s.startswith("[") and s.endswith("]"):
         inner = s[1:-1].strip()
         if not inner:
