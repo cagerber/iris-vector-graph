@@ -320,3 +320,247 @@ def test_with_rebind_preserves_scope():
     # Should translate without VariableTypeConflict error
     assert "Stage" in sql or "SELECT" in sql
     assert "property" in sql or "Stage" in sql  # property alias should be in result
+
+
+# ============================================================================
+# String Function Tests
+# ============================================================================
+
+class TestStringFunctions:
+    """Test Cypher string functions map correctly to IRIS SQL."""
+
+    def test_toUpper(self):
+        """Test toUpper() maps to UPPER()."""
+        query = "RETURN toUpper('hello') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "UPPER('hello')" in sql
+
+    def test_toLower(self):
+        """Test toLower() maps to LOWER()."""
+        query = "RETURN toLower('HELLO') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "LOWER('HELLO')" in sql
+
+    def test_trim(self):
+        """Test trim() maps to TRIM()."""
+        query = "RETURN trim('  hello  ') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "TRIM('  hello  ')" in sql
+
+    def test_lTrim(self):
+        """Test lTrim() maps to LTRIM()."""
+        query = "RETURN lTrim('  hello') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "LTRIM('  hello')" in sql
+
+    def test_rTrim(self):
+        """Test rTrim() maps to RTRIM()."""
+        query = "RETURN rTrim('hello  ') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "RTRIM('hello  ')" in sql
+
+    def test_substring_with_start(self):
+        """Test substring(s, start) with 0-based to 1-based conversion."""
+        query = "RETURN substring('hello', 0) AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # Cypher 0-based index should convert to 1-based IRIS SQL
+        assert "SUBSTRING('hello', (0) + 1)" in sql
+
+    def test_substring_with_length(self):
+        """Test substring(s, start, length) with index conversion."""
+        query = "RETURN substring('hello', 1, 3) AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # Start index 1 should become 2 (1+1), length stays the same
+        assert "SUBSTRING('hello', (1) + 1, 3)" in sql
+
+    def test_left(self):
+        """Test left(s, n) maps to LEFT()."""
+        query = "RETURN left('hello', 2) AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "LEFT('hello', 2)" in sql
+
+    def test_right(self):
+        """Test right(s, n) maps to RIGHT()."""
+        query = "RETURN right('hello', 2) AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "RIGHT('hello', 2)" in sql
+
+    def test_replace(self):
+        """Test replace(s, search, replacement) maps to REPLACE()."""
+        query = "RETURN replace('hello', 'l', 'r') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "REPLACE('hello', 'l', 'r')" in sql
+
+    def test_reverse(self):
+        """Test reverse(s) maps to REVERSE()."""
+        query = "RETURN reverse('hello') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "REVERSE('hello')" in sql
+
+    def test_split(self):
+        """Test split(s, delim) maps to STR_SPLIT()."""
+        query = "RETURN split('a,b,c', ',') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "STR_SPLIT('a,b,c', ',')" in sql
+
+    def test_size_on_string(self):
+        """Test size(s) on string maps to LENGTH()."""
+        query = "RETURN size('hello') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "LENGTH('hello')" in sql
+
+
+# ============================================================================
+# Type Conversion Function Tests
+# ============================================================================
+
+class TestTypeConversionFunctions:
+    """Test Cypher type conversion functions map correctly to IRIS SQL."""
+
+    def test_toString_number(self):
+        """Test toString(n) on number maps to CAST AS VARCHAR."""
+        query = "RETURN toString(42) AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "CAST(42 AS VARCHAR" in sql
+
+    def test_toString_boolean_literal(self):
+        """Test toString(bool) on boolean literal converts to string at compile time."""
+        query = "RETURN toString(true) AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "'true'" in sql or "true" in sql.lower()
+
+    def test_toInteger_numeric_string(self):
+        """Test toInteger(s) with ISNUMERIC guard."""
+        query = "RETURN toInteger('42') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "ISNUMERIC" in sql
+        assert "CAST('42' AS INTEGER)" in sql
+        assert "ELSE NULL END" in sql
+
+    def test_toFloat_numeric_string(self):
+        """Test toFloat(s) with ISNUMERIC guard."""
+        query = "RETURN toFloat('3.14') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "ISNUMERIC" in sql
+        assert "CAST('3.14' AS DOUBLE)" in sql
+        assert "ELSE NULL END" in sql
+
+    def test_toBoolean_string_true(self):
+        """Test toBoolean('true') with case-insensitive matching."""
+        query = "RETURN toBoolean('true') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "CASE WHEN" in sql
+        assert "'true'" in sql or "true" in sql.lower()
+        assert "THEN 1" in sql or "THEN 1" in sql
+        assert "THEN 0" in sql or "THEN 0" in sql
+        assert "NULL END" in sql
+
+    def test_toBoolean_numeric(self):
+        """Test toBoolean(expr) returns 1 or 0 for non-string literals."""
+        query = "RETURN toBoolean(1) AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        # Should return "1" for truthy, not a CASE expression
+        assert "1" in sql
+
+
+# ============================================================================
+# Utility Function Tests
+# ============================================================================
+
+class TestUtilityFunctions:
+    """Test Cypher utility functions map correctly to IRIS SQL."""
+
+    def test_coalesce_multiple_args(self):
+        """Test coalesce(a, b, c) maps to COALESCE()."""
+        query = "RETURN coalesce(null, null, 'default') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "COALESCE" in sql
+        assert "'default'" in sql
+
+    def test_nullIf_equal(self):
+        """Test nullIf(a, b) maps to NULLIF()."""
+        query = "RETURN nullIf('a', 'a') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "NULLIF('a', 'a')" in sql
+
+    def test_nullIf_not_equal(self):
+        """Test nullIf(a, b) returns a when a != b."""
+        query = "RETURN nullIf('a', 'b') AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "NULLIF('a', 'b')" in sql
+
+    def test_size_on_list(self):
+        """Test size(list) on list literal maps to JSON_ARRAYLENGTH()."""
+        query = "RETURN size([1, 2, 3]) AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "JSON_ARRAYLENGTH" in sql
+
+    def test_keys_on_map_literal(self):
+        """Test keys(map) on map literal returns JSON_ARRAY of keys."""
+        query = "RETURN keys({a: 1, b: 2}) AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "JSON_ARRAY" in sql
+
+
+# ============================================================================
+# Nested and Complex Expression Tests
+# ============================================================================
+
+class TestComplexStringExpressions:
+    """Test string functions in nested and complex expressions."""
+
+    def test_nested_string_functions(self):
+        """Test toUpper(substring(...)) nesting."""
+        query = "RETURN toUpper(substring('hello', 1, 3)) AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "UPPER" in sql
+        assert "SUBSTRING" in sql
+
+    def test_string_function_in_where(self):
+        """Test string function in WHERE clause."""
+        query = "MATCH (n) WHERE toUpper(n.name) = 'JOHN' RETURN n"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "UPPER" in sql
+        assert "WHERE" in sql
+
+    def test_type_conversion_in_arithmetic(self):
+        """Test type conversion in arithmetic expression."""
+        query = "RETURN toInteger('10') + 5 AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "ISNUMERIC" in sql or "CAST" in sql
+        assert "+" in sql
+
+    def test_coalesce_with_functions(self):
+        """Test coalesce with function results."""
+        query = "RETURN coalesce(null, toUpper('hello')) AS r"
+        result = translate_to_sql(parse_query(query))
+        sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
+        assert "COALESCE" in sql
+        assert "UPPER" in sql
