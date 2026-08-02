@@ -348,12 +348,17 @@ class IRISGraphStore:
             pre_captured_rows = None
             pre_captured_description = None
 
-            # When a transactional query has DELETE DML followed by a final
+            # When a transactional query has DELETE NODES followed by a final
             # SELECT, the SELECT must see the pre-delete snapshot.  Detect that
             # pattern and run the SELECT first so its results reflect the rows
             # that are about to be deleted.
+            # BUT: only for node deletions (DELETE FROM nodes), not property/label deletions
+            # (DELETE FROM rdf_props / rdf_labels).
+            import re as _del_re
             has_delete_dml = any(
-                isinstance(s, str) and "DELETE " in s.upper() and not s.startswith("__constraint_check_delete_connected__")
+                isinstance(s, str) and "DELETE " in s.upper() and
+                _del_re.search(r'FROM\s+(?:\w+\.)?nodes\s+', s, _del_re.IGNORECASE) and
+                not s.startswith("__constraint_check_delete_connected__")
                 for s in stmts
             )
             last_is_select = (

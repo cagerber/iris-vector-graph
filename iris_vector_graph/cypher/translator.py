@@ -3056,6 +3056,10 @@ def translate_set_clause(set_cl, context, metadata):
 
 
 def translate_remove_clause(remove, context, metadata):
+    # Track which properties are being REMOVED so we can exclude them from the final SELECT WHERE clause
+    if not hasattr(context, '_removed_properties'):
+        context._removed_properties = set()
+
     for item in remove.items:
         if isinstance(item.expression, ast.Variable) and item.label:
             alias = context.variable_aliases.get(item.expression.name)
@@ -3067,9 +3071,11 @@ def translate_remove_clause(remove, context, metadata):
                 subparams + [item.label],
             )
         elif isinstance(item.expression, ast.PropertyReference):
+            prop_name = item.expression.property_name
+            context._removed_properties.add(prop_name)
             alias, k = (
                 context.variable_aliases.get(item.expression.variable),
-                item.expression.property_name,
+                prop_name,
             )
             cte, subquery, subparams = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.node_id"
