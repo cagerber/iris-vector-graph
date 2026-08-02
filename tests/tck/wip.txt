@@ -2,13 +2,18 @@
 # Format: feature_file::Scenario: title
 # reason: <why this scenario is @wip>
 # Baseline: 1015/3897 passing as of v2.4.8 + TCK harness fixes (2026-08-01)
-# Current:  1613/3897 passing as of 2026-08-01 (session 201 round-6)
+# Current:  1771/3897 passing as of 2026-08-01 (session 201 round-7)
 #   Key fixes: 3VL boolean simplification (AND/OR null folding, CASE WHEN unwrapping),
 #              _expr_boolean CASE WHEN detection, comparison.py '1'/'0' bool coercion,
 #              XOR/NOT VARCHAR boolean coercion, reserved word ORDER BY alias,
 #              quantifier VARCHAR col + stringify numeric params (float/int JSON_TABLE),
 #              lexer hex/octal/leading-dot/exponent, CAST type-caching prevention,
-#              UNWIND+WITH stage CROSS JOIN preservation
+#              UNWIND+WITH stage CROSS JOIN preservation,
+#              temporal map/string construction (date/datetime/duration),
+#              parser IS NULL / IN / STARTS WITH precedence (oC_StringOrListOrNull),
+#              _expr_boolean CASE WHEN endswith fix,
+#              quantifier property access via JSON_VALUE for scalar vars,
+#              size() on scalar vars: runtime dispatch (JSON_ARRAYLENGTH vs LENGTH)
 
 # reason: IVG does not yet support this scenario
 features.clauses.call.Call1.Call1 - Basic procedure calling::Scenario: [10] In-query call to procedure should fail if too many explicit argument are given

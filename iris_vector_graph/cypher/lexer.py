@@ -268,10 +268,21 @@ class Lexer:
                 self.column += 1
                 if self.cursor < len(self.source):
                     esc = self.source[self.cursor]
-                    value += {
-                        'n': '\n', 't': '\t', 'r': '\r',
-                        '\\': '\\', "'": "'", '"': '"', '`': '`',
-                    }.get(esc, esc)
+                    if esc in ('u', 'U'):
+                        # Unicode escape \uXXXX or \UXXXXXXXX
+                        hex_len = 4 if esc == 'u' else 8
+                        hex_str = self.source[self.cursor + 1: self.cursor + 1 + hex_len]
+                        if len(hex_str) == hex_len and all(c in '0123456789abcdefABCDEF' for c in hex_str):
+                            value += chr(int(hex_str, 16))
+                            self.cursor += hex_len
+                            self.column += hex_len
+                        else:
+                            value += esc
+                    else:
+                        value += {
+                            'n': '\n', 't': '\t', 'r': '\r', 'b': '\b', 'f': '\f',
+                            '\\': '\\', "'": "'", '"': '"', '`': '`',
+                        }.get(esc, esc)
             else:
                 value += self.source[self.cursor]
             self.cursor += 1

@@ -4201,6 +4201,12 @@ def _expr_property_reference(expr, context, segment):
         return f"{p_alias}.val"
     if alias.startswith("e") and not alias.startswith("ES_"):
         return _expr_propref_edge_alias(expr, context, alias)
+    # Scalar variable from JSON_TABLE (list predicate / list comprehension): use JSON_VALUE
+    # not rdf_props join.  The column holds a JSON-serialised value, not a graph node id.
+    if expr.variable in context.scalar_variables:
+        col_ref = f"{alias}.{sanitize_identifier(expr.variable)}"
+        prop = expr.property_name.replace("'", "''")
+        return f"CASE WHEN ({col_ref}) IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{prop}') END"
     if expr.property_name in ("node_id", "id"):
         # Use node_id shortcut unless this variable's 'id' is a regular user property
         id_as_prop = getattr(context, '_id_as_property_vars', set())
@@ -5384,6 +5390,18 @@ def _expr_function_call(expr, context, segment):
     if fn == "properties":
         return properties_subquery(args[0] if args else "NULL")
 
+    # size(x) where x is a scalar list-predicate variable (VARCHAR holding either a
+    # plain string or a JSON-encoded list/map): dispatch at runtime by first character.
+    if fn == "size" and args and expr.arguments:
+        arg0 = expr.arguments[0]
+        if isinstance(arg0, ast.Variable) and arg0.name in context.scalar_variables:
+            col = args[0]
+            return (
+                f"CASE WHEN SUBSTRING({col}, 1, 1) IN ('[', '{{') "
+                f"THEN SQLUser.JSON_ARRAYLENGTH({col}) "
+                f"ELSE LENGTH({col}) END"
+            )
+
     result = _expr_fn_list_ops(fn, args, expr.arguments)
     if result is not None:
         return result
@@ -5437,7 +5455,10 @@ def _expr_boolean(expr, context, segment):
     # If translate_boolean_expression already returned a 1/0/NULL CASE expression
     # (e.g. for IN with null list elements, or 3VL AND/OR), don't wrap it again.
     # Also handle 3VL CASE WHEN patterns with (1=0)/(1=1) that need integer normalization.
-    if cond.startswith("CASE WHEN ") and " END" in cond:
+    # IMPORTANT: only skip re-wrapping when the CASE is the entire expression (ends with END).
+    # e.g. "CASE WHEN (0=1) THEN 1 ELSE 0 END IS NULL" must still be wrapped because IRIS
+    # rejects a bare CASE expression followed by IS NULL in a SELECT list.
+    if cond.startswith("CASE WHEN ") and cond.endswith(" END"):
         # Replace (1=0) and (1=1) sentinels with integers in the CASE WHEN body
         cond = cond.replace("THEN (1=0)", "THEN 0").replace("THEN (1=1)", "THEN 1")
         if " THEN 1 ELSE NULL END" in cond or " THEN 0 ELSE NULL END" in cond or " THEN 1 ELSE 0 END" in cond:

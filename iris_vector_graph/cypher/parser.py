@@ -1031,18 +1031,72 @@ class Parser:
                 )
         return base
 
-    def parse_comparison_expression(self) -> Any:
+    def parse_string_list_null_expression(self) -> Any:
+        """Parse additive expression with postfix IS NULL / IS NOT NULL / IN / string predicates.
+
+        In the openCypher grammar, IS NULL, IS NOT NULL, IN, STARTS WITH, ENDS WITH,
+        CONTAINS, and =~ (regex) bind tighter than binary comparison operators (= <> < > <= >=).
+        This method corresponds to oC_StringOrListOrNullOperatorExpression and must be used
+        for both the left and right operands of binary comparisons so that, e.g.,
+        ``false = true IS NULL`` parses as ``false = (true IS NULL)``.
+        """
         left = self.parse_additive_expression()
 
+        # Handle label predicate immediately (n:Label)
         if isinstance(left, ast.Variable) and self.peek().kind == TokenType.COLON:
             self.eat()
             label_tok = self.expect_label()
             return ast.LabelPredicate(variable=left.name, label=label_tok.value or "")
 
-        # Binary comparisons
+        # Postfix predicates — these bind tighter than binary comparisons.
+        # We loop to allow chaining (though most combinations are semantically odd,
+        # the grammar permits it and tests like ``x IS NOT NULL IN [...]`` can arise).
+        while True:
+            tok = self.peek()
+            match tok.kind:
+                case TokenType.IS:
+                    self.eat()  # IS
+                    if self.matches(TokenType.NOT):
+                        self.expect(TokenType.NULL)
+                        left = ast.BooleanExpression(
+                            ast.BooleanOperator.IS_NOT_NULL, [left]
+                        )
+                    else:
+                        self.expect(TokenType.NULL)
+                        left = ast.BooleanExpression(ast.BooleanOperator.IS_NULL, [left])
+                case TokenType.IN:
+                    self.eat()
+                    right = self.parse_additive_expression()
+                    left = ast.BooleanExpression(ast.BooleanOperator.IN, [left, right])
+                case TokenType.STARTS:
+                    self.eat()
+                    self.expect(TokenType.WITH_KW)
+                    right = self.parse_additive_expression()
+                    left = ast.BooleanExpression(ast.BooleanOperator.STARTS_WITH, [left, right])
+                case TokenType.ENDS:
+                    self.eat()
+                    self.expect(TokenType.WITH_KW)
+                    right = self.parse_additive_expression()
+                    left = ast.BooleanExpression(ast.BooleanOperator.ENDS_WITH, [left, right])
+                case TokenType.CONTAINS:
+                    self.eat()
+                    right = self.parse_additive_expression()
+                    left = ast.BooleanExpression(ast.BooleanOperator.CONTAINS, [left, right])
+                case TokenType.REGEX_MATCH:
+                    self.eat()
+                    right = self.parse_additive_expression()
+                    left = ast.BooleanExpression(ast.BooleanOperator.REGEX_MATCH, [left, right])
+                case _:
+                    break
+
+        return left
+
+    def parse_comparison_expression(self) -> Any:
+        left = self.parse_string_list_null_expression()
+
+        # Binary comparisons (= <> < > <= >=) — these bind LESS tightly than IS NULL / IN.
         tok = self.peek()
         op = None
-        already_consumed = False
         match tok.kind:
             case TokenType.EQUALS:
                 op = ast.BooleanOperator.EQUALS
@@ -1056,36 +1110,10 @@ class Parser:
                 op = ast.BooleanOperator.GREATER_THAN
             case TokenType.GREATER_THAN_OR_EQUAL:
                 op = ast.BooleanOperator.GREATER_THAN_OR_EQUAL
-            case TokenType.STARTS:
-                self.eat()  # STARTS
-                self.expect(TokenType.WITH_KW)
-                op = ast.BooleanOperator.STARTS_WITH
-                already_consumed = True
-            case TokenType.ENDS:
-                self.eat()  # ENDS
-                self.expect(TokenType.WITH_KW)
-                op = ast.BooleanOperator.ENDS_WITH
-                already_consumed = True
-            case TokenType.CONTAINS:
-                op = ast.BooleanOperator.CONTAINS
-            case TokenType.REGEX_MATCH:
-                op = ast.BooleanOperator.REGEX_MATCH
-            case TokenType.IN:
-                op = ast.BooleanOperator.IN
-            case TokenType.IS:
-                self.eat()  # IS
-                if self.matches(TokenType.NOT):
-                    self.expect(TokenType.NULL)
-                    return ast.BooleanExpression(
-                        ast.BooleanOperator.IS_NOT_NULL, [left]
-                    )
-                self.expect(TokenType.NULL)
-                return ast.BooleanExpression(ast.BooleanOperator.IS_NULL, [left])
 
         if op:
-            if not already_consumed:
-                self.eat()
-            right = self.parse_primary_expression()
+            self.eat()
+            right = self.parse_string_list_null_expression()
             return ast.BooleanExpression(op, [left, right])
 
         return left

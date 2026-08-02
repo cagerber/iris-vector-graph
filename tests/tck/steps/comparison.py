@@ -29,8 +29,46 @@ def _parse_tck_value(s: str) -> Any:
         return False
     if s.startswith("'") and s.endswith("'"):
         raw = s[1:-1]
-        # Process escape sequences: \n, \t, \r, \\
-        return raw.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace('\\\\', '\\')
+        # Process escape sequences: \\ first (must be before others), then \n, \t, \r, \'
+        result = []
+        i = 0
+        while i < len(raw):
+            if raw[i] == '\\' and i + 1 < len(raw):
+                nxt = raw[i + 1]
+                if nxt == '\\':
+                    result.append('\\')
+                    i += 2
+                elif nxt == 'n':
+                    result.append('\n')
+                    i += 2
+                elif nxt == 't':
+                    result.append('\t')
+                    i += 2
+                elif nxt == 'r':
+                    result.append('\r')
+                    i += 2
+                elif nxt == "'":
+                    result.append("'")
+                    i += 2
+                elif nxt == '"':
+                    result.append('"')
+                    i += 2
+                elif nxt in ('u', 'U') and i + 5 < len(raw):
+                    hex_len = 4 if nxt == 'u' else 8
+                    hex_str = raw[i + 2: i + 2 + hex_len]
+                    if len(hex_str) == hex_len and all(c in '0123456789abcdefABCDEF' for c in hex_str):
+                        result.append(chr(int(hex_str, 16)))
+                        i += 2 + hex_len
+                    else:
+                        result.append(raw[i])
+                        i += 1
+                else:
+                    result.append(raw[i])
+                    i += 1
+            else:
+                result.append(raw[i])
+                i += 1
+        return ''.join(result)
     if s.startswith("[") and s.endswith("]"):
         inner = s[1:-1].strip()
         if not inner:
