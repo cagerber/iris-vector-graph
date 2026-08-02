@@ -3713,6 +3713,16 @@ def _boolean_expr_logical(op, expr, context):
                 and operand.operator == ast.BooleanOperator.NOT
                 and len(operand.operands) == 1):
             return translate_boolean_expression(operand.operands[0], context)
+        # NOT (x IS NULL) → x IS NOT NULL (IRIS parses NOT x IS NULL as (NOT x) IS NULL)
+        if (isinstance(operand, ast.BooleanExpression)
+                and operand.operator == ast.BooleanOperator.IS_NULL):
+            left = translate_expression(operand.operands[0], context, segment="where")
+            return f"{left} IS NOT NULL"
+        # NOT (x IS NOT NULL) → x IS NULL
+        if (isinstance(operand, ast.BooleanExpression)
+                and operand.operator == ast.BooleanOperator.IS_NOT_NULL):
+            left = translate_expression(operand.operands[0], context, segment="where")
+            return f"{left} IS NULL"
         operand_sql = translate_boolean_expression(operand, context)
         operand_sql = _coerce_varchar_boolean_if_needed(operand, operand_sql, context)
         return f"NOT ({operand_sql})"
@@ -4396,9 +4406,9 @@ def _scalar_coalesce(fn, args, args_exprs):
 
 def _scalar_string(fn, args, args_exprs):
     if fn == "tointeger":
-        return f"CAST({args[0]} AS INTEGER)"
+        return f"CASE WHEN ISNUMERIC({args[0]}) = 1 THEN CAST({args[0]} AS INTEGER) ELSE NULL END"
     if fn == "tofloat":
-        return f"CAST({args[0]} AS DOUBLE)"
+        return f"CASE WHEN ISNUMERIC({args[0]}) = 1 THEN CAST({args[0]} AS DOUBLE) ELSE NULL END"
     if fn == "tostring":
         if args_exprs and isinstance(args_exprs[0], ast.Literal) and isinstance(args_exprs[0].value, bool):
             return f"'{'true' if args_exprs[0].value else 'false'}'"
@@ -4516,7 +4526,7 @@ def _scalar_statistical(fn, args, args_exprs, context):
 
 def _scalar_type_conversion(fn, args, args_exprs):
     if fn == "toboolean":
-        return f"CASE WHEN LOWER(CAST({args[0]} AS VARCHAR)) IN ('true','1','yes','y') THEN 1 ELSE 0 END"
+        return f"CASE WHEN LOWER(CAST({args[0]} AS VARCHAR)) IN ('true','1','yes','y') THEN 1 WHEN LOWER(CAST({args[0]} AS VARCHAR)) IN ('false','0','no','n') THEN 0 ELSE NULL END"
     return None
 
 
@@ -4785,6 +4795,12 @@ def _expr_function_call(expr, context, segment):
         "exists": "EXISTS",
         "toboolean": "CASE WHEN",
     }
+    # toString(bool_expr): boolean comparisons evaluate to 1/0 in SQL; map to 'true'/'false'
+    if fn == "tostring" and expr.arguments:
+        arg0 = expr.arguments[0]
+        if isinstance(arg0, ast.BooleanExpression):
+            cond = translate_boolean_expression(arg0, context)
+            return f"CASE WHEN ({cond}) THEN 'true' ELSE 'false' END"
     sql_fn = _CYPHER_FN_MAP.get(fn, fn.upper())
     scalar_result = _expr_scalar_function(fn, sql_fn, args, expr.arguments, expr, context, segment)
     if scalar_result is not None:
@@ -4852,7 +4868,23 @@ def translate_expression(expr, context, segment="select") -> str:
         return _expr_function_call(expr, context, segment)
     if isinstance(expr, ast.BooleanExpression):
         return _expr_boolean(expr, context, segment)
-    
+    if isinstance(expr, ast.LabelPredicate):
+        alias = context.variable_aliases.get(expr.variable)
+        node_col = f"{alias}.node_id" if alias else "node_id"
+        labels_tbl = _table("rdf_labels")
+        if segment in ("select", "inline", None):
+            safe_label = context.add_select_param(expr.label)
+            cond = (
+                f"EXISTS (SELECT 1 FROM {labels_tbl} _lp"
+                f" WHERE _lp.s = {node_col} AND _lp.label = {safe_label})"
+            )
+            return f"CASE WHEN ({cond}) THEN 1 ELSE 0 END"
+        safe_label = context.add_where_param(expr.label)
+        return (
+            f"EXISTS (SELECT 1 FROM {labels_tbl} _lp"
+            f" WHERE _lp.s = {node_col} AND _lp.label = {safe_label})"
+        )
+
     return "NULL"
 
 
@@ -4872,6 +4904,8 @@ def _safe_alias(a: str) -> str:
 
 def _expr_to_cypher_text(expr) -> str:
     """Return a Cypher-text representation of an expression for use as a column alias."""
+    if isinstance(expr, ast.LabelPredicate):
+        return f"({expr.variable}:{expr.label})"
     if isinstance(expr, ast.PropertyReference):
         return f"{expr.variable}.{expr.property_name}"
     if isinstance(expr, ast.Variable):

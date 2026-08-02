@@ -472,6 +472,15 @@ def normalise_iris_value(iris_val: Any, expected_tck_val: Any) -> Any:
                 return float(iris_val)
             except ValueError:
                 pass
+    if isinstance(expected_tck_val, dict):
+        if isinstance(iris_val, str):
+            import json
+            try:
+                parsed = json.loads(iris_val)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
     if isinstance(expected_tck_val, list):
         if isinstance(iris_val, (list, tuple)):
             result_list = list(iris_val)
