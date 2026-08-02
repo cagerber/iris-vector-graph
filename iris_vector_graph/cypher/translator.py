@@ -3957,11 +3957,44 @@ def _expr_arith(expr, context, segment):
     return f"({left} {op} {right})"
 
 
+def _infer_list_col_type(source_expr):
+    """Infer the best JSON_TABLE column type for a list source expression."""
+    if not (isinstance(source_expr, ast.Literal) and isinstance(source_expr.value, list)):
+        return "VARCHAR(1000)"
+    items = source_expr.value
+    has_float = False
+    has_int = False
+    for item in items:
+        if not isinstance(item, ast.Literal):
+            return "VARCHAR(1000)"
+        v = item.value
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            return "VARCHAR(1000)"
+        if isinstance(v, float):
+            has_float = True
+        elif isinstance(v, int):
+            has_int = True
+        else:
+            return "VARCHAR(1000)"
+    if has_float:
+        return "DOUBLE"
+    if has_int:
+        return "BIGINT"
+    return "VARCHAR(1000)"
+
+
 def _expr_list_predicate(expr, context, segment):
     source_sql = translate_expression(expr.source, context, segment=segment)
     var = sanitize_identifier(expr.variable)
     alias = context.next_alias("lp")
+    col_type = _infer_list_col_type(expr.source)
     context.variable_aliases[expr.variable] = f"{alias}"
+    if col_type in ("BIGINT", "DOUBLE"):
+        context.scalar_variables.discard(expr.variable)
+    else:
+        context.scalar_variables.add(expr.variable)
     # Use translate_boolean_expression for proper SQL predicates — IRIS requires
     # comparison predicates in WHERE, not CASE WHEN boolean expressions.
     if isinstance(expr.predicate, ast.BooleanExpression):
@@ -3969,6 +4002,7 @@ def _expr_list_predicate(expr, context, segment):
     else:
         pred_sql = translate_expression(expr.predicate, context, segment="where")
     del context.variable_aliases[expr.variable]
+    context.scalar_variables.discard(expr.variable)
     pred_with_alias = pred_sql
     for col in ("node_id", "p", "val", "label"):
         pred_with_alias = pred_with_alias.replace(
@@ -3986,10 +4020,10 @@ def _expr_list_predicate(expr, context, segment):
         where_pred = f"{where_pred} = 1"
     count_alias = context.next_alias("lpc")
     inner = (
-        f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} VARCHAR(1000) PATH '$')) {alias}"
+        f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {alias}"
         f" WHERE {where_pred}"
     )
-    all_count = f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} VARCHAR(1000) PATH '$')) {count_alias}"
+    all_count = f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {count_alias}"
     if expr.quantifier == "all":
         pred = f"(({inner}) = ({all_count}))"
     elif expr.quantifier == "none":
