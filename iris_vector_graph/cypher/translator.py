@@ -8195,25 +8195,49 @@ def _build_date_sql_from_dynamic_base(map_expr, context, target_fn="date"):
     # Collect all entries. We need a 'date', 'localtime', 'time', 'localdatetime',
     # or 'datetime' base key whose value is a Variable or FunctionCall.
     DATE_BASE_KEYS = ("date", "localtime", "time", "localdatetime", "datetime")
+    _DATE_ONLY_KEYS = ("date",)
+    _TIME_ONLY_KEYS = ("localtime", "time")
+    _DATETIME_KEYS = ("localdatetime", "datetime")
     base_key = None
     base_expr_node = None
+    # Also check for a secondary time base (e.g. {date: d, time: t})
+    time_base_key = None
+    time_base_expr_node = None
     for key in DATE_BASE_KEYS:
         if key in map_expr.entries:
-            base_expr_node = map_expr.entries[key]
-            if not isinstance(base_expr_node, ast.Literal):
-                base_key = key
-                break
+            expr_node = map_expr.entries[key]
+            if not isinstance(expr_node, ast.Literal):
+                if base_key is None:
+                    base_key = key
+                    base_expr_node = expr_node
+                elif time_base_key is None and key in _TIME_ONLY_KEYS and base_key in _DATE_ONLY_KEYS + _DATETIME_KEYS:
+                    # Secondary time base alongside a date/datetime base
+                    time_base_key = key
+                    time_base_expr_node = expr_node
+                elif time_base_key is None and key in _DATE_ONLY_KEYS + _DATETIME_KEYS and base_key in _TIME_ONLY_KEYS:
+                    # Secondary date base alongside a time base — swap order
+                    time_base_key = base_key
+                    time_base_expr_node = base_expr_node
+                    base_key = key
+                    base_expr_node = expr_node
 
     if base_key is None:
         return None  # no dynamic base found
 
     # Translate the base expression to SQL
     base_sql = translate_expression(base_expr_node, context, segment="select")
+    time_base_sql = (
+        translate_expression(time_base_expr_node, context, segment="select")
+        if time_base_expr_node is not None else None
+    )
 
     # Collect literal integer overrides (year, month, day, hour, minute, second, etc.)
     overrides = {}
+    _skip_keys = {base_key}
+    if time_base_key:
+        _skip_keys.add(time_base_key)
     for k, v in map_expr.entries.items():
-        if k == base_key:
+        if k in _skip_keys:
             continue
         if isinstance(v, ast.Literal) and isinstance(v.value, (int, float)):
             overrides[k] = int(v.value)
@@ -8307,32 +8331,28 @@ def _build_date_sql_from_dynamic_base(map_expr, context, target_fn="date"):
     # base_key in ("localtime", "time", "localdatetime", "datetime")
     # -------------------------------------------------------
     if target_fn in ("localtime", "time"):
-        # Time portion in the base string depends on base_key:
-        # - localtime / time: starts at position 1 (e.g. "12:31:14.645876123")
-        # - localdatetime / datetime: starts after 'T' (position 12)
-        if base_key in ("localtime", "time"):
-            # Strip timezone from time string: find position of +/- or Z
-            # Use SUBSTRING to get HH:MM:SS.frac part (up to 20 chars before tz)
-            time_base = f"REGEXP_REPLACE({base_sql}, '[Z+][^\\\\$]*$', '')"
-            time_base = base_sql  # simpler: base is already just time string
-            # Extract components:
-            # HH: positions 1-2, MM: positions 4-5, SS: 7-8, frac: 10+
-            h_pos, mi_pos, s_pos = 1, 4, 7
-        else:  # localdatetime / datetime: time starts at position 12 (after "YYYY-MM-DDT")
-            h_pos, mi_pos, s_pos = 12, 15, 18
-            time_base = base_sql
+        # Extract time-only portion from base: if base contains 'T' (datetime/localdatetime),
+        # take the part after 'T'; otherwise use the base as-is (time/localtime).
+        # This avoids having to know the actual runtime type of the base variable.
+        t_pos = f"CHARINDEX('T', {base_sql})"
+        time_base = f"CASE WHEN {t_pos} > 0 THEN SUBSTRING({base_sql}, {t_pos} + 1) ELSE {base_sql} END"
+        # Now positions are all relative to time-only string: HH:MM:SS...
+        h_pos, mi_pos, s_pos = 1, 4, 7
 
         h_sql = _int_field("hour", f"CAST(SUBSTRING({time_base}, {h_pos}, 2) AS INTEGER)")
         mi_sql = _int_field("minute", f"CAST(SUBSTRING({time_base}, {mi_pos}, 2) AS INTEGER)")
-        s_sql = _int_field("second", f"CAST(SUBSTRING({time_base}, {s_pos}, 2) AS INTEGER)")
+        # Seconds may not be present (e.g. '12:00+01:00' — position 6 is '+' not ':')
+        # Use CASE to return 0 when seconds are absent
+        _s_colon_check = f"SUBSTRING({time_base}, {s_pos - 1}, 1)"  # char before s_pos should be ':'
+        s_sql = _int_field(
+            "second",
+            f"CASE WHEN {_s_colon_check} = ':' THEN CAST(SUBSTRING({time_base}, {s_pos}, 2) AS INTEGER) ELSE 0 END"
+        )
 
-        # fractional second: position 20 onward (after "HH:MM:SS.")
-        # If base has a decimal, preserve it; overrides handled below
-        # For simplicity, keep fraction from base string (after the seconds part)
-        if base_key in ("localtime", "time"):
-            frac_start = s_pos + 3  # position after "SS." (e.g. 10)
-        else:
-            frac_start = s_pos + 3  # 21
+        # fractional second: position of '.' after seconds (s_pos + 2, since SS occupies s_pos..s_pos+1)
+        # frac_start points to the '.' character (1-based SQL position within time_base).
+        # We check if that character is '.' and if so, SUBSTRING from there includes the dot.
+        frac_start = s_pos + 2  # position of '.' (e.g. 9 for HH:MM:SS)
 
         # Build the result
         h_str = _padded(h_sql, 2)
@@ -8340,21 +8360,39 @@ def _build_date_sql_from_dynamic_base(map_expr, context, target_fn="date"):
         s_str = _padded(s_sql, 2)
 
         # Build time string with optional fractional seconds from base
-        # Check for fractional second overrides
-        _has_frac_override = any(k in overrides for k in ("second", "nanosecond", "microsecond", "millisecond"))
+        # Fractional part is replaced only when nanosecond/microsecond/millisecond is explicitly overridden.
+        # Overriding 'second' does NOT strip the fractional part — only replaces the seconds integer.
+        _has_frac_override = any(k in overrides for k in ("nanosecond", "microsecond", "millisecond"))
         if not _has_frac_override:
-            _frac_raw = f"SUBSTRING({time_base}, {frac_start})"
             if base_key in ("time", "datetime"):
-                # Strip tz suffix from fractional part
-                _frac_clean = f"REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE({_frac_raw}, '[+][0-9]{{2}}.*$', ''), '[-][0-9]{{2}}:.*$', ''), '[Z].*$', '')"
+                # Strip tz suffix from fractional part using CHARINDEX (IRIS has no REGEXP_REPLACE).
+                # Find the first tz character (Z, + or -) after position frac_start.
+                # Use SUBSTRING(s, frac_start, tz_pos - frac_start) when tz found, else SUBSTRING(s, frac_start).
+                _z_pos = f"CHARINDEX('Z', {time_base})"
+                _plus_pos = f"CHARINDEX('+', {time_base}, {frac_start})"
+                _minus_pos = f"CHARINDEX('-', {time_base}, {frac_start})"
+                # Best (earliest non-zero) tz position
+                _tz_pos = (
+                    f"CASE WHEN {_z_pos} >= {frac_start} AND ({_plus_pos} = 0 OR {_z_pos} <= {_plus_pos}) AND ({_minus_pos} = 0 OR {_z_pos} <= {_minus_pos}) THEN {_z_pos} "
+                    f"WHEN {_plus_pos} >= {frac_start} AND ({_minus_pos} = 0 OR {_plus_pos} <= {_minus_pos}) THEN {_plus_pos} "
+                    f"WHEN {_minus_pos} >= {frac_start} THEN {_minus_pos} "
+                    f"ELSE 0 END"
+                )
+                _frac_clean = (
+                    f"CASE WHEN ({_tz_pos}) > {frac_start} THEN SUBSTRING({time_base}, {frac_start}, ({_tz_pos}) - {frac_start}) "
+                    f"ELSE SUBSTRING({time_base}, {frac_start}) END"
+                )
             else:
-                _frac_clean = _frac_raw
+                _frac_clean = f"SUBSTRING({time_base}, {frac_start})"
+            # When no frac and seconds=0, omit the seconds component (openCypher: HH:MM is valid)
             time_str = (
                 f"(CASE WHEN SUBSTRING({time_base}, {frac_start}, 1) = '.' "
                 f"THEN {h_str} || ':' || {mi_str} || ':' || {s_str} || {_frac_clean} "
-                f"ELSE {h_str} || ':' || {mi_str} || ':' || {s_str} END)"
+                f"WHEN ({s_sql}) <> 0 THEN {h_str} || ':' || {mi_str} || ':' || {s_str} "
+                f"ELSE {h_str} || ':' || {mi_str} END)"
             )
         else:
+            # Override present — always include seconds
             time_str = f"({h_str} || ':' || {mi_str} || ':' || {s_str})"
 
         if target_fn == "time":
@@ -8400,9 +8438,71 @@ def _build_date_sql_from_dynamic_base(map_expr, context, target_fn="date"):
         d_str = _padded(day_sql, 2)
         date_part = f"({y_str} || '-' || {mo_str} || '-' || {d_str})"
 
-        # Time part: from base_key if it has time
-        if base_key in ("localdatetime", "datetime"):
-            # time starts at position 12 in base
+        # Time part: from time_base_sql if available, otherwise from base_key if it has time.
+        # Extract time-only part from whatever source contains time.
+        # Use CHARINDEX('T', ...) to dynamically handle both datetime/localdatetime (has T)
+        # and localtime/time (no T) without knowing the type at compile time.
+        def _time_src_sql(src_sql, src_key):
+            """Return SQL expression for the time-only portion of src_sql."""
+            if src_key in ("localtime", "time"):
+                return src_sql  # already time-only
+            elif src_key in ("localdatetime", "datetime"):
+                # time starts after 'T'
+                t_idx = f"CHARINDEX('T', {src_sql})"
+                return f"CASE WHEN {t_idx} > 0 THEN SUBSTRING({src_sql}, {t_idx} + 1) ELSE {src_sql} END"
+            else:
+                return None  # date-only, no time
+
+        if time_base_sql is not None:
+            # Separate date and time bases: use time_base_sql for time components
+            _tsrc = _time_src_sql(time_base_sql, time_base_key)
+            _tsrc_colon = f"SUBSTRING({_tsrc}, 6, 1)"  # ':' if seconds present
+            if "hour" in overrides:
+                h_str2 = _padded(str(overrides["hour"]), 2)
+            else:
+                h_str2 = _padded(f"CAST(SUBSTRING({_tsrc}, 1, 2) AS INTEGER)", 2)
+            if "minute" in overrides:
+                mi_str2 = _padded(str(overrides["minute"]), 2)
+            else:
+                mi_str2 = _padded(f"CAST(SUBSTRING({_tsrc}, 4, 2) AS INTEGER)", 2)
+            if "second" in overrides:
+                s_str2 = _padded(str(overrides["second"]), 2)
+            else:
+                s_str2 = _padded(
+                    f"CASE WHEN {_tsrc_colon} = ':' THEN CAST(SUBSTRING({_tsrc}, 7, 2) AS INTEGER) ELSE 0 END", 2
+                )
+            # Fractional seconds from time_base
+            _has_frac_ov2 = any(k in overrides for k in ("nanosecond", "microsecond", "millisecond"))
+            _frac_start2 = 9  # position of '.' in time-only string
+            if not _has_frac_ov2:
+                if time_base_key == "time":
+                    _z2 = f"CHARINDEX('Z', {_tsrc})"
+                    _p2 = f"CHARINDEX('+', {_tsrc}, {_frac_start2})"
+                    _m2 = f"CHARINDEX('-', {_tsrc}, {_frac_start2})"
+                    _tz2 = (
+                        f"CASE WHEN {_z2} >= {_frac_start2} AND ({_p2} = 0 OR {_z2} <= {_p2}) AND ({_m2} = 0 OR {_z2} <= {_m2}) THEN {_z2} "
+                        f"WHEN {_p2} >= {_frac_start2} AND ({_m2} = 0 OR {_p2} <= {_m2}) THEN {_p2} "
+                        f"WHEN {_m2} >= {_frac_start2} THEN {_m2} "
+                        f"ELSE 0 END"
+                    )
+                    _frac2 = (
+                        f"CASE WHEN ({_tz2}) > {_frac_start2} THEN SUBSTRING({_tsrc}, {_frac_start2}, ({_tz2}) - {_frac_start2}) "
+                        f"ELSE SUBSTRING({_tsrc}, {_frac_start2}) END"
+                    )
+                else:
+                    _frac2 = f"SUBSTRING({_tsrc}, {_frac_start2})"
+                time_part = (
+                    f"(CASE WHEN SUBSTRING({_tsrc}, {_frac_start2}, 1) = '.' "
+                    f"THEN {h_str2} || ':' || {mi_str2} || ':' || {s_str2} || {_frac2} "
+                    f"WHEN CASE WHEN {_tsrc_colon} = ':' THEN CAST(SUBSTRING({_tsrc}, 7, 2) AS INTEGER) ELSE 0 END <> 0 "
+                    f"THEN {h_str2} || ':' || {mi_str2} || ':' || {s_str2} "
+                    f"ELSE {h_str2} || ':' || {mi_str2} END)"
+                )
+            else:
+                time_part = f"({h_str2} || ':' || {mi_str2} || ':' || {s_str2})"
+        elif base_key in ("localdatetime", "datetime"):
+            # time starts at position 12 in base (after YYYY-MM-DDT)
+            # Positions: H=12-13, M=15-16, S=18-19, frac=20+
             if "hour" in overrides:
                 h_str2 = _padded(str(overrides["hour"]), 2)
             else:
@@ -8415,8 +8515,36 @@ def _build_date_sql_from_dynamic_base(map_expr, context, target_fn="date"):
                 s_str2 = _padded(str(overrides["second"]), 2)
             else:
                 s_str2 = _padded(f"CAST(SUBSTRING({base_sql}, 18, 2) AS INTEGER)", 2)
+            _has_frac_ov2 = any(k in overrides for k in ("nanosecond", "microsecond", "millisecond"))
+            _frac_pos2 = 20  # position of '.' in datetime string
+            if not _has_frac_ov2:
+                if base_key == "datetime":
+                    # Need to strip tz from frac
+                    _z2 = f"CHARINDEX('Z', {base_sql})"
+                    _p2 = f"CHARINDEX('+', {base_sql}, {_frac_pos2})"
+                    _m2 = f"CHARINDEX('-', {base_sql}, {_frac_pos2})"
+                    _tz2 = (
+                        f"CASE WHEN {_z2} >= {_frac_pos2} AND ({_p2} = 0 OR {_z2} <= {_p2}) AND ({_m2} = 0 OR {_z2} <= {_m2}) THEN {_z2} "
+                        f"WHEN {_p2} >= {_frac_pos2} AND ({_m2} = 0 OR {_p2} <= {_m2}) THEN {_p2} "
+                        f"WHEN {_m2} >= {_frac_pos2} THEN {_m2} "
+                        f"ELSE 0 END"
+                    )
+                    _frac2 = (
+                        f"CASE WHEN ({_tz2}) > {_frac_pos2} THEN SUBSTRING({base_sql}, {_frac_pos2}, ({_tz2}) - {_frac_pos2}) "
+                        f"ELSE SUBSTRING({base_sql}, {_frac_pos2}) END"
+                    )
+                else:
+                    _frac2 = f"SUBSTRING({base_sql}, {_frac_pos2})"
+                time_part = (
+                    f"(CASE WHEN SUBSTRING({base_sql}, {_frac_pos2}, 1) = '.' "
+                    f"THEN {h_str2} || ':' || {mi_str2} || ':' || {s_str2} || {_frac2} "
+                    f"ELSE {h_str2} || ':' || {mi_str2} || ':' || {s_str2} END)"
+                )
+            else:
+                time_part = f"({h_str2} || ':' || {mi_str2} || ':' || {s_str2})"
         elif base_key in ("localtime", "time"):
             # base starts with time
+            _tsrc_colon = f"SUBSTRING({base_sql}, 6, 1)"
             if "hour" in overrides:
                 h_str2 = _padded(str(overrides["hour"]), 2)
             else:
@@ -8429,12 +8557,13 @@ def _build_date_sql_from_dynamic_base(map_expr, context, target_fn="date"):
                 s_str2 = _padded(str(overrides["second"]), 2)
             else:
                 s_str2 = _padded(f"CAST(SUBSTRING({base_sql}, 7, 2) AS INTEGER)", 2)
+            time_part = f"({h_str2} || ':' || {mi_str2} || ':' || {s_str2})"
         else:  # date only
             h_str2 = _padded(str(overrides.get("hour", 0)), 2)
             mi_str2 = _padded(str(overrides.get("minute", 0)), 2)
             s_str2 = _padded(str(overrides.get("second", 0)), 2)
+            time_part = f"({h_str2} || ':' || {mi_str2} || ':' || {s_str2})"
 
-        time_part = f"({h_str2} || ':' || {mi_str2} || ':' || {s_str2})"
         result = f"({date_part} || 'T' || {time_part})"
 
         if target_fn == "datetime":
@@ -8442,9 +8571,31 @@ def _build_date_sql_from_dynamic_base(map_expr, context, target_fn="date"):
             if tz_override and isinstance(tz_override, str):
                 result += f" || '{_normalize_tz_str(tz_override)}'"
             elif base_key == "datetime":
-                # Preserve input timezone (after the base datetime string's time part)
-                # For simplicity, append Z
-                result += " || 'Z'"
+                # Preserve input timezone from datetime base
+                # Extract tz suffix: part after the time HH:MM[:SS...]
+                # Use CHARINDEX to find +/- or Z after position 20 (YYYY-MM-DDTHH:MM:SS)
+                _tz_src = base_sql
+                _zp = f"CHARINDEX('Z', {_tz_src})"
+                _pp = f"CHARINDEX('+', {_tz_src}, 20)"
+                _mp = f"CHARINDEX('-', {_tz_src}, 20)"
+                _tzp = (
+                    f"CASE WHEN {_zp} >= 20 AND ({_pp} = 0 OR {_zp} <= {_pp}) AND ({_mp} = 0 OR {_zp} <= {_mp}) THEN {_zp} "
+                    f"WHEN {_pp} >= 20 AND ({_mp} = 0 OR {_pp} <= {_mp}) THEN {_pp} "
+                    f"WHEN {_mp} >= 20 THEN {_mp} ELSE 0 END"
+                )
+                result += f" || CASE WHEN ({_tzp}) > 0 THEN SUBSTRING({_tz_src}, ({_tzp})) ELSE 'Z' END"
+            elif (base_key == "time" or time_base_key == "time"):
+                # Extract tz from the time variable (e.g., '12:31:14+01:00')
+                _t_src = time_base_sql if time_base_sql is not None else base_sql
+                _zp = f"CHARINDEX('Z', {_t_src})"
+                _pp = f"CHARINDEX('+', {_t_src}, 6)"
+                _mp = f"CHARINDEX('-', {_t_src}, 6)"
+                _tzp = (
+                    f"CASE WHEN {_zp} > 0 AND ({_pp} = 0 OR {_zp} <= {_pp}) AND ({_mp} = 0 OR {_zp} <= {_mp}) THEN {_zp} "
+                    f"WHEN {_pp} > 0 AND ({_mp} = 0 OR {_pp} <= {_mp}) THEN {_pp} "
+                    f"WHEN {_mp} > 0 THEN {_mp} ELSE 0 END"
+                )
+                result += f" || CASE WHEN ({_tzp}) > 0 THEN SUBSTRING({_t_src}, ({_tzp})) ELSE 'Z' END"
             else:
                 result += " || 'Z'"
             return f"({result})"
@@ -8704,19 +8855,28 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
         if args_exprs and isinstance(args_exprs[0], ast.Variable):
             base = args[0]
             # Extract time portion: if contains 'T', take substring after 'T'; else use as-is
-            # Strip trailing timezone for localtime output
-            time_expr = (
-                f"CASE WHEN CHARINDEX('T', {base}) > 0 "
-                f"THEN SUBSTRING({base}, CHARINDEX('T', {base}) + 1) "
-                f"ELSE {base} END"
-            )
+            t_idx = f"CHARINDEX('T', {base})"
+            time_part_sql = f"CASE WHEN {t_idx} > 0 THEN SUBSTRING({base}, {t_idx} + 1) ELSE {base} END"
             if fn == "localtime":
-                # Strip timezone suffix (Z or +/-HH:MM)
-                time_expr = (
-                    f"CASE WHEN CHARINDEX('T', {base}) > 0 "
-                    f"THEN REGEXP_REPLACE(SUBSTRING({base}, CHARINDEX('T', {base}) + 1), '[Z+\\-]\\d{{2}}.*$', '') "
-                    f"ELSE REGEXP_REPLACE({base}, '[Z+\\-]\\d{{2}}.*$', '') END"
+                # Strip timezone suffix (Z or +/-HH:MM) from extracted time part.
+                # IRIS has no REGEXP_REPLACE; use CHARINDEX to find tz boundary.
+                # Tz starts at first Z, + or - AFTER position 6 (after HH:MM:).
+                # Build: tz_pos = first of (CHARINDEX('+', time_part, 6), CHARINDEX('Z', time_part),
+                #                           CHARINDEX('-', time_part, 6)) that is > 0
+                # Then SUBSTRING(time_part, 1, tz_pos - 1) if tz_pos > 0 else time_part
+                tp = time_part_sql
+                _z = f"CHARINDEX('Z', {tp})"
+                _p = f"CHARINDEX('+', {tp}, 6)"
+                _m = f"CHARINDEX('-', {tp}, 6)"
+                _tz = (
+                    f"CASE WHEN {_z} > 0 AND ({_p} = 0 OR {_z} <= {_p}) AND ({_m} = 0 OR {_z} <= {_m}) THEN {_z} "
+                    f"WHEN {_p} > 0 AND ({_m} = 0 OR {_p} <= {_m}) THEN {_p} "
+                    f"WHEN {_m} > 0 THEN {_m} "
+                    f"ELSE 0 END"
                 )
+                time_expr = f"CASE WHEN ({_tz}) > 0 THEN SUBSTRING({tp}, 1, ({_tz}) - 1) ELSE {tp} END"
+            else:
+                time_expr = time_part_sql
             return time_expr
         return args[0]
     if fn == "duration":
