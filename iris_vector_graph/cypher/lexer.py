@@ -155,7 +155,25 @@ class Lexer:
                 case "*":
                     self._add_token(TokenType.STAR, char)
                 case "/":
-                    self._add_token(TokenType.SLASH, char)
+                    if self._peek() == "/":
+                        # Line comment — skip to end of line
+                        while self.cursor < len(self.source) and self.source[self.cursor] != "\n":
+                            self.cursor += 1
+                    elif self._peek() == "*":
+                        # Block comment /* ... */
+                        self.cursor += 1  # consume *
+                        while self.cursor < len(self.source) - 1:
+                            if self.source[self.cursor] == "*" and self.source[self.cursor + 1] == "/":
+                                self.cursor += 2
+                                break
+                            if self.source[self.cursor] == "\n":
+                                self.line += 1
+                                self.column = 1
+                            else:
+                                self.column += 1
+                            self.cursor += 1
+                    else:
+                        self._add_token(TokenType.SLASH, char)
                 case "%":
                     self._add_token(TokenType.PERCENT, char)
                 case "^":
