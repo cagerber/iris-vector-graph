@@ -557,25 +557,56 @@ def normalise_iris_value(iris_val: Any, expected_tck_val: Any) -> Any:
             try:
                 parsed = json.loads(iris_val)
                 if isinstance(parsed, dict):
-                    return parsed
-                # properties() returns [{key:..., value:...}] array — convert to dict
-                if isinstance(parsed, list) and all(
-                    isinstance(item, dict) and "key" in item and "value" in item
-                    for item in parsed
-                ):
+                    # Normalize string values to int/float when expected dict has numeric vals
+                    expected_dict = expected_tck_val
                     result = {}
-                    for item in parsed:
-                        k = item["key"]
-                        v = item["value"]
-                        # Try to parse numeric values
-                        try:
-                            result[k] = int(v)
-                        except (ValueError, TypeError):
+                    for k, v in parsed.items():
+                        exp_v = expected_dict.get(k)
+                        if isinstance(exp_v, int) and not isinstance(exp_v, bool) and isinstance(v, str):
+                            try:
+                                result[k] = int(v)
+                                continue
+                            except (ValueError, TypeError):
+                                pass
+                        if isinstance(exp_v, float) and isinstance(v, str):
                             try:
                                 result[k] = float(v)
+                                continue
                             except (ValueError, TypeError):
-                                result[k] = v
+                                pass
+                        result[k] = v
                     return result
+                # properties() returns [{key:..., value:...}] array (or list of
+                # JSON strings from IRIS double-encoding) — convert to dict
+                def _try_parse_item(item):
+                    if isinstance(item, dict):
+                        return item
+                    if isinstance(item, str):
+                        try:
+                            obj = json.loads(item)
+                            if isinstance(obj, dict):
+                                return obj
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                    return None
+                if isinstance(parsed, list):
+                    parsed_items = [_try_parse_item(x) for x in parsed]
+                    if parsed_items and all(
+                        item is not None and "key" in item and "value" in item
+                        for item in parsed_items
+                    ):
+                        result = {}
+                        for item in parsed_items:
+                            k = item["key"]
+                            v = item["value"]
+                            try:
+                                result[k] = int(v)
+                            except (ValueError, TypeError):
+                                try:
+                                    result[k] = float(v)
+                                except (ValueError, TypeError):
+                                    result[k] = v
+                        return result
             except (json.JSONDecodeError, ValueError):
                 pass
     if isinstance(expected_tck_val, list):

@@ -2916,6 +2916,39 @@ def translate_unwind_clause(unwind, context):
             context.from_clauses.append(union_sql)
         return
 
+    # Special case: UNWIND keys(nodeVar) AS alias — use direct JOIN to rdf_props.
+    # IRIS JSON_TABLE with a correlated subquery in the expression doesn't evaluate
+    # per-row for all rows when multiple outer rows exist; a direct JOIN fixes this.
+    if (
+        isinstance(unwind.expression, ast.FunctionCall)
+        and unwind.expression.function_name.lower() == "keys"
+        and unwind.expression.arguments
+        and isinstance(unwind.expression.arguments[0], ast.Variable)
+    ):
+        node_var = unwind.expression.arguments[0].name
+        node_alias = context.variable_aliases.get(node_var)
+        edge_stage_vars = getattr(context, "edge_stage_variables", set())
+        is_edge = (
+            node_alias is not None
+            and (
+                (node_alias.startswith("e") and not node_alias.startswith("Stage"))
+                or (node_alias.startswith("Stage") and node_var in edge_stage_vars)
+            )
+        )
+        if node_alias and not is_edge:
+            # Node variable: directly join rdf_props to enumerate keys.
+            # Use a subquery alias so the alias.unwind_alias column name is accessible.
+            rp_tbl = _table('rdf_props')
+            rp_inner = context.next_alias(prefix="rp")
+            # The join produces one row per (node, key); alias.key column exposed as unwind.alias
+            join_sql = (
+                f"(SELECT {rp_inner}.s, {rp_inner}.\"key\" AS {unwind.alias} "
+                f"FROM {rp_tbl} {rp_inner}) {alias} ON {alias}.s = {node_alias}.node_id"
+            )
+            context.join_clauses.append(f"JOIN {join_sql}")
+            context.variable_aliases[unwind.alias] = alias
+            return
+
     expr = translate_expression(unwind.expression, context, segment="join")
     if (
         isinstance(unwind.expression, ast.Variable)
@@ -3013,6 +3046,9 @@ def _create_node_literal(node, node_id_expr, context):
         )
     for k, v in node.properties.items():
         val = _create_resolve_prop_value(v, context)
+        # openCypher: setting a property to null removes it; skip null values in CREATE
+        if val is None and not isinstance(val, ast.Variable):
+            continue
         if isinstance(val, ast.Variable):
             # Property value is a bound stage variable — use SELECT-based INSERT
             var_alias = context.variable_aliases[val.name]
@@ -5001,27 +5037,27 @@ def _trp_undirected_edge(
         where_fwd = f"WHERE 1=1{pred_filter}"
         where_rev = f"WHERE s != o_id{pred_filter}"
         cte_body = (
-            f"  SELECT s AS _src, p AS _p, o_id AS _dst, s AS _os, o_id AS _oo\n"
+            f"  SELECT s AS _src, p AS _p, o_id AS _dst, s AS _os, o_id AS _oo, qualifiers\n"
             f"  FROM {edges_tbl}\n"
             f"  {where_fwd}\n"
             f"  UNION ALL\n"
-            f"  SELECT o_id AS _src, p AS _p, s AS _dst, s AS _os, o_id AS _oo\n"
+            f"  SELECT o_id AS _src, p AS _p, s AS _dst, s AS _os, o_id AS _oo, qualifiers\n"
             f"  FROM {edges_tbl}\n"
             f"  {where_rev}"
         )
     else:
         cte_body = (
-            f"  SELECT s AS _src, p AS _p, o_id AS _dst, s AS _os, o_id AS _oo\n"
+            f"  SELECT s AS _src, p AS _p, o_id AS _dst, s AS _os, o_id AS _oo, qualifiers\n"
             f"  FROM {edges_tbl}\n"
             f"  UNION ALL\n"
-            f"  SELECT o_id AS _src, p AS _p, s AS _dst, s AS _os, o_id AS _oo\n"
+            f"  SELECT o_id AS _src, p AS _p, s AS _dst, s AS _os, o_id AS _oo, qualifiers\n"
             f"  FROM {edges_tbl} WHERE s != o_id"
         )
 
     cte_name = f"_u{edge_alias}"
     if not hasattr(context, "cte_clauses"):
         context.cte_clauses = []
-    context.cte_clauses.append(f"{cte_name}(_src, _p, _dst, _os, _oo) AS (\n{cte_body}\n)")
+    context.cte_clauses.append(f"{cte_name}(_src, _p, _dst, _os, _oo, qualifiers) AS (\n{cte_body}\n)")
 
     # Join the CTE as the edge alias.
     target_on = f"{target_alias}.{t_col} = {edge_alias}._dst"
@@ -11590,8 +11626,8 @@ def _expr_fn_keys(args):
     if not args:
         return "JSON_ARRAY()"
     id_expr = args[0]
-    # Check if id_expr is a JSON object (starts with '{') - if so, use JSON_KEYS instead of rdf_props
-    # Otherwise, assume it's a node ID and look up rdf_props
+    # Node ID: look up rdf_props. Map literals are handled at compile time (line 11653).
+    # Relationship qualifiers (JSON object): use SQLUser.JSON_KEYS to extract key names.
     return (
         f"CASE WHEN ({id_expr}) IS NULL THEN NULL "
         f"WHEN SUBSTRING({id_expr}, 1, 1) = '{{' "
@@ -11762,6 +11798,17 @@ def _expr_function_call(expr, context, segment):
                 return f"CAST('{js}' AS VARCHAR({max(len(js)+1, 256)}))"
             if pval is None:
                 return "NULL"
+        # keys(r) on a relationship — use qualifiers JSON object directly
+        if isinstance(arg0, ast.Variable):
+            var_name = arg0.name
+            alias = context.variable_aliases.get(var_name, "")
+            edge_stage_vars = getattr(context, "edge_stage_variables", set())
+            is_current_edge = alias.startswith("e") and not alias.startswith("Stage")
+            is_stage_edge = alias.startswith("Stage") and var_name in edge_stage_vars
+            if is_current_edge:
+                return _expr_fn_keys([f"{alias}.qualifiers"])
+            if is_stage_edge:
+                return _expr_fn_keys([f"{alias}.{var_name}"])
 
     def _translate_arg(a):
         if isinstance(a, ast.Literal) and not isinstance(a.value, list):
@@ -11791,6 +11838,23 @@ def _expr_function_call(expr, context, segment):
             # properties(null) — return null
             if isinstance(arg0, ast.Literal) and arg0.value is None:
                 return "NULL"
+            # properties(<scalar>) or properties(<list>) — InvalidArgumentType
+            # List literals are Literal(value=list); scalars are Literal(value=non-None non-dict non-list)
+            if isinstance(arg0, ast.Literal) and arg0.value is not None:
+                raise SyntaxError(
+                    f"properties() does not support scalar or list argument (InvalidArgumentType)"
+                )
+            # properties(r) on a relationship — qualifiers is a JSON object; return it directly
+            if isinstance(arg0, ast.Variable):
+                var_name = arg0.name
+                alias = context.variable_aliases.get(var_name, "")
+                edge_stage_vars = getattr(context, "edge_stage_variables", set())
+                is_current_edge = alias.startswith("e") and not alias.startswith("Stage")
+                is_stage_edge = alias.startswith("Stage") and var_name in edge_stage_vars
+                if is_current_edge:
+                    return f"{alias}.qualifiers"
+                if is_stage_edge:
+                    return f"{alias}.{var_name}"
         return properties_subquery(args[0] if args else "NULL")
 
     # size(x) where x is a scalar list-predicate variable (VARCHAR holding either a
