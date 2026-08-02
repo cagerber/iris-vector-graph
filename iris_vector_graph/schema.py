@@ -665,7 +665,7 @@ CREATE OR REPLACE FUNCTION SQLUser.LIST_HEAD(j VARCHAR(32000)) RETURNS VARCHAR(4
 CREATE OR REPLACE FUNCTION SQLUser.LIST_LAST(j VARCHAR(32000)) RETURNS VARCHAR(4000) LANGUAGE OBJECTSCRIPT { Set arr = ##class(%Library.DynamicArray).%FromJSON(j), n = arr.%Size()-1, t = arr.%GetTypeOf(n) If t = "number" Quit arr.%Get(n) Quit arr.%GetSerialized(n) }
 """,
             """
-CREATE OR REPLACE FUNCTION SQLUser.STR_SPLIT(str VARCHAR(4000), delim VARCHAR(100)) RETURNS VARCHAR(32000) LANGUAGE OBJECTSCRIPT { Set out = ##class(%Library.DynamicArray).%New(), n = $LENGTH(str, delim) For i=1:1:n { Do out.%Push($PIECE(str, delim, i)) } Quit out.%ToJSON() }
+CREATE OR REPLACE FUNCTION SQLUser.STR_SPLIT(str VARCHAR(4000), delim VARCHAR(100)) RETURNS VARCHAR(32000) LANGUAGE OBJECTSCRIPT { Set out = ##class(%Library.DynamicArray).%New(), n = $LENGTH(str, delim), i = 1 While i <= n { Do out.%Push($PIECE(str, delim, i)), i = i + 1 } Quit out.%ToJSON() }
 """,
             f"""
 CREATE OR REPLACE PROCEDURE {table_schema}.kg_KNN_VEC(

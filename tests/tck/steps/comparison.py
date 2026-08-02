@@ -140,6 +140,14 @@ class TCKResultTable:
         # Remap IVG's expanded node columns (var_id, var_labels, var_props) → var
         remapped_rows = [_remap_node_columns(row, self.columns, actual_columns) for row in actual_rows]
 
+        # Case-insensitive column renaming: IVG lowercases function names (toInteger→tointeger).
+        # Build a lower→tck_col map so actual rows use TCK-canonical casing.
+        lower_to_tck = {col.lower(): col for col in self.columns}
+        remapped_rows = [
+            {lower_to_tck.get(k.lower(), k): v for k, v in row.items()}
+            for row in remapped_rows
+        ]
+
         # normalise actual values against expected types
         norm_actual = [
             _normalise_row_with_nodes(row, expected_rows[i] if i < len(expected_rows) else {}, self.columns)

@@ -5380,6 +5380,10 @@ def _expr_fn_range(args_exprs):
 
 def _expr_fn_list_ops(fn, args, args_exprs):
     if fn == "keys":
+        # For literal maps, extract keys at compile time
+        if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
+            keys = list(args_exprs[0].entries.keys())
+            return f"JSON_ARRAY({', '.join(repr(k) for k in keys)})"
         return _expr_fn_keys(args)
     if fn == "range":
         return _expr_fn_range(args_exprs)
