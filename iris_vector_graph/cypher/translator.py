@@ -5018,12 +5018,19 @@ def _expr_arith(expr, context, segment):
             return (isinstance(arg, ast.Literal) and isinstance(arg.value, str)) or \
                 isinstance(arg, ast.FunctionCall) and arg.function_name.startswith("__arith_+")
         def _is_list(arg):
-            return (isinstance(arg, ast.Literal) and isinstance(arg.value, list)) or \
-                (not isinstance(arg, ast.MapLiteral) and (
-                    isinstance(arg, ast.FunctionCall) and arg.function_name in (
-                        "collect", "nodes", "relationships", "labels", "keys", "range",
-                    )
-                ))
+            if isinstance(arg, ast.Literal) and isinstance(arg.value, list):
+                return True
+            if not isinstance(arg, ast.MapLiteral) and isinstance(arg, ast.FunctionCall) and arg.function_name in (
+                "collect", "nodes", "relationships", "labels", "keys", "range",
+            ):
+                return True
+            # Also check if it's a variable that references a Stage column (likely a list from WITH clause)
+            if isinstance(arg, ast.Variable) and arg.name in context.variable_aliases:
+                alias = context.variable_aliases[arg.name]
+                # Check if the alias is a Stage reference (e.g., "Stage0" or "Stage1.col_name")
+                if alias.startswith("Stage"):
+                    return True
+            return False
         left_str = _is_str(expr.arguments[0])
         right_str = _is_str(expr.arguments[1])
         if left_str or right_str:
@@ -5622,15 +5629,18 @@ def _expr_variable(expr, context, segment):
                 return context.add_join_param(v)
             return context.add_where_param(v)
         raise SyntaxError(f"Undefined variable: {expr.name}")
+    # For scalar variables from a Stage, qualify the column reference
+    if expr.name in context.scalar_variables:
+        if alias.startswith("Stage"):
+            return f"{alias}.{_safe_alias(expr.name)}"
+        if alias == "scalar" or alias in _PROC_CTE_ALIASES:
+            return expr.name
+        return f"{alias}.{expr.name}"
     if alias.startswith("Stage"):
         return _safe_alias(expr.name)
     if alias.startswith("e"):
         is_undirected = alias in getattr(context, "_undirected_aliases", set())
         return f"{alias}.{'_p' if is_undirected else 'p'}"
-    if expr.name in context.scalar_variables:
-        if alias == "scalar" or alias in _PROC_CTE_ALIASES:
-            return expr.name
-        return f"{alias}.{expr.name}"
     if alias in context.mapped_node_aliases:
         mapping = context.mapped_node_aliases[alias]
         return f"{alias}.{sanitize_identifier(mapping['id_column'])}"
