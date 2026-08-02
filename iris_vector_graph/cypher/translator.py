@@ -1664,10 +1664,10 @@ def _tts_finalize_context(cypher_query, context):
     elif context.stages and any_part_had_with and not last_part_had_with:
         # A prior part had WITH (produced stages), but the last part is a plain MATCH/RETURN.
         # _to_sql_init_part_from already set from_clauses to Stage{N} and the MATCH clauses
-        # added join_clauses correctly. Do NOT reset join_clauses — they are needed.
-        # Only clear select_items/where_conditions (already reset at part start).
+        # added join_clauses correctly. Do NOT reset join_clauses or where_conditions —
+        # they capture the post-WITH MATCH + WHERE filters (e.g. MATCH (b) WHERE a = b).
+        # Only clear select_items so translate_return_clause can rebuild them.
         context.select_items, context.select_params = [], []
-        context.where_conditions, context.where_params = [], []
 
     # UNWIND+CREATE+RETURN: foreach expansion created nodes/relationships and tracked their IDs.
     # Reset context to a fresh single-table scan filtered to the collected IDs.
@@ -4568,6 +4568,7 @@ def _expr_aggregation(expr, context, segment):
         elif v is False: arg = "0"
         elif v is None: arg = "NULL"
         elif isinstance(v, str): arg = f"'{v.replace(chr(39), chr(39)+chr(39))}'"
+        elif isinstance(v, list): arg = _expr_literal(expr.argument, context, segment)
         else: arg = str(v)
     else:
         arg = (
