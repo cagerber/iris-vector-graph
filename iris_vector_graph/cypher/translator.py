@@ -3748,6 +3748,7 @@ def _trp_directed_edge(
     source_alias, target_alias, edge_alias, s_col, t_col,
     edge_cond, target_on, jt, is_anon_source, is_new_target,
 ):
+    optional = jt == "LEFT OUTER JOIN"
     if rel.types:
         if len(rel.types) == 1:
             edge_cond += f" AND {edge_alias}.p = {context.add_join_param(rel.types[0])}"
@@ -3762,6 +3763,21 @@ def _trp_directed_edge(
         context.join_clauses.append(
             f"{jt} {_table('nodes')} {target_alias} ON {target_on}"
         )
+    elif optional:
+        # For OPTIONAL MATCH with an already-bound target, the equality check must not
+        # filter out rows where the OPTIONAL pattern failed entirely (LEFT OUTER JOIN
+        # returned null for the source of this edge).
+        # Guard: allow the row when source_alias.s_col IS NULL (meaning the prior pattern
+        # step didn't match at all).  This is different from "edge's far-end is null"
+        # which would allow partial matches (source found, but target not reachable).
+        if not is_anon_source and source_alias and not source_alias.startswith("Stage"):
+            null_guard = f"{source_alias}.{s_col} IS NULL"
+        else:
+            null_guard = None
+        if null_guard:
+            context.where_conditions.append(f"({target_on} OR {null_guard})")
+        else:
+            context.where_conditions.append(target_on)
     else:
         context.where_conditions.append(target_on)
 
@@ -4938,22 +4954,27 @@ def _expr_map_literal(expr, context, segment):
 def _expr_subscript(expr, context, segment):
     base = expr.expression
     idx = expr.index
-    if isinstance(base, ast.Variable) and isinstance(idx, ast.Variable):
+    if isinstance(base, ast.Variable):
         base_alias = context.variable_aliases.get(base.name, "")
-        idx_alias = context.variable_aliases.get(idx.name, "")
-        # If base is a stage scalar (list from WITH), use JSON_VALUE with dynamic path
-        if base_alias.startswith("Stage") or base.name in context.scalar_variables:
-            base_sql = translate_expression(base, context, segment=segment)
-            idx_sql = translate_expression(idx, context, segment=segment)
-            return f"SQLUser.JSON_VALUE({base_sql}, '$[' || CAST(({idx_sql}) AS VARCHAR) || ']')"
-        node_alias = base_alias
-        key_val = context.input_params.get(idx.name, idx.name)
-        p_alias = context.next_alias("dp")
-        node_ref = f"{node_alias}.node_id" if node_alias else "NULL"
-        context.join_clauses.append(
-            f"LEFT JOIN {_table('rdf_props')} {p_alias} ON {p_alias}.s = {node_ref} AND {p_alias}.\"key\" = {context.add_join_param(key_val)}"
-        )
-        return f"{p_alias}.val"
+        is_scalar = base_alias.startswith("Stage") or base.name in context.scalar_variables
+        if not is_scalar:
+            # base is a node variable — subscript is a property key expression
+            node_alias = base_alias
+            node_ref = f"{node_alias}.node_id" if node_alias else "NULL"
+            p_alias = context.next_alias("dp")
+            if isinstance(idx, ast.Variable):
+                key_val = context.input_params.get(idx.name, idx.name)
+                key_sql = context.add_join_param(key_val)
+            else:
+                key_sql = translate_expression(idx, context, segment="join")
+            context.join_clauses.append(
+                f"LEFT JOIN {_table('rdf_props')} {p_alias} ON {p_alias}.s = {node_ref} AND {p_alias}.\"key\" = {key_sql}"
+            )
+            return f"{p_alias}.val"
+        # Scalar variable — use JSON array index or key lookup
+        base_sql = translate_expression(base, context, segment=segment)
+        idx_sql = translate_expression(idx, context, segment=segment)
+        return f"SQLUser.JSON_VALUE({base_sql}, '$[' || CAST(({idx_sql}) AS VARCHAR) || ']')"
     base_sql = translate_expression(base, context, segment=segment)
     if isinstance(idx, ast.Literal) and isinstance(idx.value, int):
         i = idx.value

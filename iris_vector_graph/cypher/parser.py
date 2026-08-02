@@ -1076,7 +1076,14 @@ class Parser:
             self.eat()
             exp = self.parse_power_expression()
             return ast.FunctionCall(function_name="__arith_^", arguments=[base, exp])
-        while self.peek().kind in (TokenType.LBRACKET, TokenType.DOT):
+        while self.peek().kind in (TokenType.LBRACKET, TokenType.DOT) and not (
+            # DOT followed by FLOAT_LITERAL starting with '.' is the second half of
+            # a slice range (e.g. n..m tokenized as INTEGER + DOT + FLOAT('.m')).
+            # Do NOT consume it as a property access here.
+            self.peek().kind == TokenType.DOT
+            and self.lexer.peek_ahead(1).kind == TokenType.FLOAT_LITERAL
+            and self.lexer.peek_ahead(1).value.startswith(".")
+        ):
             if self.peek().kind == TokenType.LBRACKET:
                 self.eat()
                 _nxt_is_dotdot = (
@@ -1085,29 +1092,42 @@ class Parser:
                 if _nxt_is_dotdot:
                     self.eat()
                     self.eat()
-                    end = self.parse_primary_expression()
+                    end = self.parse_additive_expression()
                     self.expect(TokenType.RBRACKET)
                     base = ast.SliceExpression(expression=base, start=ast.Literal(0), end=end)
                 else:
-                    first = self.parse_primary_expression()
+                    # Parse the index/start as a full additive expression (e.g. 'nam'+'e', a+1)
+                    # but not a comparison/boolean expression which would gobble up too much.
+                    first = self.parse_additive_expression()
                     _nxt_is_dotdot2 = (
                         self.peek().kind == TokenType.DOT and self.lexer.peek_ahead(1).kind == TokenType.DOT
                     )
-                    # Handle tokenization of N..M as INTEGER DOT FLOAT(.M) — the lexer
-                    # emits '.M' as a FLOAT_LITERAL, not DOT+INTEGER.
+                    # Handle tokenization of N..M:
+                    # - '1..3' → INTEGER(1) + DOT + FLOAT('.3') — three tokens
+                    # - Sometimes: INTEGER(1) + FLOAT('.3') — two tokens
                     _nxt_is_float_dotdot = (
-                        self.peek().kind == TokenType.DOT
-                        and self.lexer.peek_ahead(1).kind == TokenType.FLOAT_LITERAL
-                        and self.lexer.peek_ahead(1).value.startswith(".")
+                        # Pattern: DOT + FLOAT('.M')
+                        (
+                            self.peek().kind == TokenType.DOT
+                            and self.lexer.peek_ahead(1).kind == TokenType.FLOAT_LITERAL
+                            and self.lexer.peek_ahead(1).value.startswith(".")
+                        )
+                        or
+                        # Pattern: FLOAT('.M') directly
+                        (
+                            self.peek().kind == TokenType.FLOAT_LITERAL
+                            and self.peek().value.startswith(".")
+                        )
                     )
                     if _nxt_is_dotdot2:
                         self.eat()
                         self.eat()
-                        second = self.parse_primary_expression()
+                        second = self.parse_additive_expression()
                         self.expect(TokenType.RBRACKET)
                         base = ast.SliceExpression(expression=base, start=first, end=second)
                     elif _nxt_is_float_dotdot:
-                        self.eat()  # consume the DOT
+                        if self.peek().kind == TokenType.DOT:
+                            self.eat()  # consume the DOT
                         float_tok = self.eat()  # consume .M as FLOAT_LITERAL
                         end_val = int(float_tok.value.lstrip("."))
                         self.expect(TokenType.RBRACKET)
