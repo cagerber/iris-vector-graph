@@ -2377,13 +2377,126 @@ def translate_to_sql(
     return _tts_select_result(cypher_query, context, metadata, order_by_items)
 
 
+def _collect_var_names(expr) -> set:
+    """Collect all variable names referenced in an expression (including inside prop refs)."""
+    if isinstance(expr, ast.Variable):
+        return {expr.name}
+    if isinstance(expr, ast.PropertyReference):
+        return {expr.variable}
+    if isinstance(expr, ast.FunctionCall):
+        result = set()
+        for arg in expr.arguments:
+            result |= _collect_var_names(arg)
+        return result
+    if isinstance(expr, ast.BooleanExpression):
+        result = set()
+        for op in expr.operands:
+            result |= _collect_var_names(op)
+        return result
+    if isinstance(expr, ast.AggregationFunction) and expr.argument:
+        return _collect_var_names(expr.argument)
+    return set()
+
+
 def preprocess_order_by(query: ast.CypherQuery, context: TranslationContext) -> list:
     if not query.order_by_clause:
         return []
     items = []
     alias_to_sql: dict = {}
     if query.return_clause:
-        for ret_item in query.return_clause.items:
+        ret = query.return_clause
+        ret_has_agg = any(_contains_aggregation(i.expression) for i in ret.items)
+
+        # InvalidAggregation: ORDER BY uses aggregation but RETURN has none
+        for ob_item in query.order_by_clause.items:
+            if _contains_aggregation(ob_item.expression):
+                if not ret_has_agg:
+                    raise SyntaxError(
+                        "InvalidAggregation: Cannot use aggregation function in ORDER BY "
+                        "unless it is also used in the projection."
+                    )
+
+        # AmbiguousAggregationExpression in ORDER BY: ORDER BY contains mixed agg+non-agg
+        # where the non-agg part is not a simple grouping key returned standalone.
+        if ret_has_agg:
+            non_agg_ret_items = [i for i in ret.items if not _contains_aggregation(i.expression)]
+            grouping_exprs_ob = set()
+            for gi in non_agg_ret_items:
+                grouping_exprs_ob.add(_expr_to_cypher_text(gi.expression))
+                if gi.alias:
+                    grouping_exprs_ob.add(gi.alias)
+            for ob_item in query.order_by_clause.items:
+                if not _contains_aggregation(ob_item.expression):
+                    continue
+                if isinstance(ob_item.expression, ast.AggregationFunction):
+                    continue  # pure aggregate ORDER BY — OK
+                # Mixed: contains agg and non-agg var refs
+                ambiguous_parts = _collect_non_agg_var_refs(ob_item.expression)
+                for part in ambiguous_parts:
+                    part_text = _expr_to_cypher_text(part)
+                    if not part_text:
+                        continue
+                    # Skip query parameter variables — they are constants, not bound variables
+                    if isinstance(part, ast.Variable) and part.name in context.input_params:
+                        continue
+                    # Complex non-simple expressions (arithmetic etc.) mixed with aggregation
+                    # are always ambiguous in ORDER BY, even if they are grouping keys.
+                    is_simple = isinstance(part, (ast.Variable, ast.PropertyReference))
+                    if not is_simple:
+                        raise SyntaxError(
+                            f"AmbiguousAggregationExpression: An expression using aggregation "
+                            f"and a non-aggregate is ambiguous in ORDER BY."
+                        )
+                    if part_text not in grouping_exprs_ob:
+                        raise SyntaxError(
+                            f"AmbiguousAggregationExpression: An expression using aggregation "
+                            f"and a non-aggregate is ambiguous in ORDER BY."
+                        )
+
+        # UndefinedVariable in ORDER BY after DISTINCT: only returned expressions are available
+        if ret.distinct:
+            returned_texts = set()
+            for ri in ret.items:
+                returned_texts.add(_expr_to_cypher_text(ri.expression))
+                if ri.alias:
+                    returned_texts.add(ri.alias)
+            for ob_item in query.order_by_clause.items:
+                ob_text = _expr_to_cypher_text(ob_item.expression)
+                if ob_text not in returned_texts:
+                    # Check if any variable in the ORDER BY expression is not in the returned set
+                    ob_vars = _collect_var_names(ob_item.expression)
+                    ret_vars: set = set()
+                    for ri in ret.items:
+                        ret_vars |= _collect_var_names(ri.expression)
+                    undefined = ob_vars - ret_vars
+                    # UndefinedVariable if ORDER BY references vars not in the RETURN projection
+                    if undefined and ob_vars:
+                        raise SyntaxError(
+                            f"UndefinedVariable: In a WITH/RETURN with DISTINCT or aggregation, "
+                            f"the ORDER BY must refer to variables returned in the projection: "
+                            f"{undefined}"
+                        )
+
+        # UndefinedVariable in ORDER BY with aggregation: ORDER BY variable must be in RETURN
+        if ret_has_agg:
+            # Build the set of variables available after aggregation (grouping keys + agg aliases)
+            ret_vars_available: set = set()
+            for ri in ret.items:
+                if ri.alias:
+                    ret_vars_available.add(ri.alias)
+                ret_vars_available |= _collect_var_names(ri.expression)
+            for ob_item in query.order_by_clause.items:
+                ob_vars = _collect_var_names(ob_item.expression)
+                # For non-aggregate ORDER BY expressions, check variables are in grouping keys
+                if not _contains_aggregation(ob_item.expression):
+                    undefined_in_ob = ob_vars - ret_vars_available
+                    if undefined_in_ob:
+                        raise SyntaxError(
+                            f"UndefinedVariable: In an aggregating query, ORDER BY must refer "
+                            f"to variables returned in the projection: {undefined_in_ob}"
+                        )
+
+        for ret_item in ret.items:
             if ret_item.alias:
                 saved_select = list(context.select_params)
                 saved_where = list(context.where_params)
@@ -6264,8 +6377,85 @@ def _expr_arith(expr, context, segment):
 
 
 
+def _lp_predicate_uses_arithmetic_on_var(predicate, var_name):
+    """Return True if any arithmetic function (__arith_%) is applied directly to var_name."""
+    if isinstance(predicate, ast.FunctionCall):
+        if (predicate.function_name.startswith("__arith_")
+                and predicate.function_name != "__arith_+"):
+            for arg in predicate.arguments:
+                if isinstance(arg, ast.Variable) and arg.name == var_name:
+                    return True
+        for arg in predicate.arguments:
+            if _lp_predicate_uses_arithmetic_on_var(arg, var_name):
+                return True
+    elif isinstance(predicate, ast.BooleanExpression):
+        for op in predicate.operands:
+            if _lp_predicate_uses_arithmetic_on_var(op, var_name):
+                return True
+    return False
+
+
+def _lp_source_all_non_numeric(source):
+    """Return True if source is a literal list and all elements are strings or booleans."""
+    if not (isinstance(source, ast.Literal) and isinstance(source.value, list)):
+        return False
+    for item in source.value:
+        if not isinstance(item, ast.Literal):
+            return False
+        v = item.value
+        if isinstance(v, bool) or isinstance(v, str):
+            continue
+        return False  # int or float — numeric
+    return True
+
+
+def _lp_needs_null_sentinel(source):
+    """Return True if source is a single-element literal list whose sole element is a
+    numeric literal list — triggers an IRIS JSON_TABLE expansion bug where
+    CAST('[[1,2,3]]' AS VARCHAR) expands to rows (1), (2), (3) instead of ('[1,2,3]').
+    Workaround: append null to the serialised JSON array.
+    """
+    if not (isinstance(source, ast.Literal) and isinstance(source.value, list)
+            and len(source.value) == 1):
+        return False
+    inner = source.value[0]
+    if not (isinstance(inner, ast.Literal) and isinstance(inner.value, list)):
+        return False
+    # Only numeric inner arrays trigger the IRIS bug.
+    for item in inner.value:
+        if isinstance(item, ast.Literal) and isinstance(item.value, (int, float)) and not isinstance(item.value, bool):
+            return True
+    return False
+
+
 def _expr_list_predicate(expr, context, segment):
-    source_sql = translate_expression(expr.source, context, segment=segment)
+    # --- Static type check: raise SyntaxError for invalid argument types ---
+    # Cypher semantics: arithmetic operators (%, *, -, /) on string/boolean list elements
+    # are invalid at compile time (InvalidArgumentType).
+    if (_lp_source_all_non_numeric(expr.source)
+            and _lp_predicate_uses_arithmetic_on_var(expr.predicate, expr.variable)):
+        raise SyntaxError(
+            f"Type mismatch: {expr.quantifier}() predicate uses arithmetic on "
+            f"non-numeric list elements (InvalidArgumentType)"
+        )
+
+    # --- IRIS JSON_TABLE null-sentinel workaround ---
+    # IRIS expands CAST('[[1,2,3]]' AS VARCHAR) to scalar rows (1,2,3) instead of
+    # one row ('[1,2,3]') when the outer array contains exactly one numeric inner array.
+    # Fix: append null to the serialised JSON so IRIS sees 2 elements and preserves
+    # the inner array as a string.  The null row is excluded via IS NOT NULL filter.
+    null_sentinel = _lp_needs_null_sentinel(expr.source)
+    if null_sentinel:
+        # Reserialise with appended null sentinel
+        from iris_vector_graph.cypher.translator import _literal_to_python as _ltp
+        inner_py = _ltp(expr.source)
+        inner_py.append(None)
+        _sentinel_json = json.dumps(inner_py)
+        _sentinel_size = max(len(_sentinel_json) + 1, 256)
+        source_sql = f"CAST('{_sentinel_json.replace(chr(39), chr(39)+chr(39))}' AS VARCHAR({_sentinel_size}))"
+    else:
+        source_sql = translate_expression(expr.source, context, segment=segment)
+
     var = sanitize_identifier(expr.variable)
     alias = context.next_alias("lp")
     # Always use VARCHAR(1000) — IRIS JSON_TABLE BIGINT/DOUBLE columns fail to
@@ -6314,82 +6504,71 @@ def _expr_list_predicate(expr, context, segment):
         # Nested quantifier: a CASE WHEN 0/1/NULL expression used as a WHERE predicate.
         # IRIS requires a comparison predicate, not a bare CASE WHEN. Add = 1 to coerce.
         where_pred = f"({where_pred} = 1)"
+    elif where_pred.startswith("(SELECT ") and where_pred.endswith(")"):
+        # Aggregation-style nested quantifier: (SELECT CASE WHEN ... END FROM ...) returns
+        # 0/1/NULL scalar. IRIS requires a comparison operator in CASE WHEN conditions.
+        where_pred = f"{where_pred} = 1"
     elif where_pred and not any(op in where_pred for op in ("=", "<", ">", " IN ", " IS ", " LIKE ", " NOT ")):
         # Bare column reference (e.g. lp0.x) — treat as truth test
         where_pred = f"{where_pred} = 1"
-    satisfy_sql = (
-        f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {alias}"
-        f" WHERE {where_pred}"
-    )
-    # 3VL (three-valued logic): use definite-fail count instead of null-element count.
-    # Counting null *elements* is wrong when the predicate handles nulls definitively
-    # (e.g., x IS NULL evaluates to TRUE for null elements — not uncertain).
+
+    # --- Aggregation approach ---
+    # Use a single JSON_TABLE scan with SUM aggregation to compute satisfy, dfail, and
+    # total counts.  This avoids duplicate alias names across sibling COUNT(*) subqueries
+    # which causes IRIS to crash with <LIST>LoadTableFunction when the predicate itself
+    # contains nested JSON_TABLE references (e.g. nested quantifier expressions).
     #
-    # Instead we count elements where the predicate is definitely FALSE using
-    #   NOT (where_pred)
-    # SQL semantics: NOT TRUE=FALSE, NOT FALSE=TRUE, NOT NULL=NULL.
-    # So "WHERE NOT (pred)" counts only definite-false rows; null elements where pred
-    # is uncertain (NULL) are excluded by SQL's three-valued WHERE semantics.
+    # 3VL (three-valued logic) semantics preserved:
+    #   sat   = COUNT of rows where predicate is TRUE
+    #   dfail = COUNT of rows where predicate is FALSE (NOT pred is TRUE)
+    #   tot   = COUNT of all rows (null sentinel excluded if applicable)
     #
-    # uncertain = total - satisfy - definite_fail   (all rows are satisfy | dfail | uncertain)
+    # uncertain = tot - sat - dfail  (rows where predicate is NULL)
     #
-    # - any:    true  if satisfy > 0;
-    #           null  if satisfy = 0 AND uncertain > 0;
-    #           false otherwise
-    # - none:   false if satisfy > 0;
-    #           null  if satisfy = 0 AND uncertain > 0;
-    #           true  if satisfy = 0 AND uncertain = 0
-    # - all:    false if definite_fail > 0;
-    #           null  if definite_fail = 0 AND uncertain > 0;
-    #           true  if definite_fail = 0 AND uncertain = 0
-    # - single: false if satisfy >= 2;
-    #           true  if satisfy = 1 AND uncertain = 0;
-    #           null  if uncertain > 0 AND satisfy <= 1;
-    #           false if satisfy = 0 AND uncertain = 0
-    dfail_alias = context.next_alias("lpd")
-    where_pred_dfail = where_pred.replace(f"{alias}.", f"{dfail_alias}.")
-    dfail_sql = (
-        f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {dfail_alias}"
-        f" WHERE NOT ({where_pred_dfail})"
+    # - any:    true  if sat > 0;  null if sat=0 AND uncertain>0;  false otherwise
+    # - none:   false if sat > 0;  null if sat=0 AND uncertain>0;  true  otherwise
+    # - all:    false if dfail>0;  null if dfail=0 AND uncertain>0; true otherwise
+    # - single: false if sat>=2;   true if sat=1 AND uncertain=0;
+    #           null if uncertain>0 AND sat<=1; false otherwise
+    stats_alias = context.next_alias("lps")
+    # For null-sentinel case, filter out the sentinel row from aggregate counts.
+    sentinel_filter = f" WHERE {alias}.{var} IS NOT NULL" if null_sentinel else ""
+    agg_sql = (
+        f"(SELECT SUM(CASE WHEN {where_pred} THEN 1 ELSE 0 END) AS sat,"
+        f" SUM(CASE WHEN NOT ({where_pred}) THEN 1 ELSE 0 END) AS dfail,"
+        f" COUNT(*) AS tot"
+        f" FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {alias}"
+        f"{sentinel_filter}) {stats_alias}"
     )
-    total_alias = context.next_alias("lpt")
-    total_sql = (
-        f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {total_alias}"
-    )
-    # uncertain = total - satisfy - dfail (expressed as inline arithmetic of three subqueries)
-    uncertain_expr = f"(({total_sql}) - ({satisfy_sql}) - ({dfail_sql}))"
+    sat_ref = f"{stats_alias}.sat"
+    dfail_ref = f"{stats_alias}.dfail"
+    tot_ref = f"{stats_alias}.tot"
+    uncertain_expr = f"({tot_ref} - {sat_ref} - {dfail_ref})"
+
     if expr.quantifier == "all":
         return (
-            f"CASE WHEN (({dfail_sql}) > 0) THEN 0"
+            f"(SELECT CASE WHEN ({dfail_ref} > 0) THEN 0"
             f" WHEN ({uncertain_expr} > 0) THEN NULL"
-            f" ELSE 1 END"
+            f" ELSE 1 END FROM {agg_sql})"
         )
     elif expr.quantifier == "none":
         return (
-            f"CASE WHEN (({satisfy_sql}) > 0) THEN 0"
+            f"(SELECT CASE WHEN ({sat_ref} > 0) THEN 0"
             f" WHEN ({uncertain_expr} > 0) THEN NULL"
-            f" ELSE 1 END"
+            f" ELSE 1 END FROM {agg_sql})"
         )
     elif expr.quantifier == "single":
-        # For the >= 2 check, reuse dfail_alias won't work (already used in dfail_sql),
-        # so generate a new alias for the second satisfy count.
-        sat2_alias = context.next_alias("lps")
-        where_pred_sat2 = where_pred.replace(f"{alias}.", f"{sat2_alias}.")
-        sat2_sql = (
-            f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {sat2_alias}"
-            f" WHERE {where_pred_sat2}"
-        )
         return (
-            f"CASE WHEN (({sat2_sql}) >= 2) THEN 0"
-            f" WHEN (({satisfy_sql}) = 1) AND ({uncertain_expr} = 0) THEN 1"
+            f"(SELECT CASE WHEN ({sat_ref} >= 2) THEN 0"
+            f" WHEN ({sat_ref} = 1) AND ({uncertain_expr} = 0) THEN 1"
             f" WHEN ({uncertain_expr} > 0) THEN NULL"
-            f" ELSE 0 END"
+            f" ELSE 0 END FROM {agg_sql})"
         )
     else:  # any
         return (
-            f"CASE WHEN (({satisfy_sql}) > 0) THEN 1"
+            f"(SELECT CASE WHEN ({sat_ref} > 0) THEN 1"
             f" WHEN ({uncertain_expr} > 0) THEN NULL"
-            f" ELSE 0 END"
+            f" ELSE 0 END FROM {agg_sql})"
         )
 
 
@@ -7431,7 +7610,24 @@ def _expr_literal(expr, context, segment):
     return context.add_where_param(v)
 
 
+_NON_DETERMINISTIC_FUNCTIONS = frozenset({
+    "rand", "random", "timestamp", "randomuuid",
+})
+
+
 def _expr_aggregation(expr, context, segment):
+    # Nested aggregation: count(count(*)) → NestedAggregation
+    if expr.argument and isinstance(expr.argument, ast.AggregationFunction):
+        raise SyntaxError(
+            "NestedAggregation: Can't use an aggregate function inside an aggregate function."
+        )
+    # Non-constant argument: count(rand()) → NonConstantExpression
+    if expr.argument and isinstance(expr.argument, ast.FunctionCall):
+        fn_lower = expr.argument.function_name.lower()
+        if fn_lower in _NON_DETERMINISTIC_FUNCTIONS:
+            raise SyntaxError(
+                f"NonConstantExpression: Can't use a non-deterministic function inside an aggregate function: {fn_lower}()"
+            )
     if expr.argument and isinstance(expr.argument, ast.Literal):
         v = expr.argument.value
         if v is True: arg = "1"
@@ -9237,6 +9433,9 @@ def _expr_function_call(expr, context, segment):
     # plain string or a JSON-encoded list/map): dispatch at runtime by first character.
     if fn == "size" and args and expr.arguments:
         arg0 = expr.arguments[0]
+        # size(collect(...)) or size(<any-aggregation>) — result is always a JSON array
+        if isinstance(arg0, ast.AggregationFunction) or _contains_aggregation(arg0):
+            return f"SQLUser.JSON_ARRAYLENGTH({args[0]})"
         if isinstance(arg0, ast.Variable) and arg0.name in context.scalar_variables:
             col = args[0]
             return (
@@ -9529,7 +9728,81 @@ def _contains_aggregation(expr) -> bool:
     return False
 
 
+def _collect_non_agg_var_refs(expr):
+    """
+    For an expression that contains aggregation, collect the non-aggregate sub-expressions
+    that reference bound variables (PropertyReference or Variable). These are potential
+    ambiguous grouping key candidates.
+
+    Returns a list of non-aggregate sub-expressions that reference variables.
+    When the expression is an arithmetic operation mixing aggregate and non-aggregate
+    operands, returns the non-aggregate operands at the top level.
+    """
+    results = []
+    if isinstance(expr, ast.AggregationFunction):
+        return []  # aggregation boundary — don't descend
+    if isinstance(expr, ast.FunctionCall) and expr.function_name.startswith("__arith_"):
+        # Arithmetic: collect non-aggregate sub-operands that reference variables
+        has_agg_args = any(_contains_aggregation(a) for a in expr.arguments)
+        if has_agg_args:
+            for arg in expr.arguments:
+                if not _contains_aggregation(arg):
+                    # Non-aggregate operand in a mixed arithmetic expression
+                    if _expr_references_variable(arg):
+                        results.append(arg)
+                else:
+                    results.extend(_collect_non_agg_var_refs(arg))
+        return results
+    if isinstance(expr, ast.FunctionCall):
+        for arg in expr.arguments:
+            results.extend(_collect_non_agg_var_refs(arg))
+        return results
+    if isinstance(expr, ast.BooleanExpression):
+        for op in expr.operands:
+            results.extend(_collect_non_agg_var_refs(op))
+        return results
+    return results
+
+
+def _expr_references_variable(expr) -> bool:
+    """Return True if the expression contains a Variable or PropertyReference."""
+    if isinstance(expr, (ast.Variable, ast.PropertyReference)):
+        return True
+    if isinstance(expr, ast.FunctionCall):
+        return any(_expr_references_variable(a) for a in expr.arguments)
+    if isinstance(expr, ast.BooleanExpression):
+        return any(_expr_references_variable(o) for o in expr.operands)
+    return False
+
+
 def translate_return_clause(ret, context):
+    # RETURN * — star is parsed as Literal('*') or as a special ReturnStar item.
+    is_return_star = (
+        len(ret.items) == 1
+        and isinstance(ret.items[0].expression, ast.Literal)
+        and ret.items[0].expression.value == "*"
+    )
+    if is_return_star and not context.stages and not context.variable_aliases:
+        raise SyntaxError(
+            "NoVariablesInScope: RETURN * is not allowed when there are no variables in scope."
+        )
+
+    # Check for duplicate column names (ColumnNameConflict)
+    seen_aliases: set = set()
+    for item in ret.items:
+        effective_alias = item.alias
+        if effective_alias is None:
+            if isinstance(item.expression, ast.Variable):
+                effective_alias = item.expression.name
+            elif isinstance(item.expression, ast.PropertyReference):
+                effective_alias = f"{item.expression.variable}.{item.expression.property_name}"
+        if effective_alias is not None:
+            if effective_alias in seen_aliases:
+                raise SyntaxError(
+                    f"ColumnNameConflict: Multiple result columns with the same name are not supported: '{effective_alias}'"
+                )
+            seen_aliases.add(effective_alias)
+
     # RETURN * after a WITH stage: the star is parsed as Literal('*').
     # Expand * into explicit hydration for all variables in scope.
     if (
@@ -9610,6 +9883,50 @@ def translate_return_clause(ret, context):
         return
     # Detect if there are any aggregation functions in the RETURN items (including nested)
     has_agg = any(_contains_aggregation(i.expression) for i in ret.items)
+
+    # AmbiguousAggregationExpression: detect return items that mix aggregation with
+    # non-aggregate variable/property references that are not standalone grouping keys.
+    # Rule: in a mixed aggregate expression:
+    #   - simple property refs (n.prop) or variables (n) that are standalone return items: OK
+    #   - anything else mixed with aggregation: AmbiguousAggregationExpression
+    if has_agg:
+        # Collect grouping keys: standalone non-aggregate return items.
+        non_agg_items = [i for i in ret.items if not _contains_aggregation(i.expression)]
+        grouping_exprs = set()
+        for gi in non_agg_items:
+            grouping_exprs.add(_expr_to_cypher_text(gi.expression))
+        for item in ret.items:
+            if not _contains_aggregation(item.expression):
+                continue
+            if isinstance(item.expression, ast.AggregationFunction):
+                continue  # pure aggregate — OK
+            # Mixed item: contains both aggregation and non-aggregate sub-expressions.
+            # Extract the non-aggregate sub-expressions that reference variables.
+            ambiguous_parts = _collect_non_agg_var_refs(item.expression)
+            for part in ambiguous_parts:
+                part_text = _expr_to_cypher_text(part)
+                if not part_text:
+                    continue
+                # Skip query parameter variables — they are constants, not bound variables
+                if isinstance(part, ast.Variable) and part.name in context.input_params:
+                    continue
+                # Complex non-aggregate expressions (arithmetic, function calls, etc.)
+                # mixed with aggregation are always ambiguous, even if they are grouping keys.
+                # Only simple property references and variables are allowed as grouping key refs.
+                is_simple = isinstance(part, (ast.Variable, ast.PropertyReference))
+                if not is_simple:
+                    raise SyntaxError(
+                        f"AmbiguousAggregationExpression: An expression using aggregation "
+                        f"and a non-aggregate is ambiguous because of the way the query is structured: "
+                        f"'{_expr_to_cypher_text(item.expression)}'"
+                    )
+                if part_text not in grouping_exprs:
+                    raise SyntaxError(
+                        f"AmbiguousAggregationExpression: An expression using aggregation "
+                        f"and a non-aggregate is ambiguous because of the way the query is structured: "
+                        f"'{_expr_to_cypher_text(item.expression)}'"
+                    )
+
     agg_aliases: set = set()
     for item in ret.items:
         if isinstance(item.expression, ast.Variable):
