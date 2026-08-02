@@ -593,6 +593,13 @@ def _rows_equal(exp: dict, act: dict, columns: list[str], list_unordered: bool) 
                     continue
                 # av is not a node dict — mismatch
                 return False
+        # Relationship pattern comparison: TCK expects "[:TYPE]" parsed as [':TYPE']
+        # Actual value from engine is just the type string 'TYPE'
+        if (isinstance(ev, list) and len(ev) == 1
+                and isinstance(ev[0], str) and ev[0].startswith(":")
+                and isinstance(av, str)
+                and ev[0][1:] == av):
+            continue
         if list_unordered and isinstance(ev, list) and isinstance(av, list):
             if sorted(str(x) for x in ev) != sorted(str(x) for x in av):
                 return False

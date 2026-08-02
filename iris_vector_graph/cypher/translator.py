@@ -3413,6 +3413,14 @@ def _trp_directed_edge_join(
             if not context.from_clauses:
                 context.from_clauses.append(f"{_table('rdf_edges')} {edge_alias}")
                 if actual_cond:
+                    # Edge predicate goes into WHERE — params for rel.types were added as
+                    # join_params but appear AFTER join-clause params in the SQL.  Move
+                    # them to where_params so positional ? order matches SQL order.
+                    n_type_params = actual_cond.count("?")
+                    if n_type_params > 0:
+                        moved = context.join_params[-n_type_params:]
+                        del context.join_params[-n_type_params:]
+                        context.where_params.extend(moved)
                     context.where_conditions.append(actual_cond)
             else:
                 full_cond = actual_cond if actual_cond else "1=1"
