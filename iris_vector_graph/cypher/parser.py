@@ -1123,18 +1123,44 @@ class Parser:
             self.peek().kind == TokenType.DOT
             and self.lexer.peek_ahead(1).kind == TokenType.FLOAT_LITERAL
             and self.lexer.peek_ahead(1).value.startswith(".")
+        ) and not (
+            # DOT followed by another DOT is the dotdot separator in a slice range (N..M).
+            # Do NOT consume it as a property access here either.
+            self.peek().kind == TokenType.DOT
+            and self.lexer.peek_ahead(1).kind == TokenType.DOT
         ):
             if self.peek().kind == TokenType.LBRACKET:
                 self.eat()
+                # Detect dotdot at start of bracket contents:
+                # - DOT + DOT (e.g. list[..null], list[..])
+                # - DOT + FLOAT_LITERAL('.N') (e.g. list[..2] tokenized as DOT+FLOAT(.2))
                 _nxt_is_dotdot = (
-                    self.peek().kind == TokenType.DOT and self.lexer.peek_ahead(1).kind == TokenType.DOT
+                    (self.peek().kind == TokenType.DOT and self.lexer.peek_ahead(1).kind == TokenType.DOT)
+                    or (
+                        self.peek().kind == TokenType.DOT
+                        and self.lexer.peek_ahead(1).kind == TokenType.FLOAT_LITERAL
+                        and self.lexer.peek_ahead(1).value.startswith(".")
+                    )
                 )
                 if _nxt_is_dotdot:
-                    self.eat()
-                    self.eat()
-                    end = self.parse_additive_expression()
-                    self.expect(TokenType.RBRACKET)
-                    base = ast.SliceExpression(expression=base, start=ast.Literal(0), end=end)
+                    self.eat()  # consume first DOT
+                    # Check for DOT+FLOAT (e.g. ..2) vs DOT+DOT (e.g. ..null, ..)
+                    if self.peek().kind == TokenType.DOT:
+                        self.eat()  # consume second DOT
+                        if self.peek().kind == TokenType.RBRACKET:
+                            # list[..] — implicit start and end
+                            self.eat()
+                            base = ast.SliceExpression(expression=base, start=None, end=None)
+                        else:
+                            end = self.parse_additive_expression()
+                            self.expect(TokenType.RBRACKET)
+                            base = ast.SliceExpression(expression=base, start=None, end=end)
+                    else:
+                        # FLOAT_LITERAL '.N' — extract integer end value
+                        float_tok = self.eat()
+                        end_val = int(float_tok.value.lstrip("."))
+                        self.expect(TokenType.RBRACKET)
+                        base = ast.SliceExpression(expression=base, start=None, end=ast.Literal(end_val))
                 else:
                     # Parse the index/start as a full additive expression (e.g. 'nam'+'e', a+1)
                     # but not a comparison/boolean expression which would gobble up too much.
@@ -1144,6 +1170,7 @@ class Parser:
                     )
                     # Handle tokenization of N..M:
                     # - '1..3' → INTEGER(1) + DOT + FLOAT('.3') — three tokens
+                    # - '1..null' → INTEGER(1) + DOT + DOT + NULL — four tokens
                     # - Sometimes: INTEGER(1) + FLOAT('.3') — two tokens
                     _nxt_is_float_dotdot = (
                         # Pattern: DOT + FLOAT('.M')
@@ -1162,9 +1189,14 @@ class Parser:
                     if _nxt_is_dotdot2:
                         self.eat()
                         self.eat()
-                        second = self.parse_additive_expression()
-                        self.expect(TokenType.RBRACKET)
-                        base = ast.SliceExpression(expression=base, start=first, end=second)
+                        if self.peek().kind == TokenType.RBRACKET:
+                            # list[start..] — implicit end (use array length)
+                            self.eat()
+                            base = ast.SliceExpression(expression=base, start=first, end=None)
+                        else:
+                            second = self.parse_additive_expression()
+                            self.expect(TokenType.RBRACKET)
+                            base = ast.SliceExpression(expression=base, start=first, end=second)
                     elif _nxt_is_float_dotdot:
                         if self.peek().kind == TokenType.DOT:
                             self.eat()  # consume the DOT

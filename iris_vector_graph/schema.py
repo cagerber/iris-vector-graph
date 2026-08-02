@@ -641,7 +641,7 @@ CREATE OR REPLACE FUNCTION SQLUser.JSON_ARRAYLENGTH(j VARCHAR(32000)) RETURNS IN
 CREATE OR REPLACE FUNCTION SQLUser.JSON_ARRAYGET(j VARCHAR(32000), i INTEGER) RETURNS VARCHAR(4000) LANGUAGE OBJECTSCRIPT { Set a = ##class(%Library.DynamicArray).%FromJSON(j) Quit a.%Get(i) _ "" }
 """,
             """
-CREATE OR REPLACE FUNCTION SQLUser.JSON_VALUE(j VARCHAR(32000), p VARCHAR(1000)) RETURNS VARCHAR(4000) LANGUAGE OBJECTSCRIPT { Set obj = ##class(%Library.DynamicObject).%FromJSON(j), key = $Extract(p, 3, *), val = obj.%Get(key) If $IsObject(val) { Quit val.%ToJSON() } Quit val _ "" }
+CREATE OR REPLACE FUNCTION SQLUser.JSON_VALUE(j VARCHAR(32000), p VARCHAR(1000)) RETURNS VARCHAR(4000) LANGUAGE OBJECTSCRIPT { If $Extract(p,2) = "[" { Set idx = +$Extract(p, 3, $Length(p)-1), arr = ##class(%Library.DynamicArray).%FromJSON(j), val = arr.%Get(idx) If $IsObject(val) { Quit val.%ToJSON() } Quit val _ "" } Set key = $Extract(p, 3, *), obj = ##class(%Library.DynamicObject).%FromJSON(j), val = obj.%Get(key) If $IsObject(val) { Quit val.%ToJSON() } Quit val _ "" }
 """,
             """
 CREATE OR REPLACE FUNCTION SQLUser.RAND() RETURNS DOUBLE LANGUAGE OBJECTSCRIPT { Quit $RANDOM(1000000) / 1000000.0 }

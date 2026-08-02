@@ -302,6 +302,11 @@ class TranslationContext:
         self.non_integer_index_vars: set = (
             set() if parent is None else parent.non_integer_index_vars.copy()
         )
+        # Variables known to hold non-map values (scalars, lists).
+        # Property access on these should raise TypeError at compile time.
+        self.non_map_vars: set = (
+            set() if parent is None else parent.non_map_vars.copy()
+        )
 
     def next_alias(self, prefix: str = "t") -> str:
         alias = f"{prefix}{self._alias_counter}"
@@ -3282,10 +3287,16 @@ def _translate_set_value(expr, context, target_prop: str) -> tuple:
     `n.<target_prop>` → `CAST(val AS NUMERIC)` since we're already in that row.
     """
     if isinstance(expr, ast.Literal):
-        return ("?", [expr.value], False)
+        val = _extract_literal_value(expr)
+        if isinstance(val, (list, dict)):
+            val = json.dumps(val)
+        return ("?", [val], False)
 
     if isinstance(expr, ast.Variable) and expr.name in context.input_params:
-        return ("?", [context.input_params[expr.name]], False)
+        v = context.input_params[expr.name]
+        if isinstance(v, (list, dict)):
+            v = json.dumps(v)
+        return ("?", [v], False)
 
     # For complex expressions, translate inline with property refs as correlated subqueries.
     def _translate_expr_for_update(e, node_var: str) -> tuple:
@@ -3612,7 +3623,14 @@ def translate_match_clause(match_clause, context, metadata):
                     # Adding a standalone nodes JOIN here would create a Cartesian product.
                     _ = context.next_alias("n")
             else:
-                _ = context.next_alias("n")
+                if not has_rels:
+                    # Bare anonymous node MATCH () with no labels/properties/rels:
+                    # translate normally to get FROM Graph_KG.nodes n0.
+                    translate_node_pattern(
+                        first_node, context, metadata, optional=match_clause.optional
+                    )
+                else:
+                    _ = context.next_alias("n")
         # Track (edge_alias, is_undirected) for each hop in this pattern — used
         # after each hop to add isomorphic-edge-exclusion WHERE conditions.
         # Cypher guarantees the same physical edge cannot be traversed twice in
@@ -5417,6 +5435,61 @@ def _boolean_expr_logical(op, expr, context):
     return None
 
 
+def _cypher_elem_eq_3vl(lv, rv):
+    """3VL element equality: returns True, False, or None (unknown).
+
+    Handles nested lists recursively.  None means at least one comparison
+    involved null and the result is therefore unknown.
+    """
+    if lv is None or rv is None:
+        return None  # any comparison with null → unknown
+    if type(lv) != type(rv):
+        # Type mismatch (e.g. int vs str): false in Cypher
+        # Exception: bool is a subtype of int in Python — treat separately
+        if isinstance(lv, bool) != isinstance(rv, bool):
+            return False
+        if isinstance(lv, list) != isinstance(rv, list):
+            return False
+    if isinstance(lv, list) and isinstance(rv, list):
+        if len(lv) != len(rv):
+            return False
+        result = True
+        for a, b in zip(lv, rv):
+            # a, b may be ast.Literal nodes or raw Python values
+            av = a.value if hasattr(a, "value") else a
+            bv = b.value if hasattr(b, "value") else b
+            cmp = _cypher_elem_eq_3vl(av, bv)
+            if cmp is False:
+                return False
+            if cmp is None:
+                result = None  # keep going — a later false would short-circuit
+        return result
+    return lv == rv
+
+
+def _list_literal_in_3vl(lhs_list, rhs_items):
+    """Check if lhs_list (Python list of ast.Literal nodes or values) is IN rhs_items
+    (list of ast.Literal nodes) using Cypher 3-valued logic.
+
+    Returns True, False, or None (unknown).
+    """
+    lv = [item.value if isinstance(item, ast.Literal) else item for item in lhs_list]
+    found_unknown = False
+    for rhs_item in rhs_items:
+        rv_raw = rhs_item.value if isinstance(rhs_item, ast.Literal) else rhs_item
+        if isinstance(rv_raw, list):
+            rv = [x.value if isinstance(x, ast.Literal) else x for x in rv_raw]
+        else:
+            rv = rv_raw
+        cmp = _cypher_elem_eq_3vl(lv, rv)
+        if cmp is True:
+            return True
+        if cmp is None:
+            found_unknown = True
+        # cmp is False: continue looking
+    return None if found_unknown else False
+
+
 def _boolean_expr_in(left, right_expr, context, left_expr=None):
     if isinstance(right_expr, ast.SubscriptExpression):
         inner_sql = translate_expression(right_expr.expression, context, segment="where")
@@ -5436,6 +5509,27 @@ def _boolean_expr_in(left, right_expr, context, left_expr=None):
         return f"{left} IN (SELECT __iv FROM JSON_TABLE({slice_sql}, '$[*]' COLUMNS(__iv VARCHAR(1000) PATH '$')) {ij_alias})"
     if isinstance(right_expr, ast.Literal) and isinstance(right_expr.value, list):
         items = right_expr.value
+
+        # Empty right-side list: x IN [] → false regardless of x
+        if not items:
+            return "(1=0)"
+
+        # When LHS is a list literal and RHS contains list literals, use 3VL list equality.
+        # This is needed because SQL string equality ('[null]' = '[null]') is incorrect for
+        # Cypher semantics: comparing null elements should yield null, not true.
+        if (
+            left_expr is not None
+            and isinstance(left_expr, ast.Literal)
+            and isinstance(left_expr.value, list)
+        ):
+            result = _list_literal_in_3vl(left_expr.value, items)
+            if result is True:
+                return "(1=1)"
+            elif result is False:
+                return "(1=0)"
+            else:  # None (unknown)
+                return "NULL"
+
         # Separate null items from non-null items for 3VL: x IN [a, null, b]
         # = x IN (a, b) OR NULL (unknown if no exact match but list has nulls)
         null_items = [i for i in items if isinstance(i, ast.Literal) and i.value is None]
@@ -5486,6 +5580,25 @@ def _boolean_expr_in(left, right_expr, context, left_expr=None):
             if null_vals:
                 return f"CASE WHEN {in_expr} THEN 1 ELSE NULL END"
             return in_expr
+    # For function calls / dynamic expressions returning JSON arrays (e.g. keys(), labels(), range()):
+    # Expand via JSON_TABLE so: left IN keys(map) works correctly.
+    _json_array_fns = frozenset({"keys", "labels", "range", "collect", "nodes", "relationships", "tail", "reverse"})
+    _is_json_array_expr = (
+        isinstance(right_expr, ast.FunctionCall) and right_expr.function_name.lower() in _json_array_fns
+    ) or isinstance(right_expr, ast.ListComprehension)
+    if _is_json_array_expr:
+        right_sql = translate_expression(right_expr, context, segment="where")
+        jt_alias = context.next_alias("jin")
+        return f"{left} IN (SELECT __jv FROM JSON_TABLE({right_sql}, '$[*]' COLUMNS(__jv VARCHAR(1000) PATH '$')) {jt_alias})"
+    # Variable holding a JSON array (scalar variable from Stage, not an input_param list)
+    if (
+        isinstance(right_expr, ast.Variable)
+        and right_expr.name not in context.input_params
+        and right_expr.name in context.scalar_variables
+    ):
+        right_sql = translate_expression(right_expr, context, segment="where")
+        jt_alias = context.next_alias("jin")
+        return f"{left} IN (SELECT __jv FROM JSON_TABLE({right_sql}, '$[*]' COLUMNS(__jv VARCHAR(1000) PATH '$')) {jt_alias})"
     return None
 
 
@@ -5798,8 +5911,12 @@ def _expr_pattern_comprehension(expr, context, segment):
 
     pred_type = ""
     if rel and rel.types:
-        safe_type = rel.types[0].replace("'", "''")
-        pred_type = f" AND {e_alias}.p = '{safe_type}'"
+        if len(rel.types) == 1:
+            safe_type = rel.types[0].replace("'", "''")
+            pred_type = f" AND {e_alias}.p = '{safe_type}'"
+        else:
+            safe_types = ", ".join(f"'{t.replace(chr(39), chr(39)*2)}'" for t in rel.types)
+            pred_type = f" AND {e_alias}.p IN ({safe_types})"
 
     src_bind = ""
     if (
@@ -5873,6 +5990,9 @@ def _expr_arith(expr, context, segment):
     if op == "%":
         left = _prop_ref_cast(expr.arguments[0], left)
         right = _prop_ref_cast(expr.arguments[1], right)
+        rhs_arg = expr.arguments[1]
+        if isinstance(rhs_arg, ast.Literal) and isinstance(rhs_arg.value, (int, float)) and rhs_arg.value != 0:
+            return f"MOD({left}, {right})"
         return f"CASE WHEN {right} = 0 AND {left} IS NOT NULL THEN CAST('NaN' AS DOUBLE) ELSE MOD({left}, {right}) END"
     if op == "^":
         left = _prop_ref_cast(expr.arguments[0], left)
@@ -5908,18 +6028,31 @@ def _expr_arith(expr, context, segment):
                 import json as _json
                 lv = _literal_to_python(expr.arguments[0])
                 rv = _literal_to_python(expr.arguments[1])
-                if isinstance(lv, list) and isinstance(rv, list):
-                    combined = lv + rv
-                    js = _json.dumps(combined)
-                    return f"CAST('{js.replace(chr(39), chr(39)+chr(39))}' AS VARCHAR({max(len(js)+1, 256)}))"
-            # Runtime: JSON array concat via subquery building
+                # Wrap scalar in list if one side is a scalar (list + scalar or scalar + list)
+                if not isinstance(lv, list):
+                    lv = [lv]
+                if not isinstance(rv, list):
+                    rv = [rv]
+                combined = lv + rv
+                js = _json.dumps(combined)
+                return f"CAST('{js.replace(chr(39), chr(39)+chr(39))}' AS VARCHAR({max(len(js)+1, 256)}))"
+            # Runtime: JSON array concat via subquery building.
+            # If one side is a scalar (not a list), wrap it as a single-element JSON array.
+            def _ensure_array_sql(arg_expr, arg_sql):
+                """Return SQL that is always a JSON array (wrapping scalar in [v] if needed)."""
+                if _is_list(arg_expr):
+                    return arg_sql
+                # Scalar: wrap in JSON array string
+                return f"('[' || CAST({arg_sql} AS VARCHAR(1000)) || ']')"
+            left_arr = _ensure_array_sql(expr.arguments[0], left)
+            right_arr = _ensure_array_sql(expr.arguments[1], right)
             # Generate row numbers up to 100 to handle practical list sizes (each element is extracted)
             row_gen = "SELECT 0 AS n" + "".join(f" UNION ALL SELECT {i}" for i in range(1, 100))
             return (
                 f"(SELECT JSON_ARRAYAGG(x.v) FROM ("
-                f"SELECT JSON_VALUE({left}, '$[' || rn.n || ']') AS v FROM ({row_gen}) rn WHERE rn.n < SQLUser.JSON_ARRAYLENGTH({left})"
+                f"SELECT JSON_VALUE({left_arr}, '$[' || rn.n || ']') AS v FROM ({row_gen}) rn WHERE rn.n < SQLUser.JSON_ARRAYLENGTH({left_arr})"
                 f" UNION ALL "
-                f"SELECT JSON_VALUE({right}, '$[' || rn.n || ']') AS v FROM ({row_gen}) rn WHERE rn.n < SQLUser.JSON_ARRAYLENGTH({right})"
+                f"SELECT JSON_VALUE({right_arr}, '$[' || rn.n || ']') AS v FROM ({row_gen}) rn WHERE rn.n < SQLUser.JSON_ARRAYLENGTH({right_arr})"
                 f") x)"
             )
         # Numeric +: cast property references to DOUBLE
@@ -5930,6 +6063,9 @@ def _expr_arith(expr, context, segment):
         left = _prop_ref_cast(expr.arguments[0], left)
         right = _prop_ref_cast(expr.arguments[1], right)
         if op == "/":
+            rhs_arg = expr.arguments[1]
+            if isinstance(rhs_arg, ast.Literal) and isinstance(rhs_arg.value, (int, float)) and rhs_arg.value != 0:
+                return f"({left} {op} {right})"
             return f"CASE WHEN {right} = 0 AND {left} IS NOT NULL THEN CAST('NaN' AS DOUBLE) ELSE ({left} {op} {right}) END"
     return f"({left} {op} {right})"
 
@@ -6127,6 +6263,11 @@ def _list_comprehension_type_check(expr):
 
 
 def _expr_list_comprehension(expr, context, segment):
+    # Aggregation in list comprehension is invalid (SyntaxError: InvalidAggregation)
+    if expr.projection and _contains_aggregation(expr.projection):
+        raise SyntaxError(
+            "SyntaxError: Aggregation functions are not allowed inside a list comprehension."
+        )
     # Type-check projection against source list elements for conversion functions.
     _list_comprehension_type_check(expr)
     source_sql = translate_expression(expr.source, context, segment="inline")
@@ -6608,6 +6749,11 @@ def _expr_property_reference(expr, context, segment):
         # Edge-qualifiers variables: use JSON_VALUE on the column value (Stage column = qualifiers JSON)
         edge_stage_vars = getattr(context, "edge_stage_variables", set())
         if expr.variable in context.scalar_variables or expr.variable in edge_stage_vars:
+            # Compile-time TypeError: scalar/list variables cannot have properties accessed on them
+            if expr.variable in getattr(context, 'non_map_vars', set()):
+                raise TypeError(
+                    f"TypeError: Type mismatch: expected Map or Node, but was {expr.variable!r} (non-map scalar)"
+                )
             col_ref = f"{alias}.{_safe_alias(expr.variable)}"
             return f"CASE WHEN {col_ref} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{expr.property_name}') END"
         # Node variables from Stage: JOIN rdf_props to get the property value
@@ -6735,9 +6881,37 @@ def _expr_subscript(expr, context, segment):
         if isinstance(idx, ast.Variable):
             idx_var_name = idx.name
             if idx_var_name in getattr(context, "non_integer_index_vars", set()):
-                # Index was bound to a non-integer type literal at translation time.
-                # Emit a SQL expression that always raises TypeError regardless of value.
-                # Use IVGTYPEERROR() which always throws — IRIS SQL UDF error = result.error.
+                # Index was bound to a non-integer type at translation time.
+                # If the base is known to be a map (dict param) and index is a string,
+                # use runtime property access.  Otherwise emit TypeError.
+                idx_pval = context.input_params.get(idx_var_name)
+                base_is_map = False
+                if isinstance(base, ast.Variable):
+                    base_pval = context.input_params.get(base.name)
+                    if isinstance(base_pval, dict):
+                        base_is_map = True
+                if base_is_map and isinstance(idx_pval, str):
+                    # Map subscript with string key — valid in Cypher
+                    idx_sql2 = translate_expression(idx, context, segment=segment)
+                    return f"SQLUser.JSON_VALUE({base_sql}, '$.' || CAST(({idx_sql2}) AS VARCHAR))"
+                # For maps at runtime with unknown base type, dispatch dynamically
+                if isinstance(idx_pval, str):
+                    idx_sql2 = translate_expression(idx, context, segment=segment)
+                    return (
+                        f"CASE WHEN ({base_sql}) IS NULL THEN NULL "
+                        f"WHEN SUBSTRING({base_sql}, 1, 1) = '{{'  "
+                        f"THEN SQLUser.JSON_VALUE({base_sql}, '$.' || CAST(({idx_sql2}) AS VARCHAR)) "
+                        f"ELSE SQLUser.CypherFn_IVGTYPEERROR('Non-integer index type for list subscript') END"
+                    )
+                if isinstance(idx_pval, int) and not isinstance(idx_pval, bool):
+                    # Integer index into a map → TypeError at runtime
+                    return (
+                        f"CASE WHEN ({base_sql}) IS NULL THEN NULL "
+                        f"WHEN SUBSTRING({base_sql}, 1, 1) = '{{'  "
+                        f"THEN SQLUser.CypherFn_IVGTYPEERROR('Map element access by non-string') "
+                        f"ELSE NULL END"
+                    )
+                # Other non-integer (bool, float, list) — unconditional TypeError
                 return (
                     f"CASE WHEN ({base_sql}) IS NOT NULL "
                     f"THEN SQLUser.CypherFn_IVGTYPEERROR('Non-integer index type for list subscript') "
@@ -6748,6 +6922,14 @@ def _expr_subscript(expr, context, segment):
             if idx_var_name in context.input_params:
                 pval = context.input_params[idx_var_name]
                 if isinstance(pval, int) and not isinstance(pval, bool):
+                    # Integer index: if base is known to be a map, emit TypeError
+                    if isinstance(base, ast.Variable) and base.name in context.input_params:
+                        base_pval = context.input_params[base.name]
+                        if isinstance(base_pval, dict):
+                            return (
+                                f"CASE WHEN ({base_sql}) IS NULL THEN NULL "
+                                f"ELSE SQLUser.CypherFn_IVGTYPEERROR('Map element access by non-string') END"
+                            )
                     return f"SQLUser.JSON_VALUE({base_sql}, '$[{pval}]')"
         idx_sql = translate_expression(idx, context, segment=segment)
         return f"SQLUser.JSON_VALUE({base_sql}, '$.' || CAST(({idx_sql}) AS VARCHAR))"
@@ -6763,34 +6945,117 @@ def _expr_subscript(expr, context, segment):
 
 
 def _expr_slice(expr, context, segment):
+    # Cypher slice semantics:
+    #   - implicit start (None) → 0
+    #   - implicit end (None) → array length
+    #   - null start or end (Literal(None)) → return NULL
+    #   - negative index n → length + n  (e.g. -1 on [1,2,3] → index 2)
     base_sql = translate_expression(expr.expression, context, segment=segment)
-    start_val = expr.start.value if isinstance(expr.start, ast.Literal) else None
-    end_val = expr.end.value if isinstance(expr.end, ast.Literal) else None
     jt_alias = context.next_alias("slc")
-    if start_val is not None and end_val is not None:
+    arr_len_sql = f"SQLUser.JSON_ARRAYLENGTH({base_sql})"
+
+    # Determine if start/end are statically known literals (including null literal)
+    start_is_literal = isinstance(expr.start, ast.Literal)
+    end_is_literal = isinstance(expr.end, ast.Literal)
+    start_val = expr.start.value if start_is_literal else None  # None = not a literal OR null literal
+    end_val = expr.end.value if end_is_literal else None
+
+    # Null propagation: if either bound is an explicit null literal, return NULL
+    if (start_is_literal and start_val is None) or (end_is_literal and end_val is None):
+        return "NULL"
+
+    # Fast path: both bounds are static non-null integers
+    if start_is_literal and start_val is not None and end_is_literal and end_val is not None:
         s = int(start_val)
         e = int(end_val)
-        if e <= s:
-            return _EMPTY_JSON_ARRAY
-        return (
-            f"(SELECT JSON_ARRAYAGG(elem) FROM "
-            f"(SELECT elem, ROW_NUMBER() OVER() AS rn "
-            f"FROM JSON_TABLE({base_sql}, '$[*]' COLUMNS(elem VARCHAR(1000) PATH '$')) {jt_alias}) __sliced "
-            f"WHERE rn > {s} AND rn <= {e})"
-        )
-    start_sql = translate_expression(expr.start, context, segment=segment) if expr.start is not None else "0"
-    end_sql = translate_expression(expr.end, context, segment=segment) if expr.end is not None else f"SQLUser.JSON_ARRAYLENGTH({base_sql})"
-    return (
+        if s < 0 or e < 0:
+            # Negative indices require knowing array length — fall through to dynamic path
+            pass
+        else:
+            if e <= s:
+                return _EMPTY_JSON_ARRAY
+            return (
+                f"(SELECT JSON_ARRAYAGG(elem) FROM "
+                f"(SELECT elem, ROW_NUMBER() OVER() AS rn "
+                f"FROM JSON_TABLE({base_sql}, '$[*]' COLUMNS(elem VARCHAR(1000) PATH '$')) {jt_alias}) __sliced "
+                f"WHERE rn > {s} AND rn <= {e})"
+            )
+
+    def _bound_sql_once(bound_expr, is_end_bound):
+        """Translate a slice bound to SQL, emitting parameters at most once.
+
+        Returns (raw_sql, is_dynamic) where raw_sql references the bound without
+        repeating parameter bindings.  For dynamic (non-literal) expressions we
+        translate once; the caller must not embed the result more than once.
+        """
+        if bound_expr is None:
+            return ("0" if not is_end_bound else arr_len_sql), False
+        if isinstance(bound_expr, ast.Literal):
+            v = bound_expr.value
+            if v is None:
+                return "NULL", False
+            n = int(v)
+            if n < 0:
+                return f"GREATEST(0, {arr_len_sql} + {n})", False
+            return str(n), False
+        # Dynamic: translate once
+        raw = translate_expression(bound_expr, context, segment=segment)
+        return raw, True
+
+    raw_start, start_dynamic = _bound_sql_once(expr.start, is_end_bound=False)
+    raw_end, end_dynamic = _bound_sql_once(expr.end, is_end_bound=True)
+
+    # For dynamic bounds, we must not repeat the SQL (which contains ?) since each
+    # occurrence would add another parameter binding. Wrap into a scalar subquery-CTE
+    # alias or just use the raw_sql directly (IRIS will evaluate ? only once per row
+    # in a WHERE clause if referenced once).
+    start_sql = raw_start
+    end_sql = raw_end
+
+    # If either dynamic bound could produce NULL at runtime, the whole slice → NULL.
+    # We detect null by checking start/end SQL contains a ?, meaning they came from
+    # a parameter.  Use NULLIF approach: wrap the entire expression.
+    needs_null_check = start_dynamic or end_dynamic
+
+    inner = (
         f"(SELECT JSON_ARRAYAGG(elem) FROM "
         f"(SELECT elem, ROW_NUMBER() OVER() AS rn "
         f"FROM JSON_TABLE({base_sql}, '$[*]' COLUMNS(elem VARCHAR(1000) PATH '$')) {jt_alias}) __sliced "
         f"WHERE rn > ({start_sql}) AND rn <= ({end_sql}))"
     )
+    if needs_null_check:
+        # Add sentinel null-check params: re-add the param values as additional ?
+        # bindings for the CASE guard.  For each dynamic bound, add a separate IS NULL
+        # check that evaluates a fresh ? binding.
+        null_checks = []
+        if start_dynamic:
+            raw_start2, _ = _bound_sql_once(expr.start, is_end_bound=False)
+            null_checks.append(f"({raw_start2}) IS NULL")
+        if end_dynamic:
+            raw_end2, _ = _bound_sql_once(expr.end, is_end_bound=True)
+            null_checks.append(f"({raw_end2}) IS NULL")
+        null_guard = " OR ".join(null_checks)
+        return f"CASE WHEN {null_guard} THEN NULL ELSE {inner} END"
+    return inner
 
 
 def _expr_property_access(expr, context, segment):
-    base_sql = translate_expression(expr.expression, context, segment=segment)
     prop = expr.property_name.replace("'", "''")
+    # Compile-time TypeError: property access on a known non-map type
+    if isinstance(expr.expression, ast.Variable):
+        vname = expr.expression.name
+        if vname in getattr(context, 'non_map_vars', set()):
+            raise TypeError(
+                f"TypeError: Type mismatch: expected Map or Node but was a non-map value"
+            )
+    elif isinstance(expr.expression, ast.Literal):
+        # Direct literal property access: always TypeError unless it's a dict
+        lv = expr.expression.value
+        if not isinstance(lv, dict):
+            raise TypeError(
+                f"TypeError: Type mismatch: expected Map or Node but was a literal non-map value"
+            )
+    base_sql = translate_expression(expr.expression, context, segment=segment)
     return f"CASE WHEN ({base_sql}) IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({base_sql}, '$.{prop}') END"
 
 
@@ -8535,7 +8800,8 @@ def _expr_fn_keys(args):
     # Check if id_expr is a JSON object (starts with '{') - if so, use JSON_KEYS instead of rdf_props
     # Otherwise, assume it's a node ID and look up rdf_props
     return (
-        f"CASE WHEN SUBSTRING({id_expr}, 1, 1) = '{{' "
+        f"CASE WHEN ({id_expr}) IS NULL THEN NULL "
+        f"WHEN SUBSTRING({id_expr}, 1, 1) = '{{' "
         f"THEN COALESCE(SQLUser.JSON_KEYS({id_expr}), CAST('[]' AS VARCHAR(256))) "
         f"ELSE COALESCE((SELECT JSON_ARRAYAGG(rp.\"key\") FROM {_table('rdf_props')} rp WHERE rp.s = {id_expr}), CAST('[]' AS VARCHAR(256))) "
         f"END"
@@ -8593,7 +8859,12 @@ def _expr_fn_list_ops(fn, args, args_exprs):
         # For literal maps, extract keys at compile time
         if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
             keys = list(args_exprs[0].entries.keys())
+            if not keys:
+                return "CAST('[]' AS VARCHAR(256))"
             return f"JSON_ARRAY({', '.join(repr(k) for k in keys)})"
+        # For null literal, return NULL
+        if args_exprs and isinstance(args_exprs[0], ast.Literal) and args_exprs[0].value is None:
+            return "NULL"
         return _expr_fn_keys(args)
     if fn == "range":
         return _expr_fn_range(args_exprs)
@@ -8601,9 +8872,26 @@ def _expr_fn_list_ops(fn, args, args_exprs):
         if not args:
             return "0"
         arg_expr = args_exprs[0] if args_exprs else None
-        is_list = (
-            isinstance(arg_expr, ast.Literal) and isinstance(arg_expr.value, list)
-        ) or isinstance(arg_expr, ast.ListComprehension)
+        def _arg_is_list_type(e):
+            """Heuristic: returns True if expression e produces a JSON array."""
+            if isinstance(e, ast.Literal) and isinstance(e.value, list):
+                return True
+            if isinstance(e, ast.ListComprehension):
+                return True
+            if isinstance(e, ast.PatternComprehension):
+                return True
+            if isinstance(e, ast.FunctionCall):
+                # List concatenation or list-producing functions
+                if e.function_name in (
+                    "__arith_+", "collect", "nodes", "relationships",
+                    "labels", "keys", "range",
+                ):
+                    return True
+                # range(), nodes(), etc. are list-producing
+                if e.function_name.lower() in ("range", "nodes", "relationships", "labels", "keys", "collect"):
+                    return True
+            return False
+        is_list = _arg_is_list_type(arg_expr)
         if is_list:
             return f"SQLUser.JSON_ARRAYLENGTH({args[0]})"
         return None
@@ -8656,6 +8944,32 @@ def _expr_function_call(expr, context, segment):
             cond = translate_boolean_expression(arg0, context)
             return f"CASE WHEN ({cond}) THEN 'true' ELSE 'false' END"
 
+    # size(pattern-predicate) raises SyntaxError — ExistsExpression arg is a pattern, not a list
+    if fn == "size" and expr.arguments and isinstance(expr.arguments[0], ast.ExistsExpression):
+        raise SyntaxError(
+            "SyntaxError: size() does not accept a pattern argument. "
+            "Use a pattern comprehension [ ... ] with size() instead."
+        )
+
+    # keys(null) and keys(param_dict): handle with context before _expr_fn_list_ops
+    if fn == "keys" and expr.arguments:
+        arg0 = expr.arguments[0]
+        # null literal → NULL
+        if isinstance(arg0, ast.Literal) and arg0.value is None:
+            return "NULL"
+        # parameter variable bound to a dict → fold keys at compile time
+        if isinstance(arg0, ast.Variable) and arg0.name in context.input_params:
+            pval = context.input_params[arg0.name]
+            if isinstance(pval, dict):
+                import json as _json
+                keys = list(pval.keys())
+                if not keys:
+                    return "CAST('[]' AS VARCHAR(256))"
+                js = _json.dumps(keys)
+                return f"CAST('{js}' AS VARCHAR({max(len(js)+1, 256)}))"
+            if pval is None:
+                return "NULL"
+
     def _translate_arg(a):
         if isinstance(a, ast.Literal) and not isinstance(a.value, list):
             inlined = _inline_literal(a)
@@ -8691,6 +9005,13 @@ def _expr_function_call(expr, context, segment):
     if fn == "size" and args and expr.arguments:
         arg0 = expr.arguments[0]
         if isinstance(arg0, ast.Variable) and arg0.name in context.scalar_variables:
+            col = args[0]
+            return (
+                f"CASE WHEN SUBSTRING({col}, 1, 1) IN ('[', '{{') "
+                f"THEN SQLUser.JSON_ARRAYLENGTH({col}) "
+                f"ELSE LENGTH({col}) END"
+            )
+        if isinstance(arg0, ast.PropertyReference):
             col = args[0]
             return (
                 f"CASE WHEN SUBSTRING({col}, 1, 1) IN ('[', '{{') "
@@ -8924,6 +9245,19 @@ def _expr_to_cypher_text(expr) -> str:
             op = _ARITH_OPS[fn]
             left = _expr_to_cypher_text(expr.arguments[0])
             right = _expr_to_cypher_text(expr.arguments[1])
+            # Preserve parentheses: wrap sub-arith-expressions to match original Cypher text.
+            # The parser encodes explicit parens by placing a lower-precedence op as a
+            # direct argument. Wrap right operand if it is itself a binary arithmetic expr.
+            _PREC = {"^": 4, "*": 3, "/": 3, "%": 3, "+": 2, "-": 2}
+            def _needs_paren(arg, parent_op):
+                if not (isinstance(arg, ast.FunctionCall) and arg.function_name in _ARITH_OPS and len(arg.arguments) == 2):
+                    return False
+                child_op = _ARITH_OPS[arg.function_name]
+                return _PREC.get(child_op, 0) < _PREC.get(parent_op, 0)
+            if _needs_paren(expr.arguments[1], op):
+                right = f"({right})"
+            if _needs_paren(expr.arguments[0], op):
+                left = f"({left})"
             return f"{left} {op} {right}"
         if fn == "__arith_unary-" and len(expr.arguments) == 1:
             return f"-{_expr_to_cypher_text(expr.arguments[0])}"
@@ -9267,6 +9601,22 @@ def translate_with_clause(with_clause, context):
                 _pval = context.input_params[_param_name]
                 if isinstance(_pval, bool) or isinstance(_pval, float) or isinstance(_pval, str) or isinstance(_pval, (list, dict)):
                     context.non_integer_index_vars.add(alias)
+
+        # Track non-map variables for property access TypeError enforcement.
+        # Scalars (int, float, bool, str) and lists cannot have properties accessed on them.
+        # Note: null (None) is NOT added here — property access on null returns null, not TypeError.
+        if isinstance(item.expression, ast.Literal):
+            _v = item.expression.value
+            if _v is not None and not isinstance(_v, dict):
+                context.non_map_vars.add(alias)
+        # ast.ListLiteral does not exist — list literals are Literal(value=list)
+        # Already handled above by the isinstance(item.expression, ast.Literal) branch
+        elif isinstance(item.expression, ast.Variable):
+            _param_name = item.expression.name
+            if _param_name in context.input_params:
+                _pval = context.input_params[_param_name]
+                if not isinstance(_pval, dict):
+                    context.non_map_vars.add(alias)
 
         # Edge variables: expose qualifiers JSON so downstream r.prop works via JSON_VALUE(r, '$.prop')
         if (isinstance(item.expression, ast.Variable)
