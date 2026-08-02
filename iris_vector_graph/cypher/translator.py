@@ -2587,7 +2587,32 @@ def _merge_pattern_existence_sql(merge_node):
     return " ".join(prop_joins_parts), prop_params
 
 
+def _validate_merge_pattern_no_null_properties(merge_node):
+    """Validate that MERGE pattern does not contain null property values.
+
+    Cypher semantic rule: null is "unknown" and cannot be matched.
+    Merging on a null property value is a semantic error (MergeReadOwnWrites).
+
+    Raises ValueError if any property in the merge pattern has a null literal value.
+    """
+    if not merge_node:
+        return
+
+    props = merge_node.properties if hasattr(merge_node, 'properties') else {}
+    for key, value in props.items():
+        if isinstance(value, ast.Literal) and value.value is None:
+            raise ValueError(
+                "Cannot merge on null property value: "
+                f"property '{key}' has value null"
+            )
+
+
 def translate_merge_clause(merge, context, metadata):
+    # Validate that MERGE pattern does not contain null property values.
+    # Cypher semantic rule: null cannot be matched in MERGE operations.
+    merge_node = merge.pattern.nodes[0] if merge.pattern.nodes else None
+    _validate_merge_pattern_no_null_properties(merge_node)
+
     # Snapshot context state before translate_create_clause so we can replace the
     # UUID-based DMLs and WHERE with label/property-based equivalents.
     _pre_dml_len = len(context.dml_statements)
