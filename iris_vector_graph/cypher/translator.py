@@ -2419,12 +2419,39 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
                 new_ob_items.append(ob_item)
         if sort_injections:
             order_by_items = new_ob_items
-            # Inject sort columns into base SELECT (before first \nFROM at top level)
+            # Inject sort columns into base SELECT (before first \nFROM at top level).
+            # For bare property references (p\d+.val), use numeric-aware projection:
+            # project both a DOUBLE column (for numeric sort) and the raw string column.
+            # The ORDER BY in OVER() references both: numeric first, string second.
+            # This matches Cypher semantics: numbers sort before strings, NULL sorts last.
+            _bare_prop_re = _re_sort.compile(r'^p\d+\.val$')
             _from_pat = _re_sort.search(r'\nFROM ', sql)
+            adjusted_ob_items = list(order_by_items)
             for sort_expr, sort_col in sort_injections:
-                if _from_pat:
-                    sql = sql[:_from_pat.start()] + f", {sort_expr} AS {sort_col}" + sql[_from_pat.start():]
-                    _from_pat = _re_sort.search(r'\nFROM ', sql)  # recompute after insert
+                if _bare_prop_re.match(sort_expr):
+                    # Project both numeric and string variants
+                    num_col = f"{sort_col}_n"
+                    str_col = f"{sort_col}_s"
+                    num_expr = f"CASE WHEN ISNUMERIC({sort_expr}) = 1 THEN CAST({sort_expr} AS DOUBLE) END"
+                    # Find direction from order_by_items
+                    direction = "ASC"
+                    for ob in adjusted_ob_items:
+                        if ob.startswith(f"{sort_col} "):
+                            direction = ob.split()[-1].upper()
+                            break
+                    if _from_pat:
+                        sql = sql[:_from_pat.start()] + f", {num_expr} AS {num_col}, {sort_expr} AS {str_col}" + sql[_from_pat.start():]
+                        _from_pat = _re_sort.search(r'\nFROM ', sql)
+                    # Replace __sortN with __sortN_n ASC, __sortN_s ASC in order_by_items
+                    adjusted_ob_items = [
+                        f"{num_col} {direction}, {str_col} {direction}" if ob == f"{sort_col} {direction}" else ob
+                        for ob in adjusted_ob_items
+                    ]
+                else:
+                    if _from_pat:
+                        sql = sql[:_from_pat.start()] + f", {sort_expr} AS {sort_col}" + sql[_from_pat.start():]
+                        _from_pat = _re_sort.search(r'\nFROM ', sql)
+            order_by_items = adjusted_ob_items
     sql = apply_pagination(sql, cypher_query, context, order_by_items)
     vl = context.var_length_paths or None
 
