@@ -865,9 +865,20 @@ class Parser:
         direction = ast.Direction.BOTH
 
         if self.matches(TokenType.ARROW_LEFT):
-            # <-[...]-  or <-- (anonymous incoming)
+            # <-[...]-  or <-- (anonymous incoming) or <--> (anonymous bidirected)
+            # Lexer tokenizes <-- as ARROW_LEFT + MINUS, and <--> as ARROW_LEFT + ARROW_RIGHT.
             direction = ast.Direction.INCOMING
-            if self.peek().kind == TokenType.MINUS:
+            if self.peek().kind == TokenType.ARROW_RIGHT:
+                # <--> bidirectional anonymous relationship (lexer: ARROW_LEFT + ARROW_RIGHT)
+                self.eat()  # consume ->
+                return ast.RelationshipPattern(
+                    variable=None,
+                    types=[],
+                    direction=ast.Direction.BOTH,
+                    properties={},
+                    variable_length=None,
+                )
+            elif self.peek().kind == TokenType.MINUS:
                 # Consume the second MINUS
                 self.eat()
                 # Now check if it's <-- (anonymous) or <-[...-
@@ -928,6 +939,7 @@ class Parser:
             if type_tok.value:
                 types.append(type_tok.value)
             while self.matches(TokenType.PIPE):
+                self.matches(TokenType.COLON)  # optional colon after pipe: [:T|:U] or [:T|U]
                 next_type_tok = self.expect_label()
                 if next_type_tok.value:
                     types.append(next_type_tok.value)

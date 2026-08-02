@@ -608,18 +608,19 @@ class TestQuantifierExpressions:
         assert "=" in sql
 
     def test_single_quantifier_multiple_subqueries(self):
-        """Test single() uses distinct aliases for multiple subqueries.
+        """Test single() uses the aggregation approach with a single JSON_TABLE scan.
 
-        The second WHEN condition checks if count = 0, which needs a separate
-        subquery with a different alias to avoid alias collision.
+        The aggregation approach computes sat/dfail/tot in one pass to avoid
+        alias duplication across sibling subqueries (IRIS LoadTableFunction crash).
         """
         query = "RETURN single(x IN [1, 2, 3] WHERE x = 2) AS result"
         result = translate_to_sql(parse_query(query))
         sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
-        # Should have at least two JSON_TABLE clauses with different aliases
+        # Should use exactly one JSON_TABLE scan (aggregation approach)
         assert "JSON_TABLE" in sql
-        # Count occurrences of "JSON_TABLE" to verify multiple subqueries
-        assert sql.count("JSON_TABLE") >= 3  # Main + null check + alias variations
+        assert sql.count("JSON_TABLE") == 1
+        # Aggregation approach uses sat/dfail/tot aliases
+        assert ".sat" in sql and ".dfail" in sql and ".tot" in sql
 
     def test_all_quantifier_literal_list(self):
         """Test all(x IN list WHERE condition) with literal list."""

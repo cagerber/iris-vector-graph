@@ -396,6 +396,46 @@ class TranslationContext:
     def build_stage_sql(
         self, distinct: bool = False, select_override: Optional[str] = None
     ) -> tuple[str, List[Any]]:
+        # IRIS bug workaround: multiple JSON_TABLE subqueries in a single SELECT
+        # with no FROM clause crash IRIS with <LIST>LoadTableFunction.
+        # Restructure as CROSS JOIN of subqueries when this pattern is detected.
+        if (
+            not select_override
+            and not self.from_clauses
+            and not self.join_clauses
+            and not self.where_conditions
+            and not self.group_by_items
+            and not self.having_conditions
+        ):
+            jt_items = [si for si in self.select_items if "JSON_TABLE" in si]
+            if len(jt_items) >= 2:
+                import re as _re
+                _alias_re = _re.compile(r'^(.*?)\s+AS\s+"([^"]+)"\s*$', _re.DOTALL)
+                subqueries = []
+                outer_cols = []
+                for idx, item in enumerate(self.select_items):
+                    sq_alias = f"_jt{idx}"
+                    m = _alias_re.match(item)
+                    if m and "JSON_TABLE" in m.group(1):
+                        expr = m.group(1).strip()
+                        col_alias = m.group(2)
+                        subqueries.append(f"(SELECT {expr} AS v) {sq_alias}")
+                        outer_cols.append(f'{sq_alias}.v AS "{col_alias}"')
+                    else:
+                        subqueries.append(None)
+                        outer_cols.append(item)
+                jt_subqueries = [(i, sq) for i, sq in enumerate(subqueries) if sq is not None]
+                if len(jt_subqueries) >= 2:
+                    from_part = jt_subqueries[0][1]
+                    join_parts = [f"CROSS JOIN {sq}" for _, sq in jt_subqueries[1:]]
+                    sql = (
+                        f"SELECT {'DISTINCT ' if distinct else ''}{', '.join(outer_cols)}\n"
+                        f"FROM {from_part}"
+                    )
+                    if join_parts:
+                        sql += "\n" + "\n".join(join_parts)
+                    return sql, list(self.select_params)
+
         select = (
             select_override
             if select_override
@@ -2453,29 +2493,40 @@ def preprocess_order_by(query: ast.CypherQuery, context: TranslationContext) -> 
                             f"and a non-aggregate is ambiguous in ORDER BY."
                         )
 
-        # UndefinedVariable in ORDER BY after DISTINCT: only returned expressions are available
+        # UndefinedVariable in ORDER BY after DISTINCT: ORDER BY must reference
+        # only projected expressions or properties of projected node variables.
+        # Rule: if only scalar properties are projected (e.g. a.name), then ORDER BY
+        # must use the exact same expression or refer to a returned full node variable.
         if ret.distinct:
             returned_texts = set()
+            returned_full_vars = set()  # full node/edge variables (not just property refs)
             for ri in ret.items:
                 returned_texts.add(_expr_to_cypher_text(ri.expression))
                 if ri.alias:
                     returned_texts.add(ri.alias)
+                # Collect full variable returns (RETURN DISTINCT a → a is a full variable)
+                if isinstance(ri.expression, ast.Variable):
+                    returned_full_vars.add(ri.expression.name)
             for ob_item in query.order_by_clause.items:
                 ob_text = _expr_to_cypher_text(ob_item.expression)
-                if ob_text not in returned_texts:
-                    # Check if any variable in the ORDER BY expression is not in the returned set
-                    ob_vars = _collect_var_names(ob_item.expression)
-                    ret_vars: set = set()
-                    for ri in ret.items:
-                        ret_vars |= _collect_var_names(ri.expression)
-                    undefined = ob_vars - ret_vars
-                    # UndefinedVariable if ORDER BY references vars not in the RETURN projection
-                    if undefined and ob_vars:
-                        raise SyntaxError(
-                            f"UndefinedVariable: In a WITH/RETURN with DISTINCT or aggregation, "
-                            f"the ORDER BY must refer to variables returned in the projection: "
-                            f"{undefined}"
-                        )
+                if ob_text in returned_texts:
+                    continue  # exact match — OK
+                if not _expr_references_variable(ob_item.expression):
+                    continue  # literal or parameter — OK
+                # Check if the ORDER BY root variable is a full returned variable
+                # (if RETURN DISTINCT a is in scope, ORDER BY a.anything is OK)
+                ob_root_var = None
+                if isinstance(ob_item.expression, ast.PropertyReference):
+                    ob_root_var = ob_item.expression.variable
+                elif isinstance(ob_item.expression, ast.Variable):
+                    ob_root_var = ob_item.expression.name
+                if ob_root_var and ob_root_var in returned_full_vars:
+                    continue  # property of a returned node variable — OK
+                # ORDER BY references something not accessible from the RETURN projection
+                raise SyntaxError(
+                    f"UndefinedVariable: In a RETURN with DISTINCT, "
+                    f"the ORDER BY must refer to variables returned in the projection."
+                )
 
         # UndefinedVariable in ORDER BY with aggregation: ORDER BY variable must be in RETURN
         if ret_has_agg:
@@ -3823,12 +3874,6 @@ def translate_match_clause(match_clause, context, metadata):
                     self_loop_vars.add(node.variable)
                 else:
                     node_vars_in_pattern[node.variable] = idx_n
-                # Also check if this variable was already seen in this MATCH clause
-                if node.variable in vars_in_match and node.variable not in self_loop_vars:
-                    raise CypherParseError(
-                        f"VariableAlreadyBound: variable '{node.variable}' is already bound "
-                        f"in this MATCH clause"
-                    )
                 vars_in_match.add(node.variable)
         # Track rel vars in a separate set (rel vars can't be duplicated)
         rel_vars_in_pattern: set = set()
