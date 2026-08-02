@@ -4523,8 +4523,23 @@ def _boolean_expr_logical(op, expr, context):
         sa = _coerce_varchar_boolean_if_needed(a, sa, context)
         sb = translate_boolean_expression(b, context)
         sb = _coerce_varchar_boolean_if_needed(b, sb, context)
+        # Three-valued XOR logic:
+        # - true XOR true = false
+        # - true XOR false = true
+        # - false XOR false = false
+        # - true XOR null = null
+        # - false XOR null = null
+        # - null XOR null = null
+        # Implementation: CASE WHEN sa IS NULL OR sb IS NULL THEN NULL
+        #                 ELSE (sa AND NOT sb) OR (NOT sa AND sb) END
+        # But when both are constants we can simplify.
         if sa == "NULL" or sb == "NULL":
-            return "NULL"
+            # At least one is NULL: result is NULL if either operand is NULL
+            if sa == "NULL" and sb == "NULL":
+                return "NULL"
+            # One is NULL: always NULL
+            return f"CASE WHEN {sa} IS NULL OR {sb} IS NULL THEN NULL ELSE (({sa} AND NOT ({sb})) OR (NOT ({sa}) AND {sb})) END"
+        # Both are non-NULL expressions: simple XOR
         return f"(({sa} AND NOT ({sb})) OR (NOT ({sa}) AND {sb}))"
     if op == ast.BooleanOperator.NOT:
         # Type validation: NOT requires boolean operand
@@ -5016,11 +5031,13 @@ def _expr_arith(expr, context, segment):
                     js = _json.dumps(combined)
                     return f"CAST('{js.replace(chr(39), chr(39)+chr(39))}' AS VARCHAR({max(len(js)+1, 256)}))"
             # Runtime: JSON array concat via subquery building
+            # Generate row numbers up to 100 to handle practical list sizes (each element is extracted)
+            row_gen = "SELECT 0 AS n" + "".join(f" UNION ALL SELECT {i}" for i in range(1, 100))
             return (
                 f"(SELECT JSON_ARRAYAGG(x.v) FROM ("
-                f"SELECT JSON_VALUE({left}, '$[' || rn.n || ']') AS v FROM (SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) rn WHERE rn.n < JSON_ARRAYLENGTH({left})"
+                f"SELECT JSON_VALUE({left}, '$[' || rn.n || ']') AS v FROM ({row_gen}) rn WHERE rn.n < SQLUser.JSON_ARRAYLENGTH({left})"
                 f" UNION ALL "
-                f"SELECT JSON_VALUE({right}, '$[' || rn.n || ']') AS v FROM (SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) rn WHERE rn.n < JSON_ARRAYLENGTH({right})"
+                f"SELECT JSON_VALUE({right}, '$[' || rn.n || ']') AS v FROM ({row_gen}) rn WHERE rn.n < SQLUser.JSON_ARRAYLENGTH({right})"
                 f") x)"
             )
         # Numeric +: cast property references to DOUBLE
@@ -5150,26 +5167,27 @@ def _expr_list_comprehension(expr, context, segment):
     source_sql = translate_expression(expr.source, context, segment="inline")
     var = sanitize_identifier(expr.variable)
     alias = context.next_alias("lc")
-    context.variable_aliases[expr.variable] = alias
+    # Map the variable to the alias.var reference for JSON_TABLE column access
+    context.variable_aliases[expr.variable] = f"{alias}.{var}"
+    # Mark as scalar variable so property access uses JSON_VALUE
+    context.scalar_variables.add(expr.variable)
     where_clause = ""
     if expr.predicate:
         if isinstance(expr.predicate, ast.BooleanExpression):
             pred_sql = translate_boolean_expression(expr.predicate, context)
         else:
             pred_sql = translate_expression(expr.predicate, context, segment="inline")
-        for col in ("node_id", "p", "val", "label"):
-            pred_sql = pred_sql.replace(f"{alias}.{col}", f"{alias}.{var}")
         where_clause = f" WHERE {pred_sql}"
     select_expr = f"{alias}.{var}"
     if expr.projection:
         proj_sql = translate_expression(expr.projection, context, segment="inline")
-        for col in ("node_id", "p", "val", "label"):
-            proj_sql = proj_sql.replace(f"{alias}.{col}", f"{alias}.{var}")
         select_expr = proj_sql
     del context.variable_aliases[expr.variable]
+    context.scalar_variables.discard(expr.variable)
+    # Use VARCHAR to support both scalar values and JSON objects
     return (
         f"(SELECT JSON_ARRAYAGG({select_expr}) FROM "
-        f"JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} INTEGER PATH '$')) {alias}"
+        f"JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} VARCHAR(32767) PATH '$')) {alias}"
         f"{where_clause})"
     )
 
