@@ -1584,6 +1584,22 @@ def _to_sql_handle_foreach(clause, context: TranslationContext, metadata) -> boo
     return True
 
 
+def _inject_row_number(sql: str, rn_over: str) -> str:
+    """Inject ROW_NUMBER() OVER(rn_over) AS __rn into a SELECT statement.
+
+    Inserts after the first SELECT (or SELECT DISTINCT), so the result can be
+    used directly in a CTE body without nesting — IRIS %qaqpre crashes on
+    ROW_NUMBER() OVER() inside a nested subquery in a CTE.
+    """
+    idx = sql.upper().find("SELECT ")
+    if idx < 0:
+        return sql
+    insert_at = idx + len("SELECT ")
+    if sql[insert_at:insert_at + 9].upper().startswith("DISTINCT "):
+        insert_at += len("DISTINCT ")
+    return sql[:insert_at] + f"ROW_NUMBER() OVER({rn_over}) AS __rn, " + sql[insert_at:]
+
+
 def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=None) -> None:
     translate_with_clause(part.with_clause, context)
 
@@ -1704,15 +1720,35 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
     if order_by_items or limit is not None or skip is not None:
         has_join = "\nJOIN " in sql or " JOIN " in sql
 
-        # ORDER BY items here are safe to use in OVER() — sort columns were projected as
-        # __sort_N aliases above (sort_projections), so no JOIN-level aliases remain.
-        rn_over = f"ORDER BY {', '.join(order_by_items)}" if order_by_items else ""
+        # For OVER() in ROW_NUMBER when using _inject_row_number: sort alias (__sort0 etc.)
+        # are in the same SELECT scope as ROW_NUMBER, so IRIS can't resolve them in OVER().
+        # Build rn_over_inline that substitutes the actual expression for each sort alias.
+        def _ob_with_exprs(ob_items, sp):
+            result = []
+            for item in ob_items:
+                for alias, expr in sp:
+                    if item.startswith(f"{alias} "):
+                        direction = item.split()[-1]
+                        item = f"({expr}) {direction}"
+                        break
+                result.append(item)
+            return result
+        _ob_exprs = _ob_with_exprs(order_by_items, sort_projections)
+        rn_over = f"ORDER BY {', '.join(_ob_exprs)}" if _ob_exprs else ""
         if limit is not None and skip is not None:
-            # SKIP+LIMIT: ROW_NUMBER subquery (no FETCH FIRST, no ORDER BY in CTE body)
+            # SKIP+LIMIT: inject ROW_NUMBER into the query directly (no nested subquery),
+            # then filter with a second CTE. IRIS cannot handle ROW_NUMBER OVER in a
+            # nested subquery inside a CTE (qaqpre crash on AI builds).
+            _rn_stage = f"Stage{i + 1}_rn"
+            _rn_sql = _inject_row_number(sql, rn_over)
+            # The rn_over substitution adds sort-expr params BEFORE the existing params in Stage1_rn.
+            # Each substituted sort alias has its params appearing once in OVER() and once in __sortN.
+            _rn_stage_params = sort_expr_params + stage_params
+            context.all_stage_params.extend(_rn_stage_params)
+            context.stages.append(f"{_rn_stage} AS (\n{_rn_sql}\n)")
+            stage_params = []
             sql = (
-                f"SELECT * FROM (\n"
-                f"SELECT ROW_NUMBER() OVER({rn_over}) AS __rn, __q.* FROM ({sql}) __q\n"
-                f") __paged WHERE __rn > {skip} AND __rn <= {skip + limit} ORDER BY __rn"
+                f"SELECT * FROM {_rn_stage} WHERE __rn > {skip} AND __rn <= {skip + limit}"
             )
         elif limit is not None:
             if order_by_items:
@@ -1729,16 +1765,13 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
             else:
                 sql += f"\nFETCH FIRST {limit} ROWS ONLY"
         elif skip is not None:
-            # SKIP only
-            if order_by_items or has_join:
-                # ROW_NUMBER on JOIN query to avoid OFFSET in CTE
-                sql = (
-                    f"SELECT * FROM (\n"
-                    f"SELECT ROW_NUMBER() OVER({rn_over}) AS __rn, __q.* FROM ({sql}) __q\n"
-                    f") __paged WHERE __rn > {skip} ORDER BY __rn"
-                )
-            else:
-                sql += f"\nOFFSET {skip} ROWS"
+            # SKIP only: inject ROW_NUMBER into query, filter in second CTE.
+            _rn_stage = f"Stage{i + 1}_rn"
+            _rn_sql = _inject_row_number(sql, rn_over)
+            context.all_stage_params.extend(stage_params)
+            context.stages.append(f"{_rn_stage} AS (\n{_rn_sql}\n)")
+            stage_params = []
+            sql = f"SELECT * FROM {_rn_stage} WHERE __rn > {skip}"
         elif order_by_items:
             # ORDER BY only (no LIMIT/SKIP): wrap to keep ORDER BY out of CTE body
             sql = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
