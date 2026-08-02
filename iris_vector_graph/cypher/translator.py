@@ -1786,6 +1786,42 @@ def _tts_union_branches(cypher_query, params):
         return None
     branches = [cypher_query] + [uq["query"] for uq in cypher_query.union_queries]
     all_flags = [False] + [uq["all"] for uq in cypher_query.union_queries]
+
+    # Mixing UNION and UNION ALL in the same query is a SyntaxError.
+    if len(all_flags) > 1:
+        has_all = any(all_flags[1:])
+        has_distinct = not all(all_flags[1:])
+        if has_all and has_distinct:
+            raise SyntaxError(
+                "Cannot mix UNION and UNION ALL in the same query"
+            )
+
+    # All branches must return the same columns (same names, same order).
+    def _branch_columns(branch):
+        rc = branch.return_clause
+        if rc is None:
+            return []
+        cols = []
+        for item in rc.items:
+            if item.alias:
+                cols.append(item.alias)
+            elif hasattr(item.expression, "name"):
+                cols.append(item.expression.name)
+            elif hasattr(item.expression, "variable"):
+                cols.append(item.expression.variable)
+            else:
+                cols.append(None)
+        return cols
+
+    first_cols = _branch_columns(branches[0])
+    for i, branch in enumerate(branches[1:], 1):
+        cols = _branch_columns(branch)
+        if cols and first_cols and cols != first_cols:
+            raise SyntaxError(
+                f"All UNION branches must have the same column names: "
+                f"{first_cols!r} vs {cols!r}"
+            )
+
     sqls = []
     all_params = []
     for branch in branches:

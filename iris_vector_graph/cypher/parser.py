@@ -342,7 +342,7 @@ class Parser:
             expr = self.parse_expression()
             alias = None
             if self.matches(TokenType.AS):
-                alias = self.expect(TokenType.IDENTIFIER).value
+                alias = self.expect_identifier_or_keyword().value
 
             items.append(ast.ReturnItem(expression=expr, alias=alias))
 
@@ -469,7 +469,7 @@ class Parser:
         self.expect(TokenType.UNWIND)
         expr = self.parse_expression()
         self.expect(TokenType.AS)
-        alias_tok = self.expect(TokenType.IDENTIFIER)
+        alias_tok = self.expect_identifier_or_keyword()
         alias = alias_tok.value
         if alias is None:
             raise CypherParseError(
@@ -762,7 +762,16 @@ class Parser:
     def parse_set_items(self) -> List[ast.SetItem]:
         items = []
         while True:
-            target = self.parse_primary_expression()
+            target = self.parse_power_expression()
+            # (n).prop is parsed as PropertyAccessExpression(Variable, prop) — normalize to PropertyReference
+            if (
+                isinstance(target, ast.PropertyAccessExpression)
+                and isinstance(target.expression, ast.Variable)
+            ):
+                target = ast.PropertyReference(
+                    variable=target.expression.name,
+                    property_name=target.property_name,
+                )
             if not isinstance(target, (ast.PropertyReference, ast.Variable)):
                 raise CypherParseError(
                     "SET target must be property reference or variable"
@@ -791,7 +800,16 @@ class Parser:
         self.expect(TokenType.REMOVE)
         items = []
         while True:
-            target = self.parse_primary_expression()
+            target = self.parse_power_expression()
+            # (n).prop normalized to PropertyReference
+            if (
+                isinstance(target, ast.PropertyAccessExpression)
+                and isinstance(target.expression, ast.Variable)
+            ):
+                target = ast.PropertyReference(
+                    variable=target.expression.name,
+                    property_name=target.property_name,
+                )
             if not isinstance(target, (ast.PropertyReference, ast.Variable)):
                 raise CypherParseError(
                     "REMOVE target must be property reference or variable"
@@ -1036,7 +1054,7 @@ class Parser:
             expr = self.parse_expression()
             alias = None
             if self.matches(TokenType.AS):
-                alias = self.expect(TokenType.IDENTIFIER).value
+                alias = self.expect_identifier_or_keyword().value
 
             items.append(ast.ReturnItem(expression=expr, alias=alias))
 
@@ -1411,7 +1429,7 @@ class Parser:
                 and self.peek().kind == TokenType.LPAREN
             ):
                 self.eat()
-                var_tok = self.expect(TokenType.IDENTIFIER)
+                var_tok = self.expect_identifier_or_keyword()
                 var_name = var_tok.value
                 self.expect(TokenType.IN)
                 source = self.parse_expression()
@@ -1428,12 +1446,12 @@ class Parser:
 
             if name.lower() == "reduce" and self.peek().kind == TokenType.LPAREN:
                 self.eat()
-                acc_tok = self.expect(TokenType.IDENTIFIER)
+                acc_tok = self.expect_identifier_or_keyword()
                 acc_name = acc_tok.value
                 self.expect(TokenType.EQUALS)
                 init_expr = self.parse_expression()
                 self.expect(TokenType.COMMA)
-                var_tok = self.expect(TokenType.IDENTIFIER)
+                var_tok = self.expect_identifier_or_keyword()
                 var_name = var_tok.value
                 self.expect(TokenType.IN)
                 source = self.parse_expression()
@@ -1453,7 +1471,7 @@ class Parser:
                 and self.peek().kind == TokenType.LPAREN
             ):
                 self.eat()
-                var_tok = self.expect(TokenType.IDENTIFIER)
+                var_tok = self.expect_identifier_or_keyword()
                 var_name = var_tok.value
                 self.expect(TokenType.IN)
                 source = self.parse_expression()
@@ -1601,7 +1619,7 @@ class Parser:
         ):
             self.eat()
             self.eat()
-            var_tok = self.expect(TokenType.IDENTIFIER)
+            var_tok = self.expect_identifier_or_keyword()
             var_name = var_tok.value
             self.expect(TokenType.IN)
             source = self.parse_expression()
@@ -1653,6 +1671,30 @@ class Parser:
         if tok.kind == TokenType.NULL:
             self.eat()
             return ast.Literal(None)
+
+        # Contextual keywords used as variable/function names (e.g. ROWS, FIRST, etc.)
+        if tok.value and tok.value.replace("_", "").replace("-", "").isalnum():
+            name = self.eat().value
+            # Check for function call
+            if self.peek().kind == TokenType.LPAREN:
+                self.eat()
+                args = []
+                distinct = False
+                if self.peek().kind == TokenType.DISTINCT:
+                    distinct = True
+                    self.eat()
+                while self.peek().kind not in (TokenType.RPAREN, TokenType.EOF):
+                    args.append(self.parse_expression())
+                    if not self.matches(TokenType.COMMA):
+                        break
+                self.expect(TokenType.RPAREN)
+                return ast.FunctionCall(
+                    function_name=name,
+                    arguments=args,
+                    distinct=distinct,
+                )
+            # Plain variable reference
+            return ast.Variable(name=name)
 
         raise CypherParseError(
             f"Unexpected token in expression: {tok.kind}", tok.line, tok.column
