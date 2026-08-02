@@ -4341,6 +4341,14 @@ def _expr_map_literal(expr, context, segment):
         elif isinstance(v, ast.Literal) and isinstance(v.value, str):
             safe_v = v.value.replace("\\", "\\\\").replace('"', '\\"').replace("'", "''")
             parts.append(f"'\"'||'{safe_k}'||'\":\"'||'{safe_v}'||'\"'")
+        elif isinstance(v, ast.MapLiteral):
+            # Nested map: the value is already a JSON object — no extra quotes
+            val_sql = translate_expression(v, context, segment=segment)
+            parts.append(f"'\"'||'{safe_k}'||'\":'||CAST({val_sql} AS VARCHAR)")
+        elif isinstance(v, ast.Literal) and isinstance(v.value, list):
+            # Nested list literal: already a JSON array — no extra quotes
+            val_sql = translate_expression(v, context, segment=segment)
+            parts.append(f"'\"'||'{safe_k}'||'\":'||CAST({val_sql} AS VARCHAR)")
         else:
             val_sql = translate_expression(v, context, segment=segment)
             parts.append(f"'\"'||'{safe_k}'||'\":\"'||CAST({val_sql} AS VARCHAR)||'\"'")
@@ -5633,6 +5641,9 @@ def _expr_to_cypher_text(expr) -> str:
         return f"({expr.variable}:{expr.label})"
     if isinstance(expr, ast.PropertyReference):
         return f"{expr.variable}.{expr.property_name}"
+    if isinstance(expr, ast.PropertyAccessExpression):
+        base = _expr_to_cypher_text(expr.expression)
+        return f"{base}.{expr.property_name}" if base else f".{expr.property_name}"
     if isinstance(expr, ast.Variable):
         return expr.name
     if isinstance(expr, ast.Literal):
