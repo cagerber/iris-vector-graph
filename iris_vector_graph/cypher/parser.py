@@ -534,6 +534,47 @@ class Parser:
             test_expression=test_expr,
         )
 
+    def _is_pattern_predicate_start(self) -> bool:
+        """Return True if current position starts a pattern predicate like (n)-[]->().
+
+        Pattern predicates in WHERE clauses look like:
+          (n)-[r]->() or (n)-->() or (n)<-[]-() or (n)-[]-()
+        Distinguished from parenthesized expressions by the presence of a
+        relationship indicator (-[ or --> or <-) after the closing ) of the node.
+        """
+        tokens = self.lexer.tokens
+        i = self.lexer.token_index
+        if i >= len(tokens) or tokens[i].kind != TokenType.LPAREN:
+            return False
+        # Scan past the node pattern (...)
+        depth = 0
+        j = i
+        while j < len(tokens):
+            t = tokens[j]
+            if t.kind == TokenType.LPAREN:
+                depth += 1
+            elif t.kind == TokenType.RPAREN:
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            elif depth == 1 and t.kind == TokenType.DOT:
+                # Property access inside the paren — this is an expression like (a.x + 1)
+                return False
+            elif depth == 1 and t.kind in (TokenType.PLUS, TokenType.SLASH,
+                                            TokenType.STAR, TokenType.PERCENT):
+                return False
+            j += 1
+        else:
+            return False
+        # After the closing ), check for relationship indicators
+        # Skip whitespace (already handled by lexer)
+        if j >= len(tokens):
+            return False
+        nxt = tokens[j]
+        # Pattern continuations: - (for -[]-> or --> or ---) or <- (for <-[]-  or <--)
+        return nxt.kind in (TokenType.MINUS, TokenType.LESS_THAN, TokenType.ARROW_LEFT)
+
     def _is_pattern_comprehension_start(self) -> bool:
         i = self.lexer.token_index
         tokens = self.lexer.tokens
@@ -1139,6 +1180,14 @@ class Parser:
             return self.parse_case_expression()
 
         if tok.kind == TokenType.LPAREN:
+            if self._is_pattern_predicate_start():
+                # Pattern predicate: (n)-[r]->() in WHERE clause — treat as exists { pattern }
+                pattern = self.parse_graph_pattern()
+                where_cond = None
+                if self.peek().kind == TokenType.WHERE:
+                    self.eat()
+                    where_cond = self.parse_expression()
+                return ast.ExistsExpression(pattern=pattern, negated=False, where_condition=where_cond)
             self.eat()
             expr = self.parse_expression()
             self.expect(TokenType.RPAREN)
