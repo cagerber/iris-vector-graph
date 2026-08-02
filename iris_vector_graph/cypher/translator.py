@@ -1671,7 +1671,7 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
                     context._orderby_alias_sql = prev_ob_map
                     # If the expression references JOIN aliases (p\d+.val) or a correlated
                     # rdf_props subquery, it cannot be used in OVER() — project it as a sort column.
-                    if _re_ob.search(r'\bp\d+\.val\b', expr) or 'rdf_props' in expr:
+                    if _re_ob.search(r'\b(?:%EXACT\()?p\d+\.val\)?', expr) or 'rdf_props' in expr:
                         sort_alias = f"__sort{len(sort_projections)}"
                         sort_projections.append((sort_alias, expr))
                         order_by_items.append(f"{sort_alias} {direction}")
@@ -2438,7 +2438,7 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
     _has_limit = cypher_query.limit is not None
     if fetch_first_unsafe and order_by_items and (_has_skip or _has_limit):
         import re as _re_sort
-        _join_alias_re = _re_sort.compile(r'\bp\d+\.val\b')
+        _join_alias_re = _re_sort.compile(r'\b(?:%EXACT\()?p\d+\.val\)?')
         new_ob_items = []
         sort_injections = []
         for i, ob_item in enumerate(order_by_items):
@@ -2453,11 +2453,11 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
         if sort_injections:
             order_by_items = new_ob_items
             # Inject sort columns into base SELECT (before first \nFROM at top level).
-            # For bare property references (p\d+.val), use numeric-aware projection:
-            # project both a DOUBLE column (for numeric sort) and the raw string column.
+            # For bare property references (p\d+.val or %EXACT(p\d+.val)), use numeric-aware
+            # projection: project both a DOUBLE column (for numeric sort) and the raw string.
             # The ORDER BY in OVER() references both: numeric first, string second.
             # This matches Cypher semantics: numbers sort before strings, NULL sorts last.
-            _bare_prop_re = _re_sort.compile(r'^p\d+\.val$')
+            _bare_prop_re = _re_sort.compile(r'^(?:%EXACT\()?p\d+\.val\)?$')
             _from_pat = _re_sort.search(r'\nFROM ', sql)
             adjusted_ob_items = list(order_by_items)
             for sort_expr, sort_col in sort_injections:
@@ -12384,6 +12384,10 @@ def translate_return_clause(ret, context):
                     context.group_by_items.append(node_expr)
                 continue
         sql = translate_expression(item.expression, context, segment="select")
+        # IRIS VARCHAR collation uppercases string values in SELECT/GROUP BY/DISTINCT.
+        # Wrap bare property-value references (p\d+.val) with %EXACT() to preserve case.
+        import re as _re_exact
+        sql = _re_exact.sub(r'\bp(\d+)\.val\b', r'%EXACT(p\1.val)', sql)
         alias = item.alias
         user_provided_alias = alias is not None  # True when user wrote AS <alias>
         cypher_col = None  # Cypher-text column name for post-execution remapping
@@ -12480,6 +12484,10 @@ def translate_with_clause(with_clause, context):
     # Process WITH clause items: translate expressions and add to select
     for item in with_clause.items:
         sql = translate_expression(item.expression, context, segment="select")
+        # IRIS VARCHAR collation uppercases string values in SELECT/GROUP BY/DISTINCT.
+        # Wrap bare property-value references with %EXACT() to preserve case.
+        import re as _re_exact_w
+        sql = _re_exact_w.sub(r'\bp(\d+)\.val\b', r'%EXACT(p\1.val)', sql)
         alias = item.alias
         if alias is None:
             if isinstance(item.expression, ast.PropertyReference):
