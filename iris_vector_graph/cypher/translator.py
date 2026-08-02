@@ -1629,9 +1629,19 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
                 )
             else:
                 try:
+                    # Map WITH-projected aliases to bare column names so ORDER BY arithmetic
+                    # expressions like `a + 2` emit `a + 2` not `u0.a + 2` (u0 is out of
+                    # scope in the outer SELECT * FROM (...) __ob ORDER BY ...).
+                    prev_ob_map = getattr(context, "_orderby_alias_sql", None)
+                    context._orderby_alias_sql = {
+                        name: _safe_alias(name) for name in with_aliases
+                    }
+                    if prev_ob_map:
+                        context._orderby_alias_sql.update(prev_ob_map)
                     # Use segment="inline" so numeric literals become inline constants.
                     # Property references add JOINs to context (join_params) as needed.
                     expr = translate_expression(item.expression, context, segment="inline")
+                    context._orderby_alias_sql = prev_ob_map
                     # If the expression references JOIN aliases (p\d+.val), it cannot be used
                     # directly in ORDER BY on the outer subquery — project it as a sort column.
                     import re as _re_ob
