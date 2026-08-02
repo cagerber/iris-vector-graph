@@ -6602,63 +6602,40 @@ def _expr_list_predicate(expr, context, segment):
         # Bare column reference (e.g. lp0.x) — treat as truth test
         where_pred = f"{where_pred} = 1"
 
-    # --- Aggregation approach ---
-    # Use a single JSON_TABLE scan with SUM aggregation to compute satisfy, dfail, and
-    # total counts.  This avoids duplicate alias names across sibling COUNT(*) subqueries
-    # which causes IRIS to crash with <LIST>LoadTableFunction when the predicate itself
-    # contains nested JSON_TABLE references (e.g. nested quantifier expressions).
-    #
-    # 3VL (three-valued logic) semantics preserved:
-    #   sat   = COUNT of rows where predicate is TRUE
-    #   dfail = COUNT of rows where predicate is FALSE (NOT pred is TRUE)
-    #   tot   = COUNT of all rows (null sentinel excluded if applicable)
-    #
-    # uncertain = tot - sat - dfail  (rows where predicate is NULL)
-    #
-    # - any:    true  if sat > 0;  null if sat=0 AND uncertain>0;  false otherwise
-    # - none:   false if sat > 0;  null if sat=0 AND uncertain>0;  true  otherwise
-    # - all:    false if dfail>0;  null if dfail=0 AND uncertain>0; true otherwise
-    # - single: false if sat>=2;   true if sat=1 AND uncertain=0;
-    #           null if uncertain>0 AND sat<=1; false otherwise
-    stats_alias = context.next_alias("lps")
-    # For null-sentinel case, filter out the sentinel row from aggregate counts.
-    sentinel_filter = f" WHERE {alias}.{var} IS NOT NULL" if null_sentinel else ""
-    agg_sql = (
-        f"(SELECT SUM(CASE WHEN {where_pred} THEN 1 ELSE 0 END) AS sat,"
-        f" SUM(CASE WHEN NOT ({where_pred}) THEN 1 ELSE 0 END) AS dfail,"
-        f" COUNT(*) AS tot"
-        f" FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {alias}"
-        f"{sentinel_filter}) {stats_alias}"
-    )
-    sat_ref = f"{stats_alias}.sat"
-    dfail_ref = f"{stats_alias}.dfail"
-    tot_ref = f"{stats_alias}.tot"
-    uncertain_expr = f"({tot_ref} - {sat_ref} - {dfail_ref})"
-
+    # 3VL single-pass aggregation: one JSON_TABLE scan, inline SUM expressions.
+    # No derived-table wrapper — avoids IRIS <UNDEFINED>corr in correlated contexts.
+    counts_alias = context.next_alias("qc")
+    sat_pred = where_pred.replace(f"{alias}.", f"{counts_alias}.")
+    not_pred = where_pred.replace(f"{alias}.", f"{counts_alias}.")
+    jt_from = f"FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {counts_alias}"
+    sat_expr = f"SUM(CASE WHEN {sat_pred} THEN 1 ELSE 0 END)"
+    dfail_expr = f"SUM(CASE WHEN NOT ({not_pred}) THEN 1 ELSE 0 END)"
+    total_expr = "COUNT(*)"
+    unc_expr = f"({total_expr} - {sat_expr} - {dfail_expr})"
     if expr.quantifier == "all":
         return (
-            f"(SELECT CASE WHEN ({dfail_ref} > 0) THEN 0"
-            f" WHEN ({uncertain_expr} > 0) THEN NULL"
-            f" ELSE 1 END FROM {agg_sql})"
+            f"(SELECT CASE WHEN {dfail_expr} > 0 THEN 0"
+            f" WHEN ({unc_expr}) > 0 THEN NULL"
+            f" ELSE 1 END {jt_from})"
         )
     elif expr.quantifier == "none":
         return (
-            f"(SELECT CASE WHEN ({sat_ref} > 0) THEN 0"
-            f" WHEN ({uncertain_expr} > 0) THEN NULL"
-            f" ELSE 1 END FROM {agg_sql})"
+            f"(SELECT CASE WHEN {sat_expr} > 0 THEN 0"
+            f" WHEN ({unc_expr}) > 0 THEN NULL"
+            f" ELSE 1 END {jt_from})"
         )
     elif expr.quantifier == "single":
         return (
-            f"(SELECT CASE WHEN ({sat_ref} >= 2) THEN 0"
-            f" WHEN ({sat_ref} = 1) AND ({uncertain_expr} = 0) THEN 1"
-            f" WHEN ({uncertain_expr} > 0) THEN NULL"
-            f" ELSE 0 END FROM {agg_sql})"
+            f"(SELECT CASE WHEN {sat_expr} >= 2 THEN 0"
+            f" WHEN {sat_expr} = 1 AND ({unc_expr}) = 0 THEN 1"
+            f" WHEN ({unc_expr}) > 0 THEN NULL"
+            f" ELSE 0 END {jt_from})"
         )
     else:  # any
         return (
-            f"(SELECT CASE WHEN ({sat_ref} > 0) THEN 1"
-            f" WHEN ({uncertain_expr} > 0) THEN NULL"
-            f" ELSE 0 END FROM {agg_sql})"
+            f"(SELECT CASE WHEN {sat_expr} > 0 THEN 1"
+            f" WHEN ({unc_expr}) > 0 THEN NULL"
+            f" ELSE 0 END {jt_from})"
         )
 
 
@@ -8660,6 +8637,11 @@ def _build_date_from_map(m, with_time=False, with_tz=False):
     """
     import datetime as _dt
 
+    # If map has a 'datetime' or 'time' base key, we can't resolve at compile time
+    # (those require _build_temporal_from_variable_map for runtime projection).
+    if _has_map_key(m, "datetime") or _has_map_key(m, "time"):
+        return None
+
     # Resolve 'date' base key (string override)
     base_year, base_month, base_day = None, None, None
     base_iso_year = None  # ISO week-year may differ from calendar year
@@ -8785,6 +8767,1028 @@ def _build_date_from_map(m, with_time=False, with_tz=False):
     return f"'{y_out:04d}-{mo_out:02d}-{d_out:02d}T{time_str}{tz_str}'"
 
 
+def _build_temporal_from_variable_map(fn, m, context):
+    """Generate runtime SQL for temporal projection from a variable base.
+
+    Handles patterns like:
+      date({date: other})               → extract date from variable
+      date({date: other, year: 28})     → override year
+      date({date: other, month: 3})     → override month
+      localtime({time: other, second: 42}) → override second
+      localdatetime({date: other, hour: 10, minute: 10, second: 10}) → combine
+      etc.
+
+    Returns SQL string or None if not handleable.
+
+    date ISO format: 'YYYY-MM-DD' (positions 1-10)
+    localtime/time format: 'HH:MM:SS[.nanos][tz]'
+    localdatetime/datetime format: 'YYYY-MM-DDTHH:MM:SS[.nanos][tz]'
+    """
+    import re as _re
+
+    # Determine which base key is present
+    base_date_expr = None
+    base_time_expr = None
+    base_datetime_expr = None
+    base_date_type = None  # type of the base temporal variable
+
+    if _has_map_key(m, "date"):
+        base_date_expr = m.entries["date"]
+    if _has_map_key(m, "time"):
+        base_time_expr = m.entries["time"]
+    if _has_map_key(m, "datetime"):
+        base_datetime_expr = m.entries["datetime"]
+
+    # Get SQL for the base temporal variable
+    def _get_base_sql(expr):
+        """Get SQL column reference for a variable expression."""
+        if expr is None:
+            return None, None
+        if isinstance(expr, ast.Variable):
+            alias = context.variable_aliases.get(expr.name)
+            temporal_type = context.temporal_types.get(expr.name)
+            # Prefer compile-time literal value if available (enables TZ arithmetic)
+            tlv = getattr(context, 'temporal_literal_values', {})
+            if expr.name in tlv:
+                return f"'{tlv[expr.name]}'", temporal_type
+            if alias and alias.startswith("Stage"):
+                sql = f"{alias}.{_safe_alias(expr.name)}"
+            elif alias:
+                sql = f"{alias}.{_safe_alias(expr.name)}"
+            else:
+                sql = _safe_alias(expr.name)
+            return sql, temporal_type
+        if isinstance(expr, ast.FunctionCall):
+            fn_inner = expr.function_name.lower()
+            if fn_inner in ("date", "localtime", "time", "localdatetime", "datetime"):
+                # Inline the temporal constructor
+                inner_args = [translate_expression(a, context, segment="inline") for a in expr.arguments]
+                inner_args_exprs = expr.arguments
+                inner_result = _scalar_numeric_and_datetime(fn_inner, inner_args, inner_args_exprs, context)
+                if inner_result is not None:
+                    return inner_result, fn_inner
+        return None, None
+
+    # For fn == "date": need date component from base
+    if fn == "date":
+        if base_date_expr is not None:
+            base_sql, btype = _get_base_sql(base_date_expr)
+            if base_sql is None:
+                return None
+            # Extract date portion from the base
+            if btype in ("date",):
+                date_sql = base_sql  # already a date string
+            elif btype in ("localdatetime", "datetime"):
+                # Extract first 10 chars (YYYY-MM-DD)
+                date_sql = f"SUBSTRING({base_sql}, 1, 10)"
+            else:
+                date_sql = base_sql  # assume date-like
+
+            # Apply overrides
+            has_year = _has_map_key(m, "year")
+            has_month = _has_map_key(m, "month")
+            has_day = _has_map_key(m, "day")
+            has_week = _has_map_key(m, "week")
+            has_ordinal = _has_map_key(m, "ordinalDay")
+            has_quarter = _has_map_key(m, "quarter")
+
+            # Simple component overrides (year/month/day)
+            if not has_week and not has_ordinal and not has_quarter:
+                if has_year:
+                    y_val = _extract_int_from_map_entry(m, "year", 1970)
+                    y_sql = f"'{y_val:04d}'"
+                else:
+                    y_sql = f"SUBSTRING({date_sql}, 1, 4)"
+                mo_sql = f"SUBSTRING({date_sql}, 6, 2)"
+                if has_month:
+                    mo_val = _extract_int_from_map_entry(m, "month", 1)
+                    mo_sql = f"'{mo_val:02d}'"
+                d_sql = f"SUBSTRING({date_sql}, 9, 2)"
+                if has_day:
+                    d_val = _extract_int_from_map_entry(m, "day", 1)
+                    d_sql = f"'{d_val:02d}'"
+                return f"({y_sql} || '-' || {mo_sql} || '-' || {d_sql})"
+
+            # Week-based: date({date: other, week: W, dayOfWeek?: D})
+            # ISO week date calculation — use IRIS DATEADD from Jan 4 of ISO year
+            if has_week:
+                week_val = _extract_int_from_map_entry(m, "week", 1)
+                has_dow = _has_map_key(m, "dayOfWeek")
+                dow_val = _extract_int_from_map_entry(m, "dayOfWeek", 1) if has_dow else None
+                if has_year:
+                    y_val = _extract_int_from_map_entry(m, "year", 1984)
+                    y_sql = f"'{y_val:04d}'"
+                else:
+                    y_sql = f"SUBSTRING({date_sql}, 1, 4)"
+                # Jan 4 is always in ISO week 1
+                # IRIS DAYOFWEEK: 1=Sun, 2=Mon, 3=Tue...
+                # offset_to_monday = MOD(DAYOFWEEK(jan4) - 2 + 7, 7)  → days to go back to Mon
+                jan4_sql = f"CAST(({y_sql} || '-01-04') AS DATE)"
+                dow_jan4_sql = f"MOD({{fn DAYOFWEEK({jan4_sql})}} - 2 + 7, 7)"
+                # Monday of week 1:
+                mon_wk1_sql = f"DATEADD('day', -{dow_jan4_sql}, {jan4_sql})"
+                # Monday of week W:
+                result_date_sql = f"DATEADD('day', ({week_val}-1)*7, {mon_wk1_sql})"
+                if has_dow and dow_val is not None and dow_val != 1:
+                    # Explicit dayOfWeek override: add (dow_val-1) days (Monday=1)
+                    result_date_sql = f"DATEADD('day', {dow_val - 1}, {result_date_sql})"
+                elif not has_dow:
+                    # Inherit dayOfWeek from base date: MOD(DAYOFWEEK(base)-2+7,7)+1 gives ISO dow (1=Mon)
+                    # IRIS DAYOFWEEK: 1=Sun,2=Mon,...,7=Sat → ISO: Mon=1,...,Sun=7
+                    # iso_dow = MOD({fn DAYOFWEEK(base_date)} - 2 + 7, 7) + 1
+                    # But 0-indexed offset from Monday = iso_dow - 1
+                    base_date_cast_sql = f"CAST(SUBSTRING({date_sql}, 1, 10) AS DATE)"
+                    dow_offset_sql = f"MOD({{fn DAYOFWEEK({base_date_cast_sql})}} - 2 + 7, 7)"
+                    result_date_sql = f"DATEADD('day', {dow_offset_sql}, {result_date_sql})"
+                # Format as YYYY-MM-DD
+                return (f"(CAST(YEAR({result_date_sql}) AS VARCHAR(4)) || '-' || "
+                        f"RIGHT('0' || CAST(MONTH({result_date_sql}) AS VARCHAR(2)), 2) || '-' || "
+                        f"RIGHT('0' || CAST(DAY({result_date_sql}) AS VARCHAR(2)), 2))")
+
+            # OrdinalDay: date({date: other, ordinalDay: N})
+            if has_ordinal:
+                ordinal_val = _extract_int_from_map_entry(m, "ordinalDay", 1)
+                if has_year:
+                    y_val = _extract_int_from_map_entry(m, "year", 1984)
+                    y_sql = f"'{y_val:04d}'"
+                else:
+                    y_sql = f"SUBSTRING({date_sql}, 1, 4)"
+                jan1_sql = f"CAST(({y_sql} || '-01-01') AS DATE)"
+                result_date_sql = f"DATEADD('day', {ordinal_val - 1}, {jan1_sql})"
+                return (f"(CAST(YEAR({result_date_sql}) AS VARCHAR(4)) || '-' || "
+                        f"RIGHT('0' || CAST(MONTH({result_date_sql}) AS VARCHAR(2)), 2) || '-' || "
+                        f"RIGHT('0' || CAST(DAY({result_date_sql}) AS VARCHAR(2)), 2))")
+
+            # Quarter: date({date: other, quarter: Q, dayOfQuarter?: D})
+            if has_quarter:
+                quarter_val = _extract_int_from_map_entry(m, "quarter", 1)
+                has_doq = _has_map_key(m, "dayOfQuarter")
+                doq_val = _extract_int_from_map_entry(m, "dayOfQuarter", 1) if has_doq else None
+                if has_year:
+                    y_val = _extract_int_from_map_entry(m, "year", 1984)
+                    y_sql = f"'{y_val:04d}'"
+                else:
+                    y_sql = f"SUBSTRING({date_sql}, 1, 4)"
+                # Start month of quarter: Q1→1, Q2→4, Q3→7, Q4→10
+                start_month = (quarter_val - 1) * 3 + 1
+                q_start_sql = f"CAST(({y_sql} || '-{start_month:02d}-01') AS DATE)"
+                if has_doq and doq_val is not None:
+                    result_date_sql = f"DATEADD('day', {doq_val - 1}, {q_start_sql})"
+                else:
+                    # Inherit month-within-quarter and day-within-month from the base date.
+                    # month_in_quarter = MOD(CAST(SUBSTRING(date, 6, 2) AS INT) - 1, 3)  (0-based)
+                    # Result = DATEADD('month', month_in_quarter, q_start) with same day
+                    base_month_sql = f"CAST(SUBSTRING({date_sql}, 6, 2) AS INTEGER)"
+                    base_day_sql = f"CAST(SUBSTRING({date_sql}, 9, 2) AS INTEGER)"
+                    # Month offset within the target quarter = MOD(base_month - 1, 3)
+                    month_offset_sql = f"MOD({base_month_sql} - 1, 3)"
+                    # Start of the resulting month: DATEADD('month', month_offset, q_start)
+                    result_month_start_sql = f"DATEADD('month', {month_offset_sql}, {q_start_sql})"
+                    # Then add day - 1 to reach the right day
+                    result_date_sql = f"DATEADD('day', {base_day_sql} - 1, {result_month_start_sql})"
+                return (f"(CAST(YEAR({result_date_sql}) AS VARCHAR(4)) || '-' || "
+                        f"RIGHT('0' || CAST(MONTH({result_date_sql}) AS VARCHAR(2)), 2) || '-' || "
+                        f"RIGHT('0' || CAST(DAY({result_date_sql}) AS VARCHAR(2)), 2))")
+        return None
+
+    # For fn in ("localtime", "time"): need time component from base
+    if fn in ("localtime", "time"):
+        if base_time_expr is not None:
+            base_sql, btype = _get_base_sql(base_time_expr)
+            if base_sql is None:
+                return None
+            # Extract time portion from the base
+            if btype in ("localtime",):
+                time_sql = base_sql
+            elif btype == "time":
+                if fn == "localtime":
+                    # localtime from time: strip TZ from time value
+                    if isinstance(base_sql, str) and base_sql.startswith("'") and base_sql.endswith("'"):
+                        import re as _re_lt
+                        _ts = base_sql[1:-1]
+                        _ts = _re_lt.sub(r'\[.*\]$', '', _ts)
+                        _ts = _re_lt.sub(r'[+-]\d{2}:?\d{2}(?::\d{2})?$', '', _ts)
+                        if _ts.endswith('Z'):
+                            _ts = _ts[:-1]
+                        time_sql = f"'{_ts}'"
+                    else:
+                        # Runtime SQL: strip TZ via CASE
+                        # TZ offset starts at pos 6 for HH:MM, pos 9 for HH:MM:SS
+                        # Use pos 6 to catch both formats
+                        time_sql = (f"CASE "
+                                    f"WHEN CHARINDEX('+', {base_sql}, 6) > 0 THEN SUBSTRING({base_sql}, 1, CHARINDEX('+', {base_sql}, 6) - 1) "
+                                    f"WHEN CHARINDEX('-', {base_sql}, 6) > 0 THEN SUBSTRING({base_sql}, 1, CHARINDEX('-', {base_sql}, 6) - 1) "
+                                    f"WHEN CHARINDEX('Z', {base_sql}) > 0 THEN SUBSTRING({base_sql}, 1, CHARINDEX('Z', {base_sql}) - 1) "
+                                    f"ELSE {base_sql} END")
+                else:
+                    time_sql = base_sql  # fn == "time": keep TZ
+            elif btype in ("localdatetime", "datetime"):
+                # Extract time part starting at position 12 (after 'YYYY-MM-DDT')
+                # Strip IANA timezone name [Region/City] if present
+                if isinstance(base_sql, str) and base_sql.startswith("'") and base_sql.endswith("'"):
+                    # Compile-time literal: extract time part in Python
+                    import re as _re_tdtm
+                    _base_dt_inner = base_sql[1:-1]
+                    _t_pos_dt = _base_dt_inner.find('T')
+                    _time_str_raw = _base_dt_inner[_t_pos_dt + 1:] if _t_pos_dt >= 0 else _base_dt_inner
+                    if fn == "localtime":
+                        # Strip all TZ info
+                        _time_str_raw = _re_tdtm.sub(r'\[[^\]]+\]', '', _time_str_raw)
+                        _time_str_raw = _re_tdtm.sub(r'[+-]\d{2}:?\d{2}(?::\d{2})?$', '', _time_str_raw)
+                        if _time_str_raw.endswith('Z'):
+                            _time_str_raw = _time_str_raw[:-1]
+                    else:
+                        # fn == "time": keep numeric TZ, strip IANA zone
+                        _time_str_raw = _re_tdtm.sub(r'\[[^\]]+\]', '', _time_str_raw)
+                    time_sql = f"'{_time_str_raw}'"
+                else:
+                    _time_raw = f"SUBSTRING({base_sql}, 12, 99)"
+                    if fn == "localtime":
+                        # Strip all timezone info. TZ starts at pos 6 min (HH:MM format)
+                        time_sql = (f"CASE WHEN CHARINDEX('[', {_time_raw}) > 0 THEN SUBSTRING({_time_raw}, 1, CHARINDEX('[', {_time_raw}) - 1) "
+                                    f"WHEN CHARINDEX('+', {_time_raw}, 6) > 0 THEN SUBSTRING({_time_raw}, 1, CHARINDEX('+', {_time_raw}, 6) - 1) "
+                                    f"WHEN CHARINDEX('-', {_time_raw}, 6) > 0 THEN SUBSTRING({_time_raw}, 1, CHARINDEX('-', {_time_raw}, 6) - 1) "
+                                    f"WHEN CHARINDEX('Z', {_time_raw}) > 0 THEN SUBSTRING({_time_raw}, 1, CHARINDEX('Z', {_time_raw}) - 1) "
+                                    f"ELSE {_time_raw} END")
+                    else:
+                        # fn == "time": keep offset, strip IANA name only
+                        time_sql = (f"CASE WHEN CHARINDEX('[', {_time_raw}) > 0 THEN SUBSTRING({_time_raw}, 1, CHARINDEX('[', {_time_raw}) - 1) "
+                                    f"ELSE {_time_raw} END")
+            else:
+                time_sql = base_sql
+
+            # Apply overrides for hour/minute/second
+            has_hour = _has_map_key(m, "hour")
+            has_minute = _has_map_key(m, "minute")
+            has_second = _has_map_key(m, "second")
+
+            if not has_hour and not has_minute and not has_second:
+                # No overrides — check timezone
+                if fn == "time":
+                    new_tz_str = None
+                    if _has_map_key(m, "timezone"):
+                        tz_expr = m.entries["timezone"]
+                        if isinstance(tz_expr, ast.Literal) and isinstance(tz_expr.value, str):
+                            new_tz_str = _normalize_tz_offset(tz_expr.value)
+                    if btype in ("localtime",):
+                        # Local time → zoned time: just append new tz (no shift needed)
+                        tz_suffix = new_tz_str if new_tz_str else "Z"
+                        return f"({time_sql} || '{tz_suffix}')"
+                    elif btype in ("time", "datetime") and new_tz_str is not None:
+                        # Zoned time → different zone: need to shift wall-clock time
+                        # Extract old offset from the time string at runtime
+                        # Strip time value (HH:MM[:SS[.frac]]) and convert to new tz
+                        # old_tz_mins: look for +HH:MM or -HH:MM or Z after position 6
+                        # Build runtime-adjusted time SQL
+                        # time_sql is like '12:31:14.645876+01:00'
+                        # Strip the time part first (HH:MM:SS.frac) by taking up to offset sign
+                        # pos_of_tz: first +/- after position 6, or Z
+                        # old_offset_mins_sql: extract from string
+                        # Then compute new hour/minute and build result
+
+                        # If time_sql is a compile-time literal, do it in Python
+                        stripped = time_sql.strip("'") if (time_sql.startswith("'") and time_sql.endswith("'")) else None
+                        if stripped is not None:
+                            import re as _re3
+                            # strip IANA
+                            stripped = _re3.sub(r'\[.*\]$', '', stripped)
+                            m_tz_old = _re3.search(r'([+-])(\d{2}):(\d{2})$', stripped)
+                            if m_tz_old:
+                                old_sign = 1 if m_tz_old.group(1) == '+' else -1
+                                old_offset_mins = old_sign * (int(m_tz_old.group(2)) * 60 + int(m_tz_old.group(3)))
+                                pure_time = stripped[:m_tz_old.start()]
+                            elif stripped.endswith('Z'):
+                                old_offset_mins = 0
+                                pure_time = stripped[:-1]
+                            else:
+                                old_offset_mins = 0
+                                pure_time = stripped
+                            # Parse new_tz_str offset
+                            m_new = _re3.match(r'^([+-])(\d{2}):(\d{2})$', new_tz_str)
+                            if m_new:
+                                new_sign = 1 if m_new.group(1) == '+' else -1
+                                new_offset_mins = new_sign * (int(m_new.group(2)) * 60 + int(m_new.group(3)))
+                            else:
+                                new_offset_mins = 0
+                            delta_mins = new_offset_mins - old_offset_mins
+                            # Parse pure_time
+                            tm = _re3.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', pure_time)
+                            if tm:
+                                h_v = int(tm.group(1)); mi_v = int(tm.group(2))
+                                s_v = int(tm.group(3) or 0)
+                                frac_v = tm.group(4) or ""
+                                total_mins = h_v * 60 + mi_v + delta_mins
+                                total_mins = total_mins % (24 * 60)
+                                new_h = total_mins // 60
+                                new_mi = total_mins % 60
+                                if frac_v:
+                                    return f"'{new_h:02d}:{new_mi:02d}:{s_v:02d}.{frac_v}{new_tz_str}'"
+                                elif s_v:
+                                    return f"'{new_h:02d}:{new_mi:02d}:{s_v:02d}{new_tz_str}'"
+                                else:
+                                    return f"'{new_h:02d}:{new_mi:02d}{new_tz_str}'"
+                        # Fallback: runtime SQL conversion (complex, omit for now)
+                        return f"({time_sql} || '')"  # return as-is if can't convert
+                    elif btype in ("localdatetime",):
+                        tz_suffix = new_tz_str if new_tz_str else "Z"
+                        return f"({time_sql} || '{tz_suffix}')"
+                return time_sql
+
+            # Build new time string with overrides
+            h_sql = f"SUBSTRING({time_sql}, 1, 2)"
+            if has_hour:
+                h_val = _extract_int_from_map_entry(m, "hour", 0)
+                h_sql = f"'{h_val:02d}'"
+            mi_sql = f"SUBSTRING({time_sql}, 4, 2)"
+            if has_minute:
+                mi_val = _extract_int_from_map_entry(m, "minute", 0)
+                mi_sql = f"'{mi_val:02d}'"
+            s_sql = f"SUBSTRING({time_sql}, 7, 2)"
+            if has_second:
+                s_val = _extract_int_from_map_entry(m, "second", 0)
+                s_sql = f"'{s_val:02d}'"
+            # Fractional seconds: keep from original unless overridden
+            # Position 9 onwards: '.nanos[tz]' or '[tz]'
+            frac_sql = f"CASE WHEN LENGTH({time_sql}) > 8 AND SUBSTRING({time_sql}, 9, 1) = '.' THEN SUBSTRING({time_sql}, 9, CHARINDEX('+', {time_sql} || '+', 9) - 9) ELSE '' END"
+            tz_suffix_sql = f"CASE WHEN CHARINDEX('+', {time_sql}, 9) > 0 THEN SUBSTRING({time_sql}, CHARINDEX('+', {time_sql}, 9)) WHEN CHARINDEX('-', {time_sql}, 9) > 0 THEN SUBSTRING({time_sql}, CHARINDEX('-', {time_sql}, 9)) WHEN CHARINDEX('Z', {time_sql}) > 0 THEN 'Z' ELSE '' END"
+
+            result_sql = f"({h_sql} || ':' || {mi_sql} || ':' || {s_sql} || {frac_sql})"
+            if fn == "time":
+                # Add timezone suffix
+                new_tz_str = None
+                if _has_map_key(m, "timezone"):
+                    tz_expr = m.entries["timezone"]
+                    if isinstance(tz_expr, ast.Literal) and isinstance(tz_expr.value, str):
+                        new_tz_str = _normalize_tz_offset(tz_expr.value)
+                if new_tz_str is not None:
+                    # If source had TZ and override differs, shift the wall-clock time
+                    if btype in ("time", "datetime"):
+                        # Try to get old TZ from the original base_sql (before CASE transforms)
+                        _orig_sql = base_sql
+                        if isinstance(_orig_sql, str) and _orig_sql.startswith("'") and _orig_sql.endswith("'"):
+                            import re as _re_shift2
+                            _orig_inner = _orig_sql[1:-1]
+                            _orig_inner = _re_shift2.sub(r'\[[^\]]+\]', '', _orig_inner)
+                            # For datetime: extract time portion
+                            _t_pos2 = _orig_inner.find('T')
+                            if _t_pos2 >= 0:
+                                _orig_inner = _orig_inner[_t_pos2 + 1:]
+                            _m_old_tz = _re_shift2.search(r'([+-])(\d{2}):(\d{2})$', _orig_inner)
+                            if _m_old_tz:
+                                _old_mins2 = (1 if _m_old_tz.group(1) == '+' else -1) * (int(_m_old_tz.group(2)) * 60 + int(_m_old_tz.group(3)))
+                                _m_new_tz = _re_shift2.match(r'^([+-])(\d{2}):(\d{2})', new_tz_str)
+                                if _m_new_tz:
+                                    _new_mins2 = (1 if _m_new_tz.group(1) == '+' else -1) * (int(_m_new_tz.group(2)) * 60 + int(_m_new_tz.group(3)))
+                                    _delta2 = _new_mins2 - _old_mins2
+                                    if _delta2 != 0:
+                                        # Need to shift h_sql and mi_sql — only possible if base_sql is a literal
+                                        _pure_t2 = _orig_inner[:_m_old_tz.start()]
+                                        _tm3 = _re_shift2.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', _pure_t2)
+                                        if _tm3:
+                                            h3 = int(_tm3.group(1)); mi3 = int(_tm3.group(2))
+                                            s3 = int(_tm3.group(3) or 0); frac3 = _tm3.group(4) or ""
+                                            # Apply second override AFTER extracting base values
+                                            if has_second:
+                                                s3 = _extract_int_from_map_entry(m, "second", s3)
+                                            total3 = (h3 * 60 + mi3 + _delta2) % (24 * 60)
+                                            h3n = total3 // 60; mi3n = total3 % 60
+                                            if frac3:
+                                                return f"'{h3n:02d}:{mi3n:02d}:{s3:02d}.{frac3}{new_tz_str}'"
+                                            elif s3:
+                                                return f"'{h3n:02d}:{mi3n:02d}:{s3:02d}{new_tz_str}'"
+                                            else:
+                                                return f"'{h3n:02d}:{mi3n:02d}{new_tz_str}'"
+                    result_sql = f"({h_sql} || ':' || {mi_sql} || ':' || {s_sql} || {frac_sql} || '{new_tz_str}')"
+                else:
+                    # No TZ override — use source TZ or default to Z for local types
+                    if btype in ("localtime", "localdatetime"):
+                        result_sql = f"({h_sql} || ':' || {mi_sql} || ':' || {s_sql} || {frac_sql} || 'Z')"
+                    elif btype in ("time", "datetime"):
+                        # Extract TZ from source literal if available
+                        if isinstance(base_sql, str) and base_sql.startswith("'") and base_sql.endswith("'"):
+                            import re as _re_src_tz
+                            _src = base_sql[1:-1]
+                            _iana_src = _re_src_tz.search(r'\[([^\]]+)\]', _src)
+                            _iana_src_str = _iana_src.group(0) if _iana_src else ""
+                            _src_no_iana = _src[:_iana_src.start()] if _iana_src else _src
+                            # For datetime: get time portion
+                            _t_p = _src_no_iana.find('T')
+                            if _t_p >= 0:
+                                _src_no_iana = _src_no_iana[_t_p + 1:]
+                            _m_src_tz = _re_src_tz.search(r'([+-]\d{2}:?\d{2}(?::\d{2})?)$', _src_no_iana)
+                            if _m_src_tz:
+                                # time() strips IANA zone; only datetime/localdatetime keep it
+                                _src_tz = _m_src_tz.group(1) + (_iana_src_str if fn != "time" else "")
+                                result_sql = f"({h_sql} || ':' || {mi_sql} || ':' || {s_sql} || {frac_sql} || '{_src_tz}')"
+                            elif _src_no_iana.endswith('Z'):
+                                result_sql = f"({h_sql} || ':' || {mi_sql} || ':' || {s_sql} || {frac_sql} || 'Z')"
+                            else:
+                                result_sql = f"({h_sql} || ':' || {mi_sql} || ':' || {s_sql} || {frac_sql} || {tz_suffix_sql})"
+                        else:
+                            result_sql = f"({h_sql} || ':' || {mi_sql} || ':' || {s_sql} || {frac_sql} || {tz_suffix_sql})"
+                    else:
+                        result_sql = f"({h_sql} || ':' || {mi_sql} || ':' || {s_sql} || {frac_sql} || {tz_suffix_sql})"
+            return result_sql
+        return None
+
+    # For fn in ("localdatetime", "datetime"): combine date and time from variables
+    if fn in ("localdatetime", "datetime"):
+        # Case 0: {datetime: expr[, day: d, second: s, ...]} — convert/reuse datetime expr
+        if base_datetime_expr is not None and base_date_expr is None and base_time_expr is None:
+            base_sql, btype = _get_base_sql(base_datetime_expr)
+            if base_sql is not None:
+                # base_sql may be a quoted literal '2023-05-15T12:00:00+01:00' or SQL expr.
+                # For localdatetime: strip TZ; for datetime: keep/override TZ.
+                # Collect optional component overrides from the map (day, second, etc.)
+                has_yr = _has_map_key(m, "year")
+                has_mo = _has_map_key(m, "month")
+                has_dy = _has_map_key(m, "day")
+                has_hr = _has_map_key(m, "hour")
+                has_mi = _has_map_key(m, "minute")
+                has_sec = _has_map_key(m, "second")
+                has_overrides = any([has_yr, has_mo, has_dy, has_hr, has_mi, has_sec])
+
+                # Helper: strip TZ suffix from a compile-time literal string
+                def _strip_tz_str(s):
+                    import re as _rtz
+                    s = _rtz.sub(r'\[[^\]]+\]', '', s)  # remove IANA zone
+                    s = _rtz.sub(r'[+-]\d{2}:?\d{2}(?::\d{2})?$', '', s)
+                    if s.endswith('Z'):
+                        s = s[:-1]
+                    return s
+
+                # If base_sql is a compile-time literal, handle fully at compile time
+                if isinstance(base_sql, str) and base_sql.startswith("'") and base_sql.endswith("'"):
+                    inner = base_sql[1:-1]
+                    tz_suffix = ""
+                    if fn == "localdatetime":
+                        inner = _strip_tz_str(inner)
+                    else:  # fn == "datetime"
+                        # Preserve or override TZ — extract IANA zone and numeric offset separately
+                        import re as _re_dt0
+                        # Step 1: extract IANA zone (e.g. [Europe/Stockholm])
+                        _iana_m0 = _re_dt0.search(r'\[([^\]]+)\]', inner)
+                        _iana_zone = _iana_m0.group(0) if _iana_m0 else ""  # e.g. '[Europe/Stockholm]'
+                        _inner_no_iana = inner[:_iana_m0.start()] if _iana_m0 else inner
+                        # Step 2: extract numeric TZ offset from end
+                        tz_m0 = _re_dt0.search(r'([+-]\d{2}:?\d{2}(?::\d{2})?)$', _inner_no_iana)
+                        if tz_m0:
+                            _numeric_tz = tz_m0.group(1)
+                            tz_suffix = _numeric_tz + _iana_zone  # e.g. '+01:00[Europe/Stockholm]'
+                            inner = _inner_no_iana[:tz_m0.start()]
+                        elif _inner_no_iana.endswith('Z'):
+                            tz_suffix = 'Z'
+                            inner = _inner_no_iana[:-1]
+                        else:
+                            # localdatetime source — default TZ is Z for datetime
+                            tz_suffix = 'Z' if btype in ("localdatetime",) else ""
+                            inner = _inner_no_iana
+                        # Step 3: apply TZ override if present (override replaces tz_suffix)
+                        tz_override_expr = m.entries.get("timezone") if hasattr(m, "entries") else None
+                        if tz_override_expr and isinstance(tz_override_expr, ast.Literal):
+                            new_tz = _format_tz_for_iso(tz_override_expr.value)
+                            # If source had TZ and new differs, shift the wall-clock time
+                            if tz_m0 and new_tz != tz_suffix:
+                                _m_old_off = _re_dt0.match(r'^([+-])(\d{2}):(\d{2})', _numeric_tz)
+                                _m_new_off = _re_dt0.match(r'^([+-])(\d{2}):(\d{2})', new_tz)
+                                if _m_old_off and _m_new_off:
+                                    _old_mins = (1 if _m_old_off.group(1) == '+' else -1) * (int(_m_old_off.group(2)) * 60 + int(_m_old_off.group(3)))
+                                    _new_mins = (1 if _m_new_off.group(1) == '+' else -1) * (int(_m_new_off.group(2)) * 60 + int(_m_new_off.group(3)))
+                                    _delta = _new_mins - _old_mins
+                                    if _delta != 0:
+                                        # Extract time part from inner (after 'T')
+                                        _t_idx = inner.find('T')
+                                        if _t_idx >= 0:
+                                            _date_part = inner[:_t_idx]
+                                            _t_str = inner[_t_idx + 1:]
+                                            _tm_m = _re_dt0.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', _t_str)
+                                            if _tm_m:
+                                                _th = int(_tm_m.group(1)); _tmi = int(_tm_m.group(2))
+                                                _ts = int(_tm_m.group(3) or 0); _tfrac = _tm_m.group(4) or ""
+                                                _total = (_th * 60 + _tmi + _delta) % (24 * 60)
+                                                _th_new = _total // 60; _tmi_new = _total % 60
+                                                if _tfrac:
+                                                    _t_shifted = f"{_th_new:02d}:{_tmi_new:02d}:{_ts:02d}.{_tfrac}"
+                                                elif _ts:
+                                                    _t_shifted = f"{_th_new:02d}:{_tmi_new:02d}:{_ts:02d}"
+                                                else:
+                                                    _t_shifted = f"{_th_new:02d}:{_tmi_new:02d}"
+                                                inner = f"{_date_part}T{_t_shifted}"
+                            tz_suffix = new_tz
+
+                    if has_overrides:
+                        # Parse inner into date+time parts and apply overrides
+                        # inner is 'YYYY-MM-DDTHH:MM[:SS[.frac]]'
+                        import re as _re_ov
+                        _dt_m = _re_ov.match(
+                            r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})([.\d]*))?$',
+                            inner)
+                        if _dt_m:
+                            yr0 = int(_dt_m.group(1)); mo0 = int(_dt_m.group(2))
+                            dy0 = int(_dt_m.group(3)); hr0 = int(_dt_m.group(4))
+                            mi0 = int(_dt_m.group(5)); sc0 = int(_dt_m.group(6) or 0)
+                            frac0 = _dt_m.group(7) or ""
+                            if has_yr: yr0 = _extract_int_from_map_entry(m, "year", yr0)
+                            if has_mo: mo0 = _extract_int_from_map_entry(m, "month", mo0)
+                            if has_dy: dy0 = _extract_int_from_map_entry(m, "day", dy0)
+                            if has_hr: hr0 = _extract_int_from_map_entry(m, "hour", hr0)
+                            if has_mi: mi0 = _extract_int_from_map_entry(m, "minute", mi0)
+                            if has_sec:
+                                sc0 = _extract_int_from_map_entry(m, "second", sc0)
+                                # second override resets sub-second fraction? No: keep frac unless nanosecond/ms key given
+                            inner = f"{yr0:04d}-{mo0:02d}-{dy0:02d}T{hr0:02d}:{mi0:02d}:{sc0:02d}{frac0}"
+
+                    if fn == "localdatetime":
+                        return f"'{inner}'"
+                    else:
+                        return f"'{inner}{tz_suffix}'"
+                else:
+                    # Runtime SQL expression path
+                    # Strip TZ suffix from base_sql (TZ starts after 'YYYY-MM-DDTHH:MM:SS')
+                    no_tz_sql = (f"CASE "
+                                 f"WHEN CHARINDEX('+', {base_sql}, 17) > 0 THEN SUBSTRING({base_sql}, 1, CHARINDEX('+', {base_sql}, 17) - 1) "
+                                 f"WHEN CHARINDEX('-', {base_sql}, 17) > 0 THEN SUBSTRING({base_sql}, 1, CHARINDEX('-', {base_sql}, 17) - 1) "
+                                 f"WHEN CHARINDEX('Z', {base_sql}, 17) > 0 THEN SUBSTRING({base_sql}, 1, CHARINDEX('Z', {base_sql}, 17) - 1) "
+                                 f"ELSE {base_sql} END")
+                    if has_overrides:
+                        # Apply date/time component overrides to no_tz_sql
+                        y_sql = f"'{_extract_int_from_map_entry(m,'year',0):04d}'" if has_yr else f"SUBSTRING({no_tz_sql}, 1, 4)"
+                        mo_sql = f"'{_extract_int_from_map_entry(m,'month',0):02d}'" if has_mo else f"SUBSTRING({no_tz_sql}, 6, 2)"
+                        d_sql = f"'{_extract_int_from_map_entry(m,'day',0):02d}'" if has_dy else f"SUBSTRING({no_tz_sql}, 9, 2)"
+                        hr_sql = f"'{_extract_int_from_map_entry(m,'hour',0):02d}'" if has_hr else f"SUBSTRING({no_tz_sql}, 12, 2)"
+                        mi_sql = f"'{_extract_int_from_map_entry(m,'minute',0):02d}'" if has_mi else f"SUBSTRING({no_tz_sql}, 15, 2)"
+                        sc_sql = f"'{_extract_int_from_map_entry(m,'second',0):02d}'" if has_sec else f"SUBSTRING({no_tz_sql}, 18, 2)"
+                        # Preserve fractional seconds from original
+                        frac_sql = (f"CASE WHEN LENGTH({no_tz_sql}) > 19 AND SUBSTRING({no_tz_sql}, 20, 1) = '.' "
+                                    f"THEN SUBSTRING({no_tz_sql}, 19, 99) ELSE '' END")
+                        rebuilt = f"({y_sql} || '-' || {mo_sql} || '-' || {d_sql} || 'T' || {hr_sql} || ':' || {mi_sql} || ':' || {sc_sql} || {frac_sql})"
+                    else:
+                        rebuilt = no_tz_sql
+
+                    if fn == "localdatetime":
+                        return rebuilt
+                    else:
+                        tz_override_expr = m.entries.get("timezone") if hasattr(m, "entries") else None
+                        if tz_override_expr and isinstance(tz_override_expr, ast.Literal) and isinstance(tz_override_expr.value, str):
+                            new_tz_iso = _format_tz_for_iso(tz_override_expr.value)
+                            return f"({rebuilt} || '{new_tz_iso}')"
+                        else:
+                            # Keep original timezone
+                            tz_suffix_sql = (f"CASE "
+                                             f"WHEN CHARINDEX('+', {base_sql}, 17) > 0 THEN SUBSTRING({base_sql}, CHARINDEX('+', {base_sql}, 17)) "
+                                             f"WHEN CHARINDEX('-', {base_sql}, 17) > 0 THEN SUBSTRING({base_sql}, CHARINDEX('-', {base_sql}, 17)) "
+                                             f"WHEN CHARINDEX('Z', {base_sql}, 17) > 0 THEN 'Z' ELSE 'Z' END")
+                            return f"({rebuilt} || {tz_suffix_sql})"
+
+        # Case 1: {date: var, hour: h, minute: m, second: s} — date from var, time from literals
+        if base_date_expr is not None:
+            base_sql, btype = _get_base_sql(base_date_expr)
+            if base_sql is None:
+                return None
+            if btype in ("date",):
+                date_sql = base_sql
+            elif btype in ("localdatetime", "datetime"):
+                date_sql = f"SUBSTRING({base_sql}, 1, 10)"
+            else:
+                date_sql = base_sql
+
+            # Apply day override if present
+            has_year = _has_map_key(m, "year")
+            has_month = _has_map_key(m, "month")
+            has_day = _has_map_key(m, "day")
+            if has_year:
+                y_val = _extract_int_from_map_entry(m, "year", 1970)
+                y_sql = f"'{y_val:04d}'"
+            else:
+                y_sql = f"SUBSTRING({date_sql}, 1, 4)"
+            if has_month:
+                mo_val = _extract_int_from_map_entry(m, "month", 1)
+                mo_sql = f"'{mo_val:02d}'"
+            else:
+                mo_sql = f"SUBSTRING({date_sql}, 6, 2)"
+            if has_day:
+                d_val = _extract_int_from_map_entry(m, "day", 1)
+                d_sql = f"'{d_val:02d}'"
+            else:
+                d_sql = f"SUBSTRING({date_sql}, 9, 2)"
+            new_date_sql = f"({y_sql} || '-' || {mo_sql} || '-' || {d_sql})"
+
+            # Time part: from {time: var} if present, else from literals
+            time_base_sql_outer, ttype_outer = None, None  # track for TZ extraction later
+            if base_time_expr is not None:
+                time_base_sql, ttype = _get_base_sql(base_time_expr)
+                time_base_sql_outer, ttype_outer = time_base_sql, ttype
+                if time_base_sql is None:
+                    return None
+                if ttype in ("localdatetime", "datetime"):
+                    if isinstance(time_base_sql, str) and time_base_sql.startswith("'") and time_base_sql.endswith("'"):
+                        # Compile-time literal: extract time part in Python
+                        _tbs_inner = time_base_sql[1:-1]
+                        _t_pos = _tbs_inner.find('T')
+                        time_base_sql = f"'{_tbs_inner[_t_pos + 1:]}'" if _t_pos >= 0 else time_base_sql
+                    else:
+                        time_base_sql = f"SUBSTRING({time_base_sql}, 12, 99)"
+                # Apply second override if present
+                has_second = _has_map_key(m, "second")
+                if has_second:
+                    s_val = _extract_int_from_map_entry(m, "second", 0)
+                    h_sql = f"SUBSTRING({time_base_sql}, 1, 2)"
+                    mi_sql = f"SUBSTRING({time_base_sql}, 4, 2)"
+                    # Fractional: extract from pos 9 (after 'HH:MM:SS'), strip tz suffix
+                    # For localdatetime: strip +/- or Z tz; for datetime/time: keep tz
+                    if fn == "localdatetime":
+                        frac_sql = (f"CASE WHEN LENGTH({time_base_sql}) > 8 AND SUBSTRING({time_base_sql}, 9, 1) = '.' "
+                                    f"THEN CASE WHEN CHARINDEX('+', {time_base_sql}, 10) > 0 THEN SUBSTRING({time_base_sql}, 9, CHARINDEX('+', {time_base_sql}, 10) - 9) "
+                                    f"WHEN CHARINDEX('-', {time_base_sql}, 10) > 0 THEN SUBSTRING({time_base_sql}, 9, CHARINDEX('-', {time_base_sql}, 10) - 9) "
+                                    f"WHEN CHARINDEX('Z', {time_base_sql}, 10) > 0 THEN SUBSTRING({time_base_sql}, 9, CHARINDEX('Z', {time_base_sql}, 10) - 9) "
+                                    f"ELSE SUBSTRING({time_base_sql}, 9, 99) END ELSE '' END")
+                    else:
+                        # fn == "datetime": strip TZ from frac (TZ suffix will be handled below)
+                        frac_sql = (f"CASE WHEN LENGTH({time_base_sql}) > 8 AND SUBSTRING({time_base_sql}, 9, 1) = '.' "
+                                    f"THEN CASE WHEN CHARINDEX('+', {time_base_sql}, 10) > 0 THEN SUBSTRING({time_base_sql}, 9, CHARINDEX('+', {time_base_sql}, 10) - 9) "
+                                    f"WHEN CHARINDEX('-', {time_base_sql}, 10) > 0 THEN SUBSTRING({time_base_sql}, 9, CHARINDEX('-', {time_base_sql}, 10) - 9) "
+                                    f"WHEN CHARINDEX('Z', {time_base_sql}, 10) > 0 THEN SUBSTRING({time_base_sql}, 9, CHARINDEX('Z', {time_base_sql}, 10) - 9) "
+                                    f"ELSE SUBSTRING({time_base_sql}, 9, 99) END ELSE '' END")
+                    time_sql = f"({h_sql} || ':' || {mi_sql} || ':' || '{s_val:02d}' || {frac_sql})"
+                else:
+                    # Strip timezone from time base for localdatetime
+                    if fn == "localdatetime":
+                        time_sql = f"CASE WHEN CHARINDEX('+', {time_base_sql}, 6) > 0 THEN SUBSTRING({time_base_sql}, 1, CHARINDEX('+', {time_base_sql}, 6) - 1) WHEN CHARINDEX('-', {time_base_sql}, 6) > 0 THEN SUBSTRING({time_base_sql}, 1, CHARINDEX('-', {time_base_sql}, 6) - 1) WHEN CHARINDEX('Z', {time_base_sql}) > 0 THEN SUBSTRING({time_base_sql}, 1, CHARINDEX('Z', {time_base_sql}) - 1) ELSE {time_base_sql} END"
+                    else:
+                        time_sql = time_base_sql
+            else:
+                # Build time from literal components
+                h = _extract_int_from_map_entry(m, "hour", 0)
+                mi_v = _extract_int_from_map_entry(m, "minute", 0)
+                s = _extract_int_from_map_entry(m, "second", 0)
+                ns = _extract_int_from_map_entry(m, "nanosecond", -1)
+                us = _extract_int_from_map_entry(m, "microsecond", -1)
+                ms_v = _extract_int_from_map_entry(m, "millisecond", -1)
+                frac = _subsecond_frac(ns, us, ms_v)
+                if frac:
+                    time_sql = f"'{h:02d}:{mi_v:02d}:{s:02d}.{frac}'"
+                elif s != 0 or ns >= 0 or us >= 0 or ms_v >= 0:
+                    time_sql = f"'{h:02d}:{mi_v:02d}:{s:02d}'"
+                else:
+                    time_sql = f"'{h:02d}:{mi_v:02d}'"
+
+            if fn == "datetime":
+                if _has_map_key(m, "timezone"):
+                    # Explicit TZ override: convert time to new TZ if needed
+                    tz_expr = m.entries["timezone"]
+                    if isinstance(tz_expr, ast.Literal) and isinstance(tz_expr.value, str):
+                        tz_str = _format_tz_for_iso(tz_expr.value)
+                        # If source time had TZ and override differs, shift the time
+                        if base_time_expr is not None and ttype_outer in ("time", "datetime") and isinstance(time_base_sql_outer, str) and time_base_sql_outer.startswith("'") and time_base_sql_outer.endswith("'"):
+                            import re as _re_shift
+                            _ts2 = time_base_sql_outer[1:-1]
+                            # Extract IANA zone from source before stripping
+                            _ts2_iana_m = _re_shift.search(r'\[([^\]]+)\]', _ts2)
+                            _ts2_iana_name = _ts2_iana_m.group(1) if _ts2_iana_m else ""
+                            _ts2 = _re_shift.sub(r'\[[^\]]+\]', '', _ts2)  # strip IANA zone
+                            # If _ts2 is a full datetime (contains 'T'), extract time portion
+                            _t_sep = _ts2.find('T')
+                            if _t_sep >= 0:
+                                _ts2 = _ts2[_t_sep + 1:]  # just the time part 'HH:MM+01:00'
+                            _m_old = _re_shift.search(r'([+-])(\d{2}):(\d{2})$', _ts2)
+                            if _m_old:
+                                old_sign = 1 if _m_old.group(1) == '+' else -1
+                                old_off_mins = old_sign * (int(_m_old.group(2)) * 60 + int(_m_old.group(3)))
+                                _pure_t = _ts2[:_m_old.start()]
+                                # If IANA zone present, recompute offset for target date (DST-aware)
+                                if _ts2_iana_name:
+                                    # Determine target date from base_date_expr + overrides
+                                    _tgt_bs, _tgt_bt = _get_base_sql(base_date_expr)
+                                    if isinstance(_tgt_bs, str) and _tgt_bs.startswith("'") and _tgt_bs.endswith("'"):
+                                        _tgt_i = _tgt_bs[1:-1][:10]
+                                        _tgt_y = int(_tgt_i[:4]) if _tgt_i[:4].isdigit() else 1984
+                                        _tgt_mo = int(_tgt_i[5:7]) if len(_tgt_i) > 6 and _tgt_i[5:7].isdigit() else 10
+                                        _tgt_d = int(_tgt_i[8:10]) if len(_tgt_i) > 9 and _tgt_i[8:10].isdigit() else 11
+                                    else:
+                                        _tgt_y, _tgt_mo, _tgt_d = 1984, 10, 11
+                                    if has_day: _tgt_d = _extract_int_from_map_entry(m, "day", _tgt_d)
+                                    if has_month: _tgt_mo = _extract_int_from_map_entry(m, "month", _tgt_mo)
+                                    if has_year: _tgt_y = _extract_int_from_map_entry(m, "year", _tgt_y)
+                                    _dst_off_s1 = _iana_tz_offset(_ts2_iana_name, _tgt_y, _tgt_mo, _tgt_d)
+                                    if _dst_off_s1:
+                                        _m_dst = _re_shift.match(r'^([+-])(\d{2}):(\d{2})', _dst_off_s1)
+                                        if _m_dst:
+                                            old_off_mins = (1 if _m_dst.group(1) == '+' else -1) * (int(_m_dst.group(2)) * 60 + int(_m_dst.group(3)))
+                            elif _ts2.endswith('Z'):
+                                old_off_mins = 0; _pure_t = _ts2[:-1]
+                            else:
+                                old_off_mins = 0; _pure_t = _ts2
+                            # Also extract time portion from time_base_sql (which may have been overridden by second)
+                            _time_for_shift = time_base_sql
+                            if isinstance(_time_for_shift, str) and _time_for_shift.startswith("'") and _time_for_shift.endswith("'"):
+                                _tfs = _time_for_shift[1:-1]
+                                _tfs = _re_shift.sub(r'\[.*\]$', '', _tfs)
+                                _tfs_tz_m = _re_shift.search(r'([+-])(\d{2}):(\d{2})$', _tfs)
+                                if _tfs_tz_m:
+                                    _pure_t = _tfs[:_tfs_tz_m.start()]
+                                elif _tfs.endswith('Z'):
+                                    _pure_t = _tfs[:-1]
+                                else:
+                                    _pure_t = _tfs
+                            _m_new2 = _re_shift.match(r'^([+-])(\d{2}):(\d{2})', tz_str)
+                            if _m_new2:
+                                new_sign2 = 1 if _m_new2.group(1) == '+' else -1
+                                new_off_mins = new_sign2 * (int(_m_new2.group(2)) * 60 + int(_m_new2.group(3)))
+                            else:
+                                new_off_mins = old_off_mins
+                            delta_mins = new_off_mins - old_off_mins
+                            if delta_mins != 0:
+                                _tm2 = _re_shift.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', _pure_t)
+                                if _tm2:
+                                    h2 = int(_tm2.group(1)); mi2 = int(_tm2.group(2))
+                                    s2v = int(_tm2.group(3) or 0); frac2 = _tm2.group(4) or ""
+                                    # Apply second override if present
+                                    if has_second:
+                                        s2v = _extract_int_from_map_entry(m, "second", s2v)
+                                    total2 = h2 * 60 + mi2 + delta_mins
+                                    total2 = total2 % (24 * 60)
+                                    h2n = total2 // 60; mi2n = total2 % 60
+                                    if frac2: shifted = f"'{h2n:02d}:{mi2n:02d}:{s2v:02d}.{frac2}'"
+                                    elif s2v: shifted = f"'{h2n:02d}:{mi2n:02d}:{s2v:02d}'"
+                                    else: shifted = f"'{h2n:02d}:{mi2n:02d}'"
+                                    return f"({new_date_sql} || 'T' || {shifted} || '{tz_str}')"
+                    else:
+                        tz_str = "Z"
+                else:
+                    # No TZ override: use source TZ from time variable
+                    if base_time_expr is not None:
+                        if ttype_outer in ("localtime", "localdatetime"):
+                            tz_str = "Z"
+                        elif isinstance(time_base_sql_outer, str) and time_base_sql_outer.startswith("'") and time_base_sql_outer.endswith("'"):
+                            # Extract TZ from compile-time literal
+                            import re as _re_tz2
+                            _ts3 = time_base_sql_outer[1:-1]
+                            # Strip IANA bracket but keep numeric TZ
+                            _iana3 = _re_tz2.search(r'\[([^\]]+)\]', _ts3)
+                            _iana_name3 = _iana3.group(1) if _iana3 else ""
+                            _iana_bracket3 = _iana3.group(0) if _iana3 else ""
+                            _ts3_no_iana = _ts3[:_iana3.start()] if _iana3 else _ts3
+                            # For datetime: extract time portion
+                            _ts3_t = _ts3_no_iana.find('T')
+                            if _ts3_t >= 0:
+                                _ts3_no_iana = _ts3_no_iana[_ts3_t + 1:]
+                            _m_tz3 = _re_tz2.search(r'([+-]\d{2}:?\d{2}(?::\d{2})?)$', _ts3_no_iana)
+                            if _m_tz3:
+                                _num_tz3 = _m_tz3.group(1)
+                                if _iana_name3:
+                                    # Recompute DST-aware offset for the target date
+                                    # Target date from base_date_expr + overrides
+                                    _target_base_sql3, _target_btype3 = _get_base_sql(base_date_expr)
+                                    if isinstance(_target_base_sql3, str) and _target_base_sql3.startswith("'") and _target_base_sql3.endswith("'"):
+                                        _tgt_inner3 = _target_base_sql3[1:-1][:10]  # YYYY-MM-DD portion
+                                        _tgt_y3 = int(_tgt_inner3[:4]) if _tgt_inner3[:4].isdigit() else 1984
+                                        _tgt_mo3 = int(_tgt_inner3[5:7]) if _tgt_inner3[5:7].isdigit() else 10
+                                        _tgt_d3 = int(_tgt_inner3[8:10]) if _tgt_inner3[8:10].isdigit() else 11
+                                    else:
+                                        _tgt_y3, _tgt_mo3, _tgt_d3 = 1984, 10, 11
+                                    if has_day: _tgt_d3 = _extract_int_from_map_entry(m, "day", _tgt_d3)
+                                    if has_month: _tgt_mo3 = _extract_int_from_map_entry(m, "month", _tgt_mo3)
+                                    if has_year: _tgt_y3 = _extract_int_from_map_entry(m, "year", _tgt_y3)
+                                    _dst_off3 = _iana_tz_offset(_iana_name3, _tgt_y3, _tgt_mo3, _tgt_d3)
+                                    tz_str = (_dst_off3 if _dst_off3 else _num_tz3) + _iana_bracket3
+                                else:
+                                    tz_str = _num_tz3
+                            elif _ts3_no_iana.endswith('Z'):
+                                tz_str = "Z"
+                            else:
+                                tz_str = "Z"
+                        else:
+                            # Runtime: extract TZ suffix from time_base_sql_outer
+                            tz_str = None  # handled via tz_suffix_sql below
+                    else:
+                        tz_str = "Z"
+                if tz_str is not None:
+                    # Strip TZ from time_sql before appending tz_str
+                    # (time_sql may be a runtime expr or literal with TZ embedded)
+                    _pure_time_sql = time_sql
+                    if isinstance(time_sql, str) and time_sql.startswith("'") and time_sql.endswith("'"):
+                        import re as _re_ptz
+                        _pt_inner = time_sql[1:-1]
+                        _pt_inner = _re_ptz.sub(r'\[.*\]$', '', _pt_inner)
+                        _pt_inner = _re_ptz.sub(r'[+-]\d{2}:?\d{2}(?::\d{2})?$', '', _pt_inner)
+                        if _pt_inner.endswith('Z'): _pt_inner = _pt_inner[:-1]
+                        _pure_time_sql = f"'{_pt_inner}'"
+                    elif time_base_sql_outer is not None:
+                        # time_sql may equal time_base_sql_outer or be a CASE expression
+                        # If it's time_base_sql_outer (runtime column), strip TZ via CASE
+                        if time_sql == time_base_sql_outer:
+                            _pure_time_sql = (f"CASE WHEN CHARINDEX('+', {time_sql}, 6) > 0 THEN SUBSTRING({time_sql}, 1, CHARINDEX('+', {time_sql}, 6) - 1) "
+                                              f"WHEN CHARINDEX('-', {time_sql}, 6) > 0 THEN SUBSTRING({time_sql}, 1, CHARINDEX('-', {time_sql}, 6) - 1) "
+                                              f"WHEN CHARINDEX('Z', {time_sql}) > 0 THEN SUBSTRING({time_sql}, 1, CHARINDEX('Z', {time_sql}) - 1) "
+                                              f"ELSE {time_sql} END")
+                    return f"({new_date_sql} || 'T' || {_pure_time_sql} || '{tz_str}')"
+                else:
+                    # Runtime TZ extraction from time_base_sql_outer
+                    pure_t_sql = (f"CASE WHEN CHARINDEX('+', {time_sql}, 6) > 0 THEN SUBSTRING({time_sql}, 1, CHARINDEX('+', {time_sql}, 6) - 1) "
+                                  f"WHEN CHARINDEX('-', {time_sql}, 6) > 0 THEN SUBSTRING({time_sql}, 1, CHARINDEX('-', {time_sql}, 6) - 1) "
+                                  f"WHEN CHARINDEX('Z', {time_sql}) > 0 THEN SUBSTRING({time_sql}, 1, CHARINDEX('Z', {time_sql}) - 1) "
+                                  f"ELSE {time_sql} END")
+                    tz_suffix_sql = (f"CASE WHEN CHARINDEX('+', {time_base_sql_outer}, 6) > 0 THEN SUBSTRING({time_base_sql_outer}, CHARINDEX('+', {time_base_sql_outer}, 6)) "
+                                     f"WHEN CHARINDEX('-', {time_base_sql_outer}, 6) > 0 THEN SUBSTRING({time_base_sql_outer}, CHARINDEX('-', {time_base_sql_outer}, 6)) "
+                                     f"WHEN CHARINDEX('Z', {time_base_sql_outer}) > 0 THEN 'Z' ELSE 'Z' END")
+                    return f"({new_date_sql} || 'T' || {pure_t_sql} || {tz_suffix_sql})"
+            return f"({new_date_sql} || 'T' || {time_sql})"
+
+        # Case 2: {year: ..., month: ..., day: ..., time: var}
+        if base_time_expr is not None:
+            base_sql, btype = _get_base_sql(base_time_expr)
+            if base_sql is None:
+                return None
+            # Date from literal components
+            year = _extract_int_from_map_entry(m, "year", 1970)
+            month = _extract_int_from_map_entry(m, "month", 1)
+            day = _extract_int_from_map_entry(m, "day", 1)
+
+            # Time from variable
+            if btype in ("localdatetime", "datetime"):
+                if isinstance(base_sql, str) and base_sql.startswith("'") and base_sql.endswith("'"):
+                    # Compile-time literal: extract time part in Python for precise TZ handling
+                    _base_inner = base_sql[1:-1]
+                    _t_start = _base_inner.find('T')
+                    time_base_sql = f"'{_base_inner[_t_start + 1:]}'" if _t_start >= 0 else base_sql
+                else:
+                    time_base_sql = f"SUBSTRING({base_sql}, 12, 99)"
+            else:
+                time_base_sql = base_sql
+
+            has_second = _has_map_key(m, "second")
+            # For compile-time literals, extract time components in Python for precise handling
+            _c2_base_literal = (isinstance(time_base_sql, str) and time_base_sql.startswith("'") and time_base_sql.endswith("'"))
+            if _c2_base_literal:
+                import re as _re_c2lit
+                _c2_t_inner = time_base_sql[1:-1]
+                # Extract IANA zone and numeric TZ from time_base_sql
+                _c2_lit_iana = _re_c2lit.search(r'\[([^\]]+)\]', _c2_t_inner)
+                _c2_lit_iana_name = _c2_lit_iana.group(1) if _c2_lit_iana else ""
+                _c2_lit_iana_str = _c2_lit_iana.group(0) if _c2_lit_iana else ""
+                _c2_t_no_iana = _c2_t_inner[:_c2_lit_iana.start()] if _c2_lit_iana else _c2_t_inner
+                _c2_lit_tz_m = _re_c2lit.search(r'([+-]\d{2}:?\d{2}(?::\d{2})?)$', _c2_t_no_iana)
+                if _c2_lit_tz_m:
+                    _c2_lit_num_tz = _c2_lit_tz_m.group(1)
+                    _c2_lit_pure_t = _c2_t_no_iana[:_c2_lit_tz_m.start()]
+                elif _c2_t_no_iana.endswith('Z'):
+                    _c2_lit_num_tz = 'Z'
+                    _c2_lit_pure_t = _c2_t_no_iana[:-1]
+                else:
+                    _c2_lit_num_tz = ''
+                    _c2_lit_pure_t = _c2_t_no_iana
+                # Parse pure time components
+                _c2_tm_m = _re_c2lit.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', _c2_lit_pure_t)
+                if _c2_tm_m:
+                    _c2_lit_h = int(_c2_tm_m.group(1)); _c2_lit_mi = int(_c2_tm_m.group(2))
+                    _c2_lit_s = int(_c2_tm_m.group(3) or 0); _c2_lit_frac = _c2_tm_m.group(4) or ""
+                else:
+                    _c2_base_literal = False  # fallback
+
+            if has_second:
+                s_val = _extract_int_from_map_entry(m, "second", 0)
+                if _c2_base_literal:
+                    # Build time_sql entirely in Python — avoids frac TZ stripping issue
+                    _c2_s_eff = s_val  # second override
+                    if _c2_lit_frac:
+                        # Strip TZ from frac in Python (frac is already pure fractional from _c2_lit_frac)
+                        time_sql = f"'{_c2_lit_h:02d}:{_c2_lit_mi:02d}:{_c2_s_eff:02d}.{_c2_lit_frac}'"
+                    else:
+                        time_sql = f"'{_c2_lit_h:02d}:{_c2_lit_mi:02d}:{_c2_s_eff:02d}'"
+                else:
+                    h_sql = f"SUBSTRING({time_base_sql}, 1, 2)"
+                    mi_sql = f"SUBSTRING({time_base_sql}, 4, 2)"
+                    if fn == "localdatetime":
+                        frac_sql = (f"CASE WHEN LENGTH({time_base_sql}) > 8 AND SUBSTRING({time_base_sql}, 9, 1) = '.' "
+                                    f"THEN CASE WHEN CHARINDEX('+', {time_base_sql}, 10) > 0 THEN SUBSTRING({time_base_sql}, 9, CHARINDEX('+', {time_base_sql}, 10) - 9) "
+                                    f"WHEN CHARINDEX('-', {time_base_sql}, 10) > 0 THEN SUBSTRING({time_base_sql}, 9, CHARINDEX('-', {time_base_sql}, 10) - 9) "
+                                    f"WHEN CHARINDEX('Z', {time_base_sql}, 10) > 0 THEN SUBSTRING({time_base_sql}, 9, CHARINDEX('Z', {time_base_sql}, 10) - 9) "
+                                    f"ELSE SUBSTRING({time_base_sql}, 9, 99) END ELSE '' END")
+                    else:
+                        # Strip TZ from frac for datetime
+                        frac_sql = (f"CASE WHEN LENGTH({time_base_sql}) > 8 AND SUBSTRING({time_base_sql}, 9, 1) = '.' "
+                                    f"THEN CASE WHEN CHARINDEX('+', {time_base_sql}, 10) > 0 THEN SUBSTRING({time_base_sql}, 9, CHARINDEX('+', {time_base_sql}, 10) - 9) "
+                                    f"WHEN CHARINDEX('-', {time_base_sql}, 10) > 0 THEN SUBSTRING({time_base_sql}, 9, CHARINDEX('-', {time_base_sql}, 10) - 9) "
+                                    f"WHEN CHARINDEX('Z', {time_base_sql}, 10) > 0 THEN SUBSTRING({time_base_sql}, 9, CHARINDEX('Z', {time_base_sql}, 10) - 9) "
+                                    f"ELSE SUBSTRING({time_base_sql}, 9, 99) END ELSE '' END")
+                    time_sql = f"({h_sql} || ':' || {mi_sql} || ':' || '{s_val:02d}' || {frac_sql})"
+            else:
+                if fn == "localdatetime":
+                    # Strip TZ from localtime/time base (TZ starts at pos 6 min for HH:MM)
+                    time_sql = f"CASE WHEN CHARINDEX('+', {time_base_sql}, 6) > 0 THEN SUBSTRING({time_base_sql}, 1, CHARINDEX('+', {time_base_sql}, 6) - 1) WHEN CHARINDEX('-', {time_base_sql}, 6) > 0 THEN SUBSTRING({time_base_sql}, 1, CHARINDEX('-', {time_base_sql}, 6) - 1) WHEN CHARINDEX('Z', {time_base_sql}) > 0 THEN SUBSTRING({time_base_sql}, 1, CHARINDEX('Z', {time_base_sql}) - 1) ELSE {time_base_sql} END"
+                else:
+                    time_sql = time_base_sql
+
+            if fn == "datetime":
+                # Build timezone suffix; if a new timezone override is given and the source
+                # time has a different timezone, shift the wall-clock time.
+                tz_override_expr = m.entries.get("timezone") if hasattr(m, "entries") else None
+                if tz_override_expr and isinstance(tz_override_expr, ast.Literal) and isinstance(tz_override_expr.value, str):
+                    new_tz_iso = _format_tz_for_iso(tz_override_expr.value, year, month, day)
+                    # If source has a known compile-time tz and new tz differs, convert
+                    if _c2_base_literal and btype in ("time", "datetime") and _c2_lit_num_tz not in ('', 'Z'):
+                        import re as _re4
+                        _m_old_off = _re4.match(r'^([+-])(\d{2}):(\d{2})', _c2_lit_num_tz)
+                        _m_new_off = _re4.match(r'^([+-])(\d{2}):(\d{2})', new_tz_iso)
+                        if _m_old_off and _m_new_off:
+                            old_off_mins = (1 if _m_old_off.group(1) == '+' else -1) * (int(_m_old_off.group(2)) * 60 + int(_m_old_off.group(3)))
+                            new_off_mins = (1 if _m_new_off.group(1) == '+' else -1) * (int(_m_new_off.group(2)) * 60 + int(_m_new_off.group(3)))
+                            delta_mins = new_off_mins - old_off_mins
+                            if delta_mins != 0:
+                                # s_val already applied in time_sql for has_second case; use _c2_lit_s as base
+                                _c2_s_for_shift = s_val if has_second else _c2_lit_s
+                                total2 = _c2_lit_h * 60 + _c2_lit_mi + delta_mins
+                                total2 = total2 % (24 * 60)
+                                h2n = total2 // 60; mi2n = total2 % 60
+                                if _c2_lit_frac:
+                                    shifted_t = f"'{h2n:02d}:{mi2n:02d}:{_c2_s_for_shift:02d}.{_c2_lit_frac}'"
+                                elif _c2_s_for_shift:
+                                    shifted_t = f"'{h2n:02d}:{mi2n:02d}:{_c2_s_for_shift:02d}'"
+                                else:
+                                    shifted_t = f"'{h2n:02d}:{mi2n:02d}'"
+                                return f"('{year:04d}-{month:02d}-{day:02d}T' || {shifted_t} || '{new_tz_iso}')"
+                    elif not _c2_base_literal:
+                        # Runtime: check if time_sql is a literal (no-has_second case)
+                        stripped_t = time_sql.strip("'") if (isinstance(time_sql, str) and time_sql.startswith("'") and time_sql.endswith("'")) else None
+                        if stripped_t is not None and btype in ("time", "datetime"):
+                            import re as _re4b
+                            s2t = _re4b.sub(r'\[.*\]$', '', stripped_t)
+                            m_old_tz = _re4b.search(r'([+-])(\d{2}):(\d{2})$', s2t)
+                            if m_old_tz:
+                                old_sign = 1 if m_old_tz.group(1) == '+' else -1
+                                old_off_mins = old_sign * (int(m_old_tz.group(2)) * 60 + int(m_old_tz.group(3)))
+                                pure_t = s2t[:m_old_tz.start()]
+                            elif s2t.endswith('Z'):
+                                old_off_mins = 0; pure_t = s2t[:-1]
+                            else:
+                                old_off_mins = 0; pure_t = s2t
+                            _tz_raw = tz_override_expr.value
+                            _m_new = _re4b.match(r'^([+-])(\d{2}):(\d{2})', _format_tz_for_iso(_tz_raw, year, month, day))
+                            if _m_new:
+                                new_sign = 1 if _m_new.group(1) == '+' else -1
+                                new_off_mins = new_sign * (int(_m_new.group(2)) * 60 + int(_m_new.group(3)))
+                            else:
+                                new_off_mins = old_off_mins
+                            delta_mins = new_off_mins - old_off_mins
+                            if delta_mins != 0:
+                                tm2 = _re4b.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', pure_t)
+                                if tm2:
+                                    h2 = int(tm2.group(1)); mi2 = int(tm2.group(2))
+                                    s2v = int(tm2.group(3) or 0); frac2 = tm2.group(4) or ""
+                                    total2 = h2 * 60 + mi2 + delta_mins
+                                    total2 = total2 % (24 * 60)
+                                    h2n = total2 // 60; mi2n = total2 % 60
+                                    if frac2:
+                                        shifted_t = f"'{h2n:02d}:{mi2n:02d}:{s2v:02d}.{frac2}'"
+                                    elif s2v:
+                                        shifted_t = f"'{h2n:02d}:{mi2n:02d}:{s2v:02d}'"
+                                    else:
+                                        shifted_t = f"'{h2n:02d}:{mi2n:02d}'"
+                                    return f"('{year:04d}-{month:02d}-{day:02d}T' || {shifted_t} || '{new_tz_iso}')"
+                    return f"('{year:04d}-{month:02d}-{day:02d}T' || {time_sql} || '{new_tz_iso}')"
+                else:
+                    # No timezone override: use source timezone from base_sql (for datetime/time)
+                    if btype in ("time", "datetime") and _c2_base_literal:
+                        # Extract TZ from compile-time base literal; recompute IANA offset for target date
+                        _c2_tz_str_final = _c2_lit_num_tz  # default: use source numeric TZ
+                        if _c2_lit_iana_name:
+                            # Recompute DST-aware offset for the target date (year/month/day)
+                            _c2_dst_offset = _iana_tz_offset(_c2_lit_iana_name, year, month, day)
+                            if _c2_dst_offset:
+                                _c2_tz_str_final = _c2_dst_offset + _c2_lit_iana_str
+                            else:
+                                _c2_tz_str_final = _c2_lit_num_tz + _c2_lit_iana_str
+                        # Build pure time (without TZ) for the time part
+                        _c2_s_eff2 = s_val if has_second else _c2_lit_s
+                        if _c2_lit_frac:
+                            _c2_pure_time_str = f"'{_c2_lit_h:02d}:{_c2_lit_mi:02d}:{_c2_s_eff2:02d}.{_c2_lit_frac}'"
+                        elif _c2_s_eff2:
+                            _c2_pure_time_str = f"'{_c2_lit_h:02d}:{_c2_lit_mi:02d}:{_c2_s_eff2:02d}'"
+                        else:
+                            _c2_pure_time_str = f"'{_c2_lit_h:02d}:{_c2_lit_mi:02d}'"
+                        if not _c2_tz_str_final:
+                            _c2_tz_str_final = 'Z'
+                        return f"('{year:04d}-{month:02d}-{day:02d}T' || {_c2_pure_time_str} || '{_c2_tz_str_final}')"
+                    elif btype in ("time", "datetime"):
+                        tz_suffix_sql = (f"CASE WHEN CHARINDEX('+', {base_sql}, 6) > 0 THEN SUBSTRING({base_sql}, CHARINDEX('+', {base_sql}, 6)) "
+                                         f"WHEN CHARINDEX('-', {base_sql}, 6) > 0 THEN SUBSTRING({base_sql}, CHARINDEX('-', {base_sql}, 6)) "
+                                         f"WHEN CHARINDEX('Z', {base_sql}) > 0 THEN 'Z' ELSE 'Z' END")
+                        # Strip tz from time_sql for the time part
+                        pure_time_sql = (f"CASE WHEN CHARINDEX('+', {time_sql}, 6) > 0 THEN SUBSTRING({time_sql}, 1, CHARINDEX('+', {time_sql}, 6) - 1) "
+                                         f"WHEN CHARINDEX('-', {time_sql}, 6) > 0 THEN SUBSTRING({time_sql}, 1, CHARINDEX('-', {time_sql}, 6) - 1) "
+                                         f"WHEN CHARINDEX('Z', {time_sql}) > 0 THEN SUBSTRING({time_sql}, 1, CHARINDEX('Z', {time_sql}) - 1) "
+                                         f"ELSE {time_sql} END")
+                        return f"('{year:04d}-{month:02d}-{day:02d}T' || {pure_time_sql} || {tz_suffix_sql})"
+                    elif btype in ("localtime", "localdatetime"):
+                        return f"('{year:04d}-{month:02d}-{day:02d}T' || {time_sql} || 'Z')"
+
+            return f"('{year:04d}-{month:02d}-{day:02d}T' || {time_sql})"
+
+        return None
+
+    return None
+
+
 def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
     if fn == "isnan":
         if not args:
@@ -8842,7 +9846,29 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
             parsed = _parse_datetime_string(args_exprs[0].value)
             if parsed:
                 return f"'{parsed}'"
-        return args[0]
+        # For FunctionCall arg (e.g., localdatetime(datetime(...))):
+        # strip timezone from the result — localdatetime is TZ-naive.
+        # args[0] is already the compiled SQL for the inner function call.
+        # If it's a string literal in the SQL (starts with '), strip TZ suffix.
+        if args[0].startswith("'") and args[0].endswith("'"):
+            inner_val = args[0][1:-1]  # strip quotes
+            # Strip IANA bracket annotation first
+            import re as _re_loc
+            inner_val = _re_loc.sub(r'\[[^\]]+\]$', '', inner_val)
+            # Strip +HH:MM or Z timezone suffix
+            inner_val = _re_loc.sub(r'([+-]\d{2}:?\d{2}(?::\d{2})?)$', '', inner_val)
+            if inner_val.endswith('Z'):
+                inner_val = inner_val[:-1]
+            # Compact time: remove trailing :00 from HH:MM:00 if seconds=0 and no ms
+            return f"'{inner_val}'"
+        # args[0] is a runtime SQL column reference — strip TZ from datetime column
+        # TZ offset starts at position 20 ('YYYY-MM-DDTHH:MM:SS' = 19 chars + 'T')
+        _ld_col = args[0]
+        return (f"CASE "
+                f"WHEN CHARINDEX('+', {_ld_col}, 17) > 0 THEN SUBSTRING({_ld_col}, 1, CHARINDEX('+', {_ld_col}, 17) - 1) "
+                f"WHEN CHARINDEX('-', {_ld_col}, 17) > 0 THEN SUBSTRING({_ld_col}, 1, CHARINDEX('-', {_ld_col}, 17) - 1) "
+                f"WHEN CHARINDEX('Z', {_ld_col}, 17) > 0 THEN SUBSTRING({_ld_col}, 1, CHARINDEX('Z', {_ld_col}, 17) - 1) "
+                f"ELSE {_ld_col} END")
     if fn in ("datetime",):
         if not args:
             return "NULL"
@@ -8859,6 +9885,18 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
             parsed = _parse_datetime_string(args_exprs[0].value)
             if parsed:
                 return f"'{parsed}'"
+        # Variable arg: datetime(localdatetime_var) → add Z; datetime(datetime_var) → keep as-is
+        if args_exprs and isinstance(args_exprs[0], ast.Variable):
+            temporal_type = context.temporal_types.get(args_exprs[0].name)
+            if temporal_type == "localdatetime":
+                # localdatetime has no TZ — add Z
+                tlv = getattr(context, 'temporal_literal_values', {})
+                if args_exprs[0].name in tlv:
+                    return f"'{tlv[args_exprs[0].name]}Z'"
+                return f"({args[0]} || 'Z')"
+            elif temporal_type == "datetime":
+                # datetime already has TZ — return as-is
+                return args[0]
         return args[0]
     if fn in ("localtime", "time"):
         if not args:
@@ -8906,12 +9944,6 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
             t_idx = f"CHARINDEX('T', {base})"
             time_part_sql = f"CASE WHEN {t_idx} > 0 THEN SUBSTRING({base}, {t_idx} + 1) ELSE {base} END"
             if fn == "localtime":
-                # Strip timezone suffix (Z or +/-HH:MM) from extracted time part.
-                # IRIS has no REGEXP_REPLACE; use CHARINDEX to find tz boundary.
-                # Tz starts at first Z, + or - AFTER position 6 (after HH:MM:).
-                # Build: tz_pos = first of (CHARINDEX('+', time_part, 6), CHARINDEX('Z', time_part),
-                #                           CHARINDEX('-', time_part, 6)) that is > 0
-                # Then SUBSTRING(time_part, 1, tz_pos - 1) if tz_pos > 0 else time_part
                 tp = time_part_sql
                 _z = f"CHARINDEX('Z', {tp})"
                 _p = f"CHARINDEX('+', {tp}, 6)"
@@ -11159,6 +12191,12 @@ def translate_with_clause(with_clause, context):
                 alias = f"{item.expression.function_name}"
         if alias is None:
             alias = context.next_alias("v")
+
+        # Track temporal literal values for compile-time TZ conversion in later stages
+        if isinstance(sql, str) and sql.startswith("'") and sql.endswith("'"):
+            if not hasattr(context, 'temporal_literal_values'):
+                context.temporal_literal_values = {}
+            context.temporal_literal_values[alias] = sql[1:-1]  # strip quotes
 
         # Track temporal types for property access extraction
         if isinstance(item.expression, ast.FunctionCall):
