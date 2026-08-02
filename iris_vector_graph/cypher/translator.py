@@ -3935,49 +3935,51 @@ def translate_merge_clause(merge, context, metadata):
                                     [val, sql_alias, k],
                                 )
                 elif isinstance(item.expression, ast.Variable):
-                    # Label assignment: MERGE (...) ON CREATE SET a:SomeLabel
+                    # Label assignment: MERGE (...) ON CREATE SET a:SomeLabel or SET a:Foo:Bar
                     var_name = item.expression.name
                     # Validate: variable must be defined.
                     if (var_name not in context.variable_aliases
                             and context.input_params.get(f"__create_id_{var_name}") is None):
                         raise SyntaxError(f"Undefined variable: {var_name}")
                     actual_id = context.input_params.get(f"__create_id_{var_name}")
-                    label = str(
-                        item.value.value if isinstance(item.value, ast.Literal) else item.value
-                    )
-                    if is_create:
-                        # ON CREATE: add label only when node was just created.
-                        # Use FROM nodes WHERE node_id = ? (avoids no-FROM SELECT).
-                        context.add_dml(
-                            f'INSERT INTO {_table("rdf_labels")} (s, label) '
-                            f'SELECT node_id, ? FROM {_table("nodes")} WHERE node_id = ?',
-                            [label, actual_id],
-                        )
+                    raw_val = item.value
+                    if isinstance(raw_val, list):
+                        label_list_merge = [str(lv) for lv in raw_val]
                     else:
-                        # ON MATCH: add label to the pre-existing node identified by MERGE pattern.
-                        _lbl_mn = merge.pattern.nodes[0] if merge.pattern.nodes else None
-                        _lbl_es, _lbl_ep = _merge_pattern_existence_sql(_lbl_mn)
-                        _lbl_labels = _lbl_mn.labels if _lbl_mn else []
-                        _lbl_props = _lbl_mn.properties if _lbl_mn else {}
-                        if _lbl_labels or _lbl_props:
-                            # Find matched node via MERGE pattern, add label if not present.
-                            _lbl_ns = _lbl_es.replace("SELECT 1 FROM ", "SELECT _ml0.node_id FROM ", 1)
+                        label_list_merge = [str(raw_val.value if isinstance(raw_val, ast.Literal) else raw_val)]
+                    for label in label_list_merge:
+                        if is_create:
+                            # ON CREATE: add label only when node was just created.
                             context.add_dml(
                                 f'INSERT INTO {_table("rdf_labels")} (s, label) '
-                                f'SELECT q.node_id, ? FROM ({_lbl_ns}) q '
-                                f'WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_labels")} '
-                                f'WHERE s = q.node_id AND label = ?)',
-                                [label] + _lbl_ep + [label],
+                                f'SELECT node_id, ? FROM {_table("nodes")} WHERE node_id = ?',
+                                [label, actual_id],
                             )
                         else:
-                            # No pattern constraints — add label to all nodes.
-                            context.add_dml(
-                                f'INSERT INTO {_table("rdf_labels")} (s, label) '
-                                f'SELECT node_id, ? FROM {_table("nodes")} '
-                                f'WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_labels")} '
-                                f'WHERE s = node_id AND label = ?)',
-                                [label, label],
-                            )
+                            # ON MATCH: add label to the pre-existing node identified by MERGE pattern.
+                            _lbl_mn = merge.pattern.nodes[0] if merge.pattern.nodes else None
+                            _lbl_es, _lbl_ep = _merge_pattern_existence_sql(_lbl_mn)
+                            _lbl_labels = _lbl_mn.labels if _lbl_mn else []
+                            _lbl_props = _lbl_mn.properties if _lbl_mn else {}
+                            if _lbl_labels or _lbl_props:
+                                # Find matched node via MERGE pattern, add label if not present.
+                                _lbl_ns = _lbl_es.replace("SELECT 1 FROM ", "SELECT _ml0.node_id FROM ", 1)
+                                context.add_dml(
+                                    f'INSERT INTO {_table("rdf_labels")} (s, label) '
+                                    f'SELECT q.node_id, ? FROM ({_lbl_ns}) q '
+                                    f'WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_labels")} '
+                                    f'WHERE s = q.node_id AND label = ?)',
+                                    [label] + _lbl_ep + [label],
+                                )
+                            else:
+                                # No pattern constraints — add label to all nodes.
+                                context.add_dml(
+                                    f'INSERT INTO {_table("rdf_labels")} (s, label) '
+                                    f'SELECT node_id, ? FROM {_table("nodes")} '
+                                    f'WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_labels")} '
+                                    f'WHERE s = node_id AND label = ?)',
+                                    [label, label],
+                                )
 
 
 def _translate_set_value(expr, context, target_prop: str) -> tuple:
@@ -4255,21 +4257,21 @@ def translate_set_clause(set_cl, context, metadata):
                     [k, val] + subparams_lo,
                 )
         elif isinstance(item.expression, ast.Variable):
-            alias, label = (
-                context.variable_aliases.get(item.expression.name),
-                str(
-                    item.value.value
-                    if isinstance(item.value, ast.Literal)
-                    else item.value
-                ),
-            )
+            alias = context.variable_aliases.get(item.expression.name)
+            # item.value may be a list of labels (SET n:Foo:Bar) or a single string/literal
+            raw_val = item.value
+            if isinstance(raw_val, list):
+                label_list = [str(lv) for lv in raw_val]
+            else:
+                label_list = [str(raw_val.value if isinstance(raw_val, ast.Literal) else raw_val)]
             cte, subquery, subparams = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.node_id"
             )
-            context.add_dml(
-                f"{cte}INSERT INTO {_table('rdf_labels')} (s, label) SELECT node_id, ? FROM {_table('nodes')} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE s = {_table('nodes')}.node_id AND label = ?)",
-                [label] + subparams + [label],
-            )
+            for label in label_list:
+                context.add_dml(
+                    f"{cte}INSERT INTO {_table('rdf_labels')} (s, label) SELECT node_id, ? FROM {_table('nodes')} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE s = {_table('nodes')}.node_id AND label = ?)",
+                    [label] + subparams + [label],
+                )
 
 
 def translate_remove_clause(remove, context, metadata):
@@ -4283,10 +4285,13 @@ def translate_remove_clause(remove, context, metadata):
             cte, subquery, subparams = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.node_id"
             )
-            context.add_dml(
-                f"{cte}DELETE FROM {_table('rdf_labels')} WHERE s IN ({subquery}) AND label = ?",
-                subparams + [item.label],
-            )
+            # item.label may be a list (REMOVE n:Foo:Bar) or a single string
+            label_list = item.label if isinstance(item.label, list) else [item.label]
+            for lbl in label_list:
+                context.add_dml(
+                    f"{cte}DELETE FROM {_table('rdf_labels')} WHERE s IN ({subquery}) AND label = ?",
+                    subparams + [lbl],
+                )
         elif isinstance(item.expression, ast.PropertyReference):
             prop_name = item.expression.property_name
             context._removed_properties.add(prop_name)

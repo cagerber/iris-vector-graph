@@ -785,10 +785,15 @@ class Parser:
                 value = self.parse_expression()
                 items.append(ast.SetItem(expression=target, value=value, merge=True))
             elif self.matches(TokenType.COLON):
-                # SET n:Label
+                # SET n:Label1:Label2:... — collect all colon-separated labels
+                labels = []
                 label_tok = self.expect_label()
-                label = label_tok.value if label_tok.value else ""
-                items.append(ast.SetItem(expression=target, value=label))
+                labels.append(label_tok.value if label_tok.value else "")
+                while self.peek().kind == TokenType.COLON:
+                    self.eat()
+                    label_tok = self.expect_label()
+                    labels.append(label_tok.value if label_tok.value else "")
+                items.append(ast.SetItem(expression=target, value=labels))
             else:
                 raise CypherParseError("Expected '=' or ':' in SET item")
 
@@ -817,7 +822,13 @@ class Parser:
             if isinstance(target, ast.Variable) and self.peek().kind == TokenType.COLON:
                 self.eat()
                 label_tok = self.expect_label()
-                items.append(ast.RemoveItem(expression=target, label=label_tok.value or ""))
+                # Collect additional colon-separated labels (REMOVE n:Foo:Bar)
+                labels = [label_tok.value or ""]
+                while self.peek().kind == TokenType.COLON:
+                    self.eat()
+                    extra_tok = self.expect_label()
+                    labels.append(extra_tok.value or "")
+                items.append(ast.RemoveItem(expression=target, label=labels))
             else:
                 items.append(ast.RemoveItem(expression=target))
             if not self.matches(TokenType.COMMA):
