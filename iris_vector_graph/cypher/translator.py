@@ -2547,12 +2547,25 @@ def preprocess_order_by(query: ast.CypherQuery, context: TranslationContext) -> 
                             f"to variables returned in the projection: {undefined_in_ob}"
                         )
 
+        # Build alias_to_sql from context.select_items — these were already computed by
+        # translate_return_clause with the correct alias counters. Parsing them avoids
+        # re-calling translate_expression which would allocate fresh aliases (p2, p3…)
+        # that are not in the FROM clause.
+        import re as _alias_re
+        for sel_item in context.select_items:
+            # Format: "<expr> AS <alias>" or "<expr> AS \"<alias>\""
+            _m = _alias_re.match(r'^(.*)\s+AS\s+"?([^"]+)"?\s*$', sel_item, _alias_re.IGNORECASE)
+            if _m:
+                sql_expr_raw, alias_name = _m.group(1).strip(), _m.group(2).strip()
+                alias_to_sql[alias_name] = sql_expr_raw
+        # Fall back to re-translating any aliases not found in select_items
         for ret_item in ret.items:
-            if ret_item.alias:
+            if ret_item.alias and ret_item.alias not in alias_to_sql:
                 saved_select = list(context.select_params)
                 saved_where = list(context.where_params)
                 saved_join = list(context.join_params)
                 saved_join_clauses = list(context.join_clauses)
+                saved_alias_counter = context._alias_counter
                 try:
                     sql_expr = translate_expression(ret_item.expression, context, segment="select")
                     alias_to_sql[ret_item.alias] = sql_expr
@@ -2563,8 +2576,24 @@ def preprocess_order_by(query: ast.CypherQuery, context: TranslationContext) -> 
                     context.where_params = saved_where
                     context.join_params = saved_join
                     context.join_clauses = saved_join_clauses
+                    context._alias_counter = saved_alias_counter
     import re as _re
     _proc_prefix_re = _re.compile(r'^(?:Stage\d+|' + '|'.join(_PROC_CTE_ALIASES) + r')\.')
+    # Inject alias_to_sql into context so compound ORDER BY expressions like `n + 2`
+    # (where `n` is a RETURN alias) resolve correctly via _expr_variable.
+    # This is scoped to ORDER BY translation only and cleaned up afterwards.
+    _prev_orderby_alias_sql = getattr(context, "_orderby_alias_sql", None)
+    context._orderby_alias_sql = alias_to_sql
+    try:
+        _ob_items_result = _preprocess_order_by_items(
+            query, context, items, alias_to_sql, _proc_prefix_re
+        )
+    finally:
+        context._orderby_alias_sql = _prev_orderby_alias_sql
+    return _ob_items_result
+
+
+def _preprocess_order_by_items(query, context, items, alias_to_sql, _proc_prefix_re):
     for item in query.order_by_clause.items:
         try:
             if (isinstance(item.expression, ast.Variable)
@@ -7236,12 +7265,18 @@ def _expr_property_reference(expr, context, segment):
                 )
             col_ref = f"{alias}.{_safe_alias(expr.variable)}"
             return f"CASE WHEN {col_ref} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{expr.property_name}') END"
-        # Node variables from Stage: JOIN rdf_props to get the property value
-        # The Stage column contains the node ID, so use it directly
-        p_alias = context.next_alias("p")
+        # Node variables from Stage: get property value for the stage node id.
+        # When called from ORDER BY (segment="inline"), use a correlated subquery instead of
+        # a JOIN — multiple ORDER BY keys would create multiple LEFT JOINs on rdf_props, which
+        # triggers the %qaqpre SIGSEGV in IRIS 2026.3.0AI on multi-JOIN queries.
         stage_col = _safe_alias(expr.variable)
+        prop_key = expr.property_name
+        if segment == "inline":
+            context.join_params.append(prop_key)
+            return f"(SELECT val FROM {_table('rdf_props')} WHERE s = {stage_col} AND \"key\" = ?)"
+        p_alias = context.next_alias("p")
         context.join_clauses.append(
-            f'LEFT JOIN {_table("rdf_props")} {p_alias} ON {p_alias}.s = {stage_col} AND {p_alias}."key" = {context.add_join_param(expr.property_name)}'
+            f'LEFT JOIN {_table("rdf_props")} {p_alias} ON {p_alias}.s = {stage_col} AND {p_alias}."key" = {context.add_join_param(prop_key)}'
         )
         return f"{p_alias}.val"
     if alias.startswith("e") and not alias.startswith("ES_"):
@@ -7259,6 +7294,14 @@ def _expr_property_reference(expr, context, segment):
         )
     if expr.property_name == "node_id":
         return f"{alias}.node_id"
+    # For ORDER BY (segment="inline"), use a correlated subquery instead of a JOIN on rdf_props.
+    # Multiple ORDER BY keys would create multiple LEFT JOINs on rdf_props, which triggers the
+    # %qaqpre SIGSEGV in IRIS 2026.3.0AI on multi-JOIN+FETCH FIRST queries.
+    # Use the variable name as the node_id column (it's projected as the variable alias in WITH).
+    if segment == "inline":
+        context.join_params.append(expr.property_name)
+        var_col = _safe_alias(expr.variable)
+        return f"(SELECT val FROM {_table('rdf_props')} WHERE s = {var_col} AND \"key\" = ?)"
     if segment == "where":
         # Skip the structural guard when this property is also IS NULL / IS NOT NULL
         # checked in the current boolean context (e.g. `a.x IS NULL OR a.x > 'y'`).
@@ -7546,6 +7589,11 @@ def _expr_property_access(expr, context, segment):
 
 def _expr_variable(expr, context, segment):
     alias = context.variable_aliases.get(expr.name)
+    # ORDER BY alias substitution: when translating ORDER BY expressions, RETURN aliases
+    # (like `n` in `RETURN n.num AS n ORDER BY n + 2`) should resolve to their SQL expression.
+    _ob_alias_sql = getattr(context, "_orderby_alias_sql", None)
+    if _ob_alias_sql and expr.name in _ob_alias_sql:
+        return _ob_alias_sql[expr.name]
     # Variable-length relationship variable: the engine fills in the actual path list.
     # Emit NULL placeholder; the engine replaces this column with the relationship list.
     if alias == "__vl_rel__":

@@ -148,7 +148,42 @@ def after_all(context):
 
 
 def _connect(container_name: str, port: int):
-    """Connect to the IRIS container using iris_devtester."""
+    """Connect to the IRIS container.
+
+    Strategy (in order):
+    1. OrbStack DNS: {container}.orb.local resolves to a routable IP — use :1972 directly.
+    2. Socat proxy / host port forwarding (port != 21972).
+    3. iris_devtester fallback.
+    """
+    import socket as _socket
+    _orb_host = f"{container_name}.orb.local"
+    try:
+        _orb_ip = _socket.gethostbyname(_orb_host)
+        import iris.dbapi as _dbapi
+        try:
+            conn = _dbapi.connect(
+                hostname=_orb_ip, port=1972, namespace="USER",
+                username="_SYSTEM", password="SYS",
+            )
+            logger.info("TCK connected to %s via OrbStack %s (%s):1972", container_name, _orb_host, _orb_ip)
+            return conn
+        except Exception as e:
+            logger.warning("OrbStack %s:1972 failed (%s) — falling back", _orb_ip, e)
+    except _socket.gaierror:
+        pass  # not OrbStack
+
+    if port != 21972:
+        import iris.dbapi as _dbapi
+        try:
+            conn = _dbapi.connect(
+                hostname="localhost", port=port, namespace="USER",
+                username="_SYSTEM", password="SYS",
+            )
+            logger.info("TCK harness connected to %s via localhost:%s", container_name, port)
+            return conn
+        except Exception as e:
+            logger.warning("Direct connect to localhost:%s failed (%s) — trying iris_devtester", port, e)
+
     try:
         from iris_devtester import IRISContainer as IRC
         fresh = IRC.attach(container_name)
