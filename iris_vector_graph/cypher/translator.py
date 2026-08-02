@@ -6744,14 +6744,70 @@ def _expr_to_cypher_text(expr) -> str:
 
 def translate_return_clause(ret, context):
     # RETURN * after a WITH stage: the star is parsed as Literal('*').
-    # When we're selecting from a stage CTE, don't add any select_items — the
-    # _tts_select_result fallback (line ~1814) will emit "SELECT *" instead.
+    # Expand * into explicit hydration for all variables in scope.
     if (
         len(ret.items) == 1
         and isinstance(ret.items[0].expression, ast.Literal)
         and ret.items[0].expression.value == "*"
         and context.stages
     ):
+        # Expand RETURN * into explicit select items for each variable.
+        # Variables must be sorted deterministically for test reproducibility.
+        for var_name in sorted(context.variable_aliases.keys()):
+            if var_name in context.scalar_variables:
+                continue
+
+            alias_name = context.variable_aliases.get(var_name)
+            if not alias_name:
+                continue
+
+            # Handle edge variables (aliases starting with 'e')
+            if alias_name.startswith("e") and not alias_name.startswith("Stage"):
+                # Edge variable: emit identity columns (s, p, o_id)
+                is_undirected = alias_name in getattr(context, "_undirected_aliases", set())
+                if is_undirected:
+                    context.select_items.append(f"{alias_name}._src AS {var_name}_src")
+                    context.select_items.append(f"{alias_name}._p AS {var_name}_p")
+                    context.select_items.append(f"{alias_name}._dst AS {var_name}_dst")
+                else:
+                    context.select_items.append(f"{alias_name}.s AS {var_name}_s")
+                    context.select_items.append(f"{alias_name}.p AS {var_name}_p")
+                    context.select_items.append(f"{alias_name}.o_id AS {var_name}_o_id")
+                context.optional_null_row_items.extend(["NULL", "NULL", "NULL"])
+                continue
+
+            # Handle stage-promoted edge variables (e.g., WITH r promoted to Stage1)
+            edge_stage_vars = getattr(context, "edge_stage_variables", set())
+            if alias_name.startswith("Stage") and var_name in edge_stage_vars:
+                p_col = f"__edge_{var_name}_p"
+                # Emit p (type) as the relationship identifier
+                context.select_items.append(f"{alias_name}.{p_col} AS {var_name}")
+                context.optional_null_row_items.append("NULL")
+                continue
+
+            # Handle node variables (all other non-edge, non-scalar aliases)
+            if alias_name and not alias_name.startswith("e"):
+                prefix = var_name
+                if alias_name.startswith("Stage") or alias_name in _PROC_CTE_ALIASES:
+                    node_expr = var_name
+                else:
+                    # Check if this node is null-gated by a downstream optional edge
+                    gate_edge = context.opt_intermediate_nulled.get(alias_name)
+                    if gate_edge:
+                        node_expr = (
+                            f"CASE WHEN {gate_edge}.s IS NULL "
+                            f"THEN NULL ELSE {alias_name}.node_id END"
+                        )
+                    else:
+                        node_expr = f"{alias_name}.node_id"
+                context.select_items.append(f"{node_expr} AS {prefix}_id")
+                context.select_items.append(
+                    f"{labels_subquery(node_expr)} AS {prefix}_labels"
+                )
+                context.select_items.append(
+                    f"{properties_subquery(node_expr)} AS {prefix}_props"
+                )
+                context.optional_null_row_items.extend(["NULL", "NULL", "NULL"])
         return
     for item in ret.items:
         if isinstance(item.expression, ast.Variable):
