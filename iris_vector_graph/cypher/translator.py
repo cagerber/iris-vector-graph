@@ -1796,7 +1796,9 @@ def _tts_finalize_context(cypher_query, context):
         # For transactional queries (with SET/REMOVE/DELETE), we need to clear WHERE
         # conditions on properties that have been modified, since their values have changed.
         set_properties = getattr(context, '_set_properties', set())
-        if set_properties and context.where_conditions:
+        removed_properties = getattr(context, '_removed_properties', set())
+        modified_properties = set_properties | removed_properties
+        if modified_properties and context.where_conditions:
             # Filter out WHERE conditions that reference modified properties.
             # Examples of conditions to remove:
             #   p2.val = 'Andres'  (literal value filter on property)
