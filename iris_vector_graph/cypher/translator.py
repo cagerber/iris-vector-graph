@@ -2848,6 +2848,41 @@ def translate_updating_clause(upd, context, metadata):
 
 
 def translate_unwind_clause(unwind, context):
+    alias = context.register_variable(unwind.alias, prefix="u")
+    context.scalar_variables.add(unwind.alias)
+    context.bind_variable_type(unwind.alias, "scalar")
+
+    # For list literals with only scalar elements, use UNION ALL instead of JSON_TABLE.
+    # IRIS JSON_TABLE coerces empty strings to NULL (JSON_TABLE PATH '$' issue).
+    _use_union = False
+    _union_rows: list = []
+    if isinstance(unwind.expression, ast.Literal) and isinstance(unwind.expression.value, list):
+        _items = _extract_literal_value(unwind.expression.value)
+        if all(isinstance(v, (str, int, float, bool)) or v is None for v in _items):
+            _use_union = True
+            _union_rows = _items
+
+    if _use_union:
+        col = unwind.alias
+        if not _union_rows:
+            # Empty list — produce zero rows via a no-match subquery
+            union_sql = f"(SELECT ? AS {col} FROM (SELECT 1) _empty WHERE 1=0) {alias}"
+            context.add_join_param(None)
+        else:
+            parts = []
+            for v in _union_rows:
+                if v is None:
+                    parts.append(f"SELECT NULL AS {col}")
+                else:
+                    parts.append(f"SELECT ? AS {col}")
+                    context.add_join_param(v)
+            union_sql = f"({' UNION ALL '.join(parts)}) {alias}"
+        if context.from_clauses:
+            context.join_clauses.append(f"CROSS JOIN {union_sql}")
+        else:
+            context.from_clauses.append(union_sql)
+        return
+
     expr = translate_expression(unwind.expression, context, segment="join")
     if (
         isinstance(unwind.expression, ast.Variable)
@@ -2856,10 +2891,6 @@ def translate_unwind_clause(unwind, context):
         val = context.input_params[unwind.expression.name]
         if isinstance(val, list):
             context.join_params[-1] = json.dumps(val)
-    alias = context.register_variable(unwind.alias, prefix="u")
-    context.scalar_variables.add(unwind.alias)
-    # UNWIND binds a scalar variable (array element)
-    context.bind_variable_type(unwind.alias, "scalar")
     json_table_sql = f"JSON_TABLE({expr}, '$[*]' COLUMNS ({unwind.alias} VARCHAR(1000) PATH '$')) {alias}"
     if context.from_clauses:
         context.join_clauses.append(f"CROSS JOIN {json_table_sql}")
