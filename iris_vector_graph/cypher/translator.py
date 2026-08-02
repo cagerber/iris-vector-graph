@@ -2715,6 +2715,22 @@ def _create_resolve_prop_value(v, context):
         val = _extract_literal_value(v)
         # JSON-encode lists and dicts for storage in rdf_props
         if isinstance(val, (list, dict)):
+            # Resolve any temporal FunctionCall items in the list before JSON-encoding
+            if isinstance(val, list):
+                resolved = []
+                for item in val:
+                    if isinstance(item, ast.FunctionCall) and item.function_name.lower() in _TEMPORAL_CREATE_FNS:
+                        try:
+                            sql_val = translate_expression(item, context, segment="select")
+                            if isinstance(sql_val, str) and sql_val.startswith("'") and sql_val.endswith("'"):
+                                resolved.append(sql_val[1:-1])
+                            else:
+                                resolved.append(item)
+                        except Exception:
+                            resolved.append(item)
+                    else:
+                        resolved.append(item)
+                val = resolved
             return json.dumps(val)
         return val
     if isinstance(v, ast.Variable) and v.name in context.input_params:
@@ -8810,6 +8826,20 @@ def _eval_temporal_ns_function(fn, args_exprs, context):
     """
     import datetime as _dt
     import re as _re
+
+    # ---- .statement / .transaction / .realtime variants ----
+    # e.g. date.statement(null) → null; date.statement() → current date (not supported at compile-time)
+    _TEMPORAL_BASES = ("date", "localtime", "time", "localdatetime", "datetime", "duration")
+    _TEMPORAL_VARIANTS = ("statement", "transaction", "realtime")
+    _parts = fn.split(".", 1)
+    if len(_parts) == 2 and _parts[0] in _TEMPORAL_BASES and _parts[1] in _TEMPORAL_VARIANTS:
+        # Null propagation: if called with null arg, return NULL
+        if args_exprs:
+            arg0 = args_exprs[0]
+            if isinstance(arg0, ast.Literal) and arg0.value is None:
+                return "NULL"
+        # No-arg or non-null arg: can't evaluate at compile-time; return None to fall through
+        return None
 
     # ---- duration.between(lhs, rhs) ----
     if fn == "duration.between":
