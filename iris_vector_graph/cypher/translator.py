@@ -4455,7 +4455,7 @@ def _boolean_expr_in(left, right_expr, context):
         if isinstance(idx, ast.Literal) and isinstance(idx.value, int):
             i = idx.value
             ij_alias = context.next_alias("ij")
-            sub_arr_sql = f"(SELECT __sa FROM JSON_TABLE({inner_sql}, '$[{i}]' COLUMNS(__sa VARCHAR(4096) PATH '$')) __jt_sa)"
+            sub_arr_sql = f"JSON_VALUE({inner_sql}, '$[{i}]')"
             return f"{left} IN (SELECT __iv FROM JSON_TABLE({sub_arr_sql}, '$[*]' COLUMNS(__iv VARCHAR(1000) PATH '$')) {ij_alias})"
         idx_sql = translate_expression(idx, context, segment="where")
         sub_arr_sql = f"SQLUser.JSON_VALUE({inner_sql}, '$[' || CAST(({idx_sql}) AS VARCHAR) || ']')"
