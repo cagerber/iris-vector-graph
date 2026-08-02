@@ -3666,6 +3666,9 @@ def _boolean_expr_logical(op, expr, context):
             )
         parts = []
         has_null = False
+        _sp0 = len(context.select_params)
+        _wp0 = len(context.where_params)
+        _jp0 = len(context.join_params)
         for o in expr.operands:
             if _is_temporal_ts_condition(o, context):
                 continue
@@ -3678,8 +3681,12 @@ def _boolean_expr_logical(op, expr, context):
         if not parts:
             # All operands were null or temporal
             return "NULL" if has_null else "1=1"
-        # Three-value AND: if any operand is definitively false, result is false
+        # Three-value AND: if any operand is definitively false, result is false.
+        # Roll back any params added by discarded operands.
         if "(1=0)" in parts:
+            del context.select_params[_sp0:]
+            del context.where_params[_wp0:]
+            del context.join_params[_jp0:]
             return "(1=0)"
         # Unwrap nested nullable CASE WHEN parts (produced by inner 3VL AND/OR):
         # "CASE WHEN NOT (cond) THEN (1=0) ELSE NULL END" means: false if NOT cond, else NULL.
@@ -3716,6 +3723,9 @@ def _boolean_expr_logical(op, expr, context):
             )
         parts_or = []
         has_null_or = False
+        _sp0_or = len(context.select_params)
+        _wp0_or = len(context.where_params)
+        _jp0_or = len(context.join_params)
         for o in expr.operands:
             p = translate_boolean_expression(o, context)
             p = _coerce_varchar_boolean_if_needed(o, p, context)
@@ -3725,7 +3735,12 @@ def _boolean_expr_logical(op, expr, context):
                 parts_or.append(p)
         if not parts_or:
             return "NULL" if has_null_or else "(1=0)"
+        # Three-value OR: if any operand is definitively true, result is true.
+        # Roll back params added by discarded operands.
         if "(1=1)" in parts_or:
+            del context.select_params[_sp0_or:]
+            del context.where_params[_wp0_or:]
+            del context.join_params[_jp0_or:]
             return "(1=1)"
         # Unwrap nested nullable CASE WHEN parts from inner 3VL AND/OR:
         import re as _re_or
