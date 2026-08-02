@@ -8160,6 +8160,213 @@ def _parse_date_string(s):
     return None
 
 
+def _build_date_sql_from_dynamic_base(map_expr, context, target_fn="date"):
+    """Generate SQL for date/localdatetime/datetime({date: expr, ...overrides}) or
+    localtime/time({time: expr, ...overrides}) where expr is a runtime SQL expression.
+
+    Returns SQL string or None if the pattern is not recognised.
+    """
+    import re as _re2
+
+    # Collect all entries. We need a 'date', 'localtime', 'time', 'localdatetime',
+    # or 'datetime' base key whose value is a Variable or FunctionCall.
+    DATE_BASE_KEYS = ("date", "localtime", "time", "localdatetime", "datetime")
+    base_key = None
+    base_expr_node = None
+    for key in DATE_BASE_KEYS:
+        if key in map_expr.entries:
+            base_expr_node = map_expr.entries[key]
+            if not isinstance(base_expr_node, ast.Literal):
+                base_key = key
+                break
+
+    if base_key is None:
+        return None  # no dynamic base found
+
+    # Translate the base expression to SQL
+    base_sql = translate_expression(base_expr_node, context, segment="select")
+
+    # Collect literal integer overrides (year, month, day, hour, minute, second, etc.)
+    overrides = {}
+    for k, v in map_expr.entries.items():
+        if k == base_key:
+            continue
+        if isinstance(v, ast.Literal) and isinstance(v.value, (int, float)):
+            overrides[k] = int(v.value)
+        elif isinstance(v, ast.Literal) and isinstance(v.value, str):
+            overrides[k] = v.value
+
+    # Helper to build a zero-padded field SQL expression
+    def _padded(sql_int_expr, width):
+        return f"LPAD(CAST({sql_int_expr} AS VARCHAR({width + 2})), {width}, '0')"
+
+    def _int_field(override_key, default_sql):
+        """Return SQL expression for a numeric field, using override if present."""
+        if override_key in overrides and isinstance(overrides[override_key], int):
+            return str(overrides[override_key])
+        return default_sql
+
+    # -------------------------------------------------------
+    # target_fn == "date": result is YYYY-MM-DD
+    # base_key in ("date", "localdatetime", "datetime")
+    # base temporal string starts with "YYYY-MM-DD"
+    # -------------------------------------------------------
+    if target_fn == "date" and base_key in ("date", "localdatetime", "datetime"):
+        if "week" in overrides or "ordinalDay" in overrides or "quarter" in overrides:
+            return None  # complex; skip for now
+        year_sql = _int_field("year", f"CAST(SUBSTRING({base_sql}, 1, 4) AS INTEGER)")
+        month_sql = _int_field("month", f"CAST(SUBSTRING({base_sql}, 6, 2) AS INTEGER)")
+        day_sql = _int_field("day", f"CAST(SUBSTRING({base_sql}, 9, 2) AS INTEGER)")
+        y_str = _padded(year_sql, 4)
+        mo_str = _padded(month_sql, 2)
+        d_str = _padded(day_sql, 2)
+        return f"({y_str} || '-' || {mo_str} || '-' || {d_str})"
+
+    # -------------------------------------------------------
+    # target_fn == "localtime": result is HH:MM[:SS[.frac]]
+    # base_key in ("localtime", "time", "localdatetime", "datetime")
+    # -------------------------------------------------------
+    if target_fn in ("localtime", "time"):
+        # Time portion in the base string depends on base_key:
+        # - localtime / time: starts at position 1 (e.g. "12:31:14.645876123")
+        # - localdatetime / datetime: starts after 'T' (position 12)
+        if base_key in ("localtime", "time"):
+            # Strip timezone from time string: find position of +/- or Z
+            # Use SUBSTRING to get HH:MM:SS.frac part (up to 20 chars before tz)
+            time_base = f"REGEXP_REPLACE({base_sql}, '[Z+][^\\\\$]*$', '')"
+            time_base = base_sql  # simpler: base is already just time string
+            # Extract components:
+            # HH: positions 1-2, MM: positions 4-5, SS: 7-8, frac: 10+
+            h_pos, mi_pos, s_pos = 1, 4, 7
+        else:  # localdatetime / datetime: time starts at position 12 (after "YYYY-MM-DDT")
+            h_pos, mi_pos, s_pos = 12, 15, 18
+            time_base = base_sql
+
+        h_sql = _int_field("hour", f"CAST(SUBSTRING({time_base}, {h_pos}, 2) AS INTEGER)")
+        mi_sql = _int_field("minute", f"CAST(SUBSTRING({time_base}, {mi_pos}, 2) AS INTEGER)")
+        s_sql = _int_field("second", f"CAST(SUBSTRING({time_base}, {s_pos}, 2) AS INTEGER)")
+
+        # fractional second: position 20 onward (after "HH:MM:SS.")
+        # If base has a decimal, preserve it; overrides handled below
+        # For simplicity, keep fraction from base string (after the seconds part)
+        if base_key in ("localtime", "time"):
+            frac_start = s_pos + 3  # position after "SS." (e.g. 10)
+        else:
+            frac_start = s_pos + 3  # 21
+
+        # Build the result
+        h_str = _padded(h_sql, 2)
+        mi_str = _padded(mi_sql, 2)
+        s_str = _padded(s_sql, 2)
+
+        # Get the fractional part from base; no fractional overrides handled here
+        # frac_sql: everything from frac_start to end of the time-only portion
+        frac_expr = f"SUBSTRING({time_base}, {frac_start})"
+        # Strip timezone suffix from fraction
+        if base_key == "time":
+            # Remove trailing tz offset: find position of Z, +, or - after frac
+            frac_expr = f"REGEXP_REPLACE({frac_expr}, '[Z][^\\\\$]*$', '')"
+            frac_expr = f"REGEXP_REPLACE({frac_expr}, '[+-]\\\\d{{2}}:.*$', '')"
+
+        # Basic time string: HH:MM:SS where SS defaults from base
+        # Use a CASE to check if fractional part exists
+        time_str = f"({h_str} || ':' || {mi_str} || ':' || {s_str})"
+
+        if target_fn == "time":
+            # Output needs timezone
+            tz_override = overrides.get("timezone")
+            if tz_override and isinstance(tz_override, str):
+                tz_sql = f"'{_normalize_tz_str(tz_override)}'"
+            elif base_key == "time":
+                # Preserve input timezone from base time string
+                # Extract tz suffix: everything from the Z/+/- char
+                tz_sql = f"REGEXP_REPLACE(SUBSTRING({base_sql}, CHARINDEX({base_sql}, 'Z')), ...)"
+                # Too complex for inline SQL; fall back
+                return None
+            else:
+                tz_sql = "'Z'"
+            return f"({time_str} || {tz_sql})"
+
+        return time_str
+
+    # -------------------------------------------------------
+    # target_fn in ("localdatetime", "datetime"): result is YYYY-MM-DDTHH:MM[:SS[.frac]][tz]
+    # -------------------------------------------------------
+    if target_fn in ("localdatetime", "datetime"):
+        if "week" in overrides or "ordinalDay" in overrides or "quarter" in overrides:
+            return None  # complex
+        # Base date part: from base_key
+        if base_key in ("date", "localdatetime", "datetime"):
+            year_sql = _int_field("year", f"CAST(SUBSTRING({base_sql}, 1, 4) AS INTEGER)")
+            month_sql = _int_field("month", f"CAST(SUBSTRING({base_sql}, 6, 2) AS INTEGER)")
+            day_sql = _int_field("day", f"CAST(SUBSTRING({base_sql}, 9, 2) AS INTEGER)")
+        elif base_key == "time":
+            # No date in a time — use literal date components from overrides only
+            year_sql = str(overrides.get("year", 1970))
+            month_sql = str(overrides.get("month", 1))
+            day_sql = str(overrides.get("day", 1))
+        else:
+            return None
+
+        y_str = _padded(year_sql, 4)
+        mo_str = _padded(month_sql, 2)
+        d_str = _padded(day_sql, 2)
+        date_part = f"({y_str} || '-' || {mo_str} || '-' || {d_str})"
+
+        # Time part: from base_key if it has time
+        if base_key in ("localdatetime", "datetime"):
+            # time starts at position 12 in base
+            if "hour" in overrides:
+                h_str2 = _padded(str(overrides["hour"]), 2)
+            else:
+                h_str2 = _padded(f"CAST(SUBSTRING({base_sql}, 12, 2) AS INTEGER)", 2)
+            if "minute" in overrides:
+                mi_str2 = _padded(str(overrides["minute"]), 2)
+            else:
+                mi_str2 = _padded(f"CAST(SUBSTRING({base_sql}, 15, 2) AS INTEGER)", 2)
+            if "second" in overrides:
+                s_str2 = _padded(str(overrides["second"]), 2)
+            else:
+                s_str2 = _padded(f"CAST(SUBSTRING({base_sql}, 18, 2) AS INTEGER)", 2)
+        elif base_key in ("localtime", "time"):
+            # base starts with time
+            if "hour" in overrides:
+                h_str2 = _padded(str(overrides["hour"]), 2)
+            else:
+                h_str2 = _padded(f"CAST(SUBSTRING({base_sql}, 1, 2) AS INTEGER)", 2)
+            if "minute" in overrides:
+                mi_str2 = _padded(str(overrides["minute"]), 2)
+            else:
+                mi_str2 = _padded(f"CAST(SUBSTRING({base_sql}, 4, 2) AS INTEGER)", 2)
+            if "second" in overrides:
+                s_str2 = _padded(str(overrides["second"]), 2)
+            else:
+                s_str2 = _padded(f"CAST(SUBSTRING({base_sql}, 7, 2) AS INTEGER)", 2)
+        else:  # date only
+            h_str2 = _padded(str(overrides.get("hour", 0)), 2)
+            mi_str2 = _padded(str(overrides.get("minute", 0)), 2)
+            s_str2 = _padded(str(overrides.get("second", 0)), 2)
+
+        time_part = f"({h_str2} || ':' || {mi_str2} || ':' || {s_str2})"
+        result = f"({date_part} || 'T' || {time_part})"
+
+        if target_fn == "datetime":
+            tz_override = overrides.get("timezone")
+            if tz_override and isinstance(tz_override, str):
+                result += f" || '{_normalize_tz_str(tz_override)}'"
+            elif base_key == "datetime":
+                # Preserve input timezone (after the base datetime string's time part)
+                # For simplicity, append Z
+                result += " || 'Z'"
+            else:
+                result += " || 'Z'"
+            return f"({result})"
+
+        return result
+
+    return None
+
+
 def _build_date_from_map(m, with_time=False, with_tz=False):
     """
     Build a date/datetime string from a MapLiteral.
@@ -8311,6 +8518,12 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
             result = _build_date_from_map(args_exprs[0], with_time=False)
             if result is not None:
                 return result
+            # Dynamic base: date({date: expr, ...overrides}) — generate SQL SUBSTRING ops
+            result = _build_date_sql_from_dynamic_base(
+                args_exprs[0], context, target_fn="date"
+            )
+            if result is not None:
+                return result
         # String arg: parse ISO 8601 formats
         if args_exprs and isinstance(args_exprs[0], ast.Literal) and isinstance(args_exprs[0].value, str):
             parsed = _parse_date_string(args_exprs[0].value)
@@ -8324,6 +8537,11 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
             result = _build_date_from_map(args_exprs[0], with_time=True, with_tz=False)
             if result is not None:
                 return result
+            result = _build_date_sql_from_dynamic_base(
+                args_exprs[0], context, target_fn="localdatetime"
+            )
+            if result is not None:
+                return result
         if args_exprs and isinstance(args_exprs[0], ast.Literal) and isinstance(args_exprs[0].value, str):
             parsed = _parse_datetime_string(args_exprs[0].value)
             if parsed:
@@ -8334,6 +8552,11 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
             return "NULL"
         if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
             result = _build_date_from_map(args_exprs[0], with_time=True, with_tz=True)
+            if result is not None:
+                return result
+            result = _build_date_sql_from_dynamic_base(
+                args_exprs[0], context, target_fn="datetime"
+            )
             if result is not None:
                 return result
         if args_exprs and isinstance(args_exprs[0], ast.Literal) and isinstance(args_exprs[0].value, str):
