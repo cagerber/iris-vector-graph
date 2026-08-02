@@ -1698,6 +1698,22 @@ def _tts_finalize_context(cypher_query, context):
     if cypher_query.return_clause and not any_part_had_with:
         _apply_unwind_create_context_reset(context)
 
+    # Handle standalone CALL with YIELD (no RETURN): synthesize RETURN for yielded items
+    if (
+        cypher_query.procedure_call is not None
+        and cypher_query.procedure_call.yield_items
+        and not cypher_query.return_clause
+        and context.stages
+    ):
+        # Create synthetic select items from YIELD items
+        cte_name = context.from_clauses[0] if context.from_clauses else None
+        if not cte_name:
+            cte_name = context.stages[0].split(" AS ")[0].strip()
+        for item in cypher_query.procedure_call.yield_items:
+            # For each YIELD item, create a select item that references it
+            context.select_items.append(f"{cte_name}.{item} AS {item}")
+        context.select_params = []
+
     if cypher_query.return_clause:
          translate_return_clause(cypher_query.return_clause, context)
 
@@ -7043,6 +7059,11 @@ def translate_return_clause(ret, context):
                 )
                 context.optional_null_row_items.extend(["NULL", "NULL", "NULL"])
         return
+    # Detect if there are any aggregation functions in the RETURN items
+    has_agg = any(
+        isinstance(i.expression, ast.AggregationFunction) for i in ret.items
+    )
+    agg_aliases: set = set()
     for item in ret.items:
         if isinstance(item.expression, ast.Variable):
             var_name = item.expression.name
@@ -7145,6 +7166,12 @@ def translate_return_clause(ret, context):
             context.select_items.append(f"{sql} AS {_safe_alias(alias).replace('.', '_')}")
         else:
             context.select_items.append(sql)
+        # If there's aggregation in the RETURN clause and this item is not an aggregation,
+        # add it to GROUP BY (same logic as translate_with_clause)
+        if has_agg and not isinstance(item.expression, ast.AggregationFunction):
+            context.group_by_items.append(sql)
+        if isinstance(item.expression, ast.AggregationFunction):
+            agg_aliases.add(alias) if alias else None
         # Build null-row value for OPTIONAL MATCH fallback:
         # IS NULL → 1 (null IS NULL = true), IS NOT NULL → 0, else NULL
         if isinstance(item.expression, ast.BooleanExpression):
@@ -7292,7 +7319,9 @@ def _translate_having_expr(expr, agg_aliases: set, agg_alias_sql: dict, context)
             return f"NOT ({_translate_having_expr(expr.operands[0], agg_aliases, agg_alias_sql, context)})"
         left = _translate_having_expr(expr.operands[0], agg_aliases, agg_alias_sql, context)
         right_expr = expr.operands[1] if len(expr.operands) > 1 else None
-        right = translate_expression(right_expr, context, segment="where") if right_expr is not None else ""
+        # Use segment="inline" to inline literals (don't parameterize them) in HAVING clauses.
+        # This avoids adding extra parameters for literal constants in aggregate comparisons.
+        right = translate_expression(right_expr, context, segment="inline") if right_expr is not None else ""
         op_map = {
             ast.BooleanOperator.EQUALS: "=",
             ast.BooleanOperator.NOT_EQUALS: "<>",
