@@ -2715,6 +2715,78 @@ def translate_merge_clause(merge, context, metadata):
                     f'{p_alias}.val = {context.add_join_param(str(val))}'
                 )
 
+    # --- Rewrite DML + SELECT for relationship MERGE patterns ---
+    # For MERGE patterns with relationships (e.g., MERGE (a)-[r:TYPE]->(b)),
+    # translate_create_clause generates INSERT without idempotency checks.
+    # We need to:
+    # 1. Add NOT EXISTS guard to the INSERT so MERGE is idempotent
+    # 2. Register the edge alias and add rdf_edges JOIN for SELECT
+    if merge.pattern.relationships:
+        for rel_idx, rel in enumerate(merge.pattern.relationships):
+            if not rel.types or len(rel.types) > 1:
+                continue
+
+            left_node, right_node = merge.pattern.nodes[rel_idx], merge.pattern.nodes[rel_idx + 1]
+            # For INCOMING direction, source is right_node
+            if rel.direction == ast.Direction.INCOMING:
+                source_node, target_node = right_node, left_node
+            else:
+                source_node, target_node = left_node, right_node
+
+            # Get the SQL aliases for source and target from MATCH-bound variables
+            src_var = source_node.variable
+            tgt_var = target_node.variable
+            src_alias = context.variable_aliases.get(src_var) if src_var else None
+            tgt_alias = context.variable_aliases.get(tgt_var) if tgt_var else None
+
+            if not src_alias or not tgt_alias:
+                # Source or target not bound in MATCH; skip edge registration
+                continue
+
+            rel_type = rel.types[0]
+
+            # Find the rdf_edges INSERT for this relationship and wrap it with NOT EXISTS
+            added_dmls = context.dml_statements[_pre_dml_len:]
+            new_dmls = []
+            edge_inserted = False
+
+            for sql, params in added_dmls:
+                if "INSERT INTO " + _table("rdf_edges") in sql and not edge_inserted:
+                    # Wrap the INSERT with NOT EXISTS guard for idempotency.
+                    # The original INSERT is:
+                    #   INSERT INTO rdf_edges (s, p, o_id) SELECT n0.node_id, ?, n2.node_id
+                    #   FROM nodes n0 ... WHERE ...
+                    # We need to add:
+                    #   AND NOT EXISTS (SELECT 1 FROM rdf_edges WHERE s = n0.node_id AND p = ? AND o_id = n2.node_id)
+                    wrapped_sql = sql.rstrip()
+                    # Add the NOT EXISTS guard at the end of the WHERE clause
+                    wrapped_sql = (
+                        f"{wrapped_sql} AND NOT EXISTS ("
+                        f"SELECT 1 FROM {_table('rdf_edges')} WHERE "
+                        f"s = {src_alias}.node_id AND p = ? AND o_id = {tgt_alias}.node_id"
+                        f")"
+                    )
+                    new_params = params + [rel_type]
+                    new_dmls.append((wrapped_sql, new_params))
+                    edge_inserted = True
+                else:
+                    new_dmls.append((sql, params))
+
+            if edge_inserted:
+                # Replace the DML statements
+                del context.dml_statements[_pre_dml_len:]
+                context.dml_statements.extend(new_dmls)
+
+            # Register the edge alias and add JOIN for SELECT
+            if rel.variable:
+                e_alias = context.register_variable(rel.variable, prefix="e")
+                context.join_clauses.append(
+                    f"JOIN {_table('rdf_edges')} {e_alias} ON "
+                    f"{e_alias}.s = {src_alias}.node_id AND "
+                    f"{e_alias}.p = {context.add_join_param(rel_type)} AND "
+                    f"{e_alias}.o_id = {tgt_alias}.node_id"
+                )
+
     var = merge.pattern.nodes[0].variable if merge.pattern.nodes else None
     for action, is_create in [(merge.on_create, True), (merge.on_match, False)]:
         if action:
