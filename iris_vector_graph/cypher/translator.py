@@ -460,7 +460,10 @@ def translate_procedure_call(
     if any(name.lower().startswith(p) for p in _SYSTEM_PROC_PREFIXES):
         context.system_procedure_call = proc
         return
-    if name == "ivg.vector.search":
+    # Check for TCK test procedures first
+    if name.lower().startswith("test."):
+        _translate_test_procedure(proc, context)
+    elif name == "ivg.vector.search":
         _translate_vector_search(proc, context)
     elif name == "ivg.neighbors":
         _translate_neighbors(proc, context)
@@ -492,8 +495,83 @@ def translate_procedure_call(
         _translate_kcore(proc, context)
     else:
         raise ValueError(
-            f"Unknown procedure: {name!r}. Supported: ivg.retrieve, ivg.vector.search, ivg.neighbors, ivg.ppr, ivg.bm25.search, ivg.ivf.search, ivg.shortestPath.weighted, ivg.degreeCentrality, ivg.betweenness, ivg.closeness, ivg.eigenvector, ivg.leiden, ivg.triangleCount, ivg.scc, ivg.kcore"
+            f"Unknown procedure: {name!r}. Supported: ivg.retrieve, ivg.vector.search, ivg.neighbors, ivg.ppr, ivg.bm25.search, ivg.ivf.search, ivg.shortestPath.weighted, ivg.degreeCentrality, ivg.betweenness, ivg.closeness, ivg.eigenvector, ivg.leiden, ivg.triangleCount, ivg.scc, ivg.kcore, test.*"
         )
+
+
+def _translate_test_procedure(proc: ast.CypherProcedureCall, context: TranslationContext) -> None:
+    """Translate a TCK test procedure (test.*) to a CTE with materialized result rows.
+
+    TCK procedures are registered in context._tck_procedures with their args, outputs, and
+    test data rows.
+    """
+    proc_name = proc.procedure_name
+    procedures = getattr(context, '_tck_procedures', {}) or {}
+
+    if proc_name not in procedures:
+        raise ValueError(
+            f"Procedure not found: {proc_name!r}. "
+            f"Available: {list(procedures.keys()) if procedures else 'none registered'}"
+        )
+
+    proc_def = procedures[proc_name]
+    args_spec = proc_def.get('args', [])
+    outputs_spec = proc_def.get('outputs', [])
+    rows = proc_def.get('rows', [])
+
+    # Validate argument count
+    arg_count_provided = len(proc.arguments) if proc.arguments else 0
+    arg_count_expected = len(args_spec)
+
+    if arg_count_provided != arg_count_expected:
+        raise ValueError(
+            f"Procedure {proc_name}: expected {arg_count_expected} arguments, "
+            f"got {arg_count_provided}"
+        )
+
+    # Create a CTE that materializes the test data
+    cte_name = f"TCK_Proc_{id(proc)}"
+    output_names = [out['name'] for out in outputs_spec]
+
+    if not output_names:
+        # Procedure with no outputs — no CTE needed, procedure is just called for side effects
+        return
+
+    # Build UNION of all test data rows
+    union_parts = []
+    for row in rows:
+        # Each row is a dict {col_name: value}
+        # Convert values to SQL literals
+        select_cols = []
+        for out_name in output_names:
+            val = row.get(out_name)
+            if val is None:
+                col_sql = "NULL"
+            elif isinstance(val, str):
+                # String literal — strip surrounding quotes if present, then escape
+                if val.startswith("'") and val.endswith("'"):
+                    val = val[1:-1]
+                escaped = val.replace("'", "''")
+                col_sql = f"'{escaped}'"
+            else:
+                # Numeric or boolean
+                col_sql = str(val)
+            select_cols.append(f"{col_sql} AS {out_name}")
+        union_parts.append(f"SELECT {', '.join(select_cols)}")
+
+    if union_parts:
+        select_sql = " UNION ALL ".join(union_parts)
+    else:
+        # No test data rows — return empty result
+        cols_sql = ", ".join([f"NULL AS {name}" for name in output_names])
+        select_sql = f"SELECT {cols_sql} WHERE FALSE"
+
+    # Add CTE to context
+    context.stages.insert(0, f"{cte_name} AS (\n{select_sql}\n)")
+
+    # Set up variable aliases for YIELD items
+    for item in proc.yield_items:
+        context.variable_aliases[item] = cte_name
 
 
 def _resolve_arg(arg, context: TranslationContext, name: str, expected_type=None):
@@ -1939,7 +2017,8 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
 
 
 def translate_to_sql(
-    cypher_query: ast.CypherQuery, params: Optional[Dict[str, Any]] = None, engine=None
+    cypher_query: ast.CypherQuery, params: Optional[Dict[str, Any]] = None, engine=None,
+    procedures: Optional[Dict[str, Any]] = None,
 ) -> SQLQuery:
     result = _tts_union_branches(cypher_query, params)
     if result is not None:
@@ -1948,6 +2027,7 @@ def translate_to_sql(
     context = TranslationContext()
     context.input_params = params or {}
     context._engine = engine
+    context._tck_procedures = procedures or {}  # TCK test procedures
     context.graph_context = getattr(cypher_query, "graph_context", None)
     metadata = QueryMetadata()
     context._metadata = metadata
@@ -2857,6 +2937,10 @@ def translate_merge_clause(merge, context, metadata):
 
 
 def translate_set_clause(set_cl, context, metadata):
+    # Track which properties are being SET so we can exclude them from the final SELECT WHERE clause
+    if not hasattr(context, '_set_properties'):
+        context._set_properties = set()
+
     for item in set_cl.items:
         if isinstance(item.expression, ast.Variable) and getattr(item, "merge", False):
             alias = context.variable_aliases.get(item.expression.name)
@@ -2868,6 +2952,7 @@ def translate_set_clause(set_cl, context, metadata):
                 map_val = context.input_params[val_expr.name]
                 if isinstance(map_val, dict):
                     for k, v in map_val.items():
+                        context._set_properties.add(k)
                         context.add_dml(
                             f'{cte}UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
                             [v] + subparams + [k],
@@ -2878,6 +2963,7 @@ def translate_set_clause(set_cl, context, metadata):
                         )
             elif isinstance(val_expr, ast.MapLiteral):
                 for k, v in val_expr.entries.items():
+                    context._set_properties.add(k)
                     val = v.value if isinstance(v, ast.Literal) else context.input_params.get(v.name) if isinstance(v, ast.Variable) else v
                     context.add_dml(
                         f'{cte}UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
@@ -2888,9 +2974,11 @@ def translate_set_clause(set_cl, context, metadata):
                         [k, val] + subparams + [k],
                     )
         elif isinstance(item.expression, ast.PropertyReference):
+            prop_name = item.expression.property_name
+            context._set_properties.add(prop_name)
             alias, k, v = (
                 context.variable_aliases.get(item.expression.variable),
-                item.expression.property_name,
+                prop_name,
                 item.value,
             )
             val = v.value if isinstance(v, ast.Literal) else v
@@ -4549,6 +4637,13 @@ def _boolean_expr_logical(op, expr, context):
         if sa == "NULL" or sb == "NULL":
             # At least one operand evaluates to NULL → XOR result is NULL
             return "NULL"
+        # Constant folding: if both operands are sentinel booleans (1=1)/(1=0), evaluate at Python level
+        # to avoid generating exponentially large nested SQL for chains like true XOR true XOR true ...
+        if sa in ("(1=1)", "(1=0)") and sb in ("(1=1)", "(1=0)"):
+            a_val = (sa == "(1=1)")
+            b_val = (sb == "(1=1)")
+            result = a_val != b_val  # XOR: true if exactly one is true
+            return "(1=1)" if result else "(1=0)"
         # Both are non-NULL expressions: simple XOR
         return f"(({sa} AND NOT ({sb})) OR (NOT ({sa}) AND {sb}))"
     if op == ast.BooleanOperator.NOT:
