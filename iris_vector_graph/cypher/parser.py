@@ -1562,7 +1562,23 @@ class Parser:
     def parse_map_literal(self) -> Dict[str, Any]:
         """Parse {key: value, ...}"""
         props = {}
-        while self.peek().kind == TokenType.IDENTIFIER:
+        _NOT_KEY = frozenset({
+            TokenType.COLON, TokenType.COMMA, TokenType.RBRACE,
+            TokenType.LPAREN, TokenType.RPAREN, TokenType.EOF,
+            TokenType.LBRACE,
+        })
+        while True:
+            # Accept identifiers or keyword tokens as property keys when followed by COLON.
+            # e.g. {end: 1} — 'end' is an END keyword token, not an IDENTIFIER.
+            tok = self.peek()
+            next_tok = self.lexer.peek_ahead(1)
+            is_key = (
+                tok.kind not in _NOT_KEY
+                and isinstance(tok.value, str)
+                and next_tok.kind == TokenType.COLON
+            )
+            if not is_key:
+                break
             key_tok = self.eat()
             key = key_tok.value
             if key is None:

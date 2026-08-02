@@ -4448,7 +4448,7 @@ def _boolean_expr_logical(op, expr, context):
     return None
 
 
-def _boolean_expr_in(left, right_expr, context):
+def _boolean_expr_in(left, right_expr, context, left_expr=None):
     if isinstance(right_expr, ast.SubscriptExpression):
         inner_sql = translate_expression(right_expr.expression, context, segment="where")
         idx = right_expr.index
@@ -4474,6 +4474,23 @@ def _boolean_expr_in(left, right_expr, context):
         if not non_null_items:
             # All null: x IN [null] = null (handled by caller null check for left=null, else null)
             return "NULL"
+        # Type-strict IN: Cypher string != int, filter mismatched literal items
+        if left_expr is not None and isinstance(left_expr, ast.Literal) and left_expr.value is not None:
+            lv = left_expr.value
+            lv_str = isinstance(lv, str)
+            lv_num = isinstance(lv, (int, float)) and not isinstance(lv, bool)
+            filtered = []
+            for item in non_null_items:
+                if isinstance(item, ast.Literal) and item.value is not None:
+                    iv = item.value
+                    if (lv_str and isinstance(iv, (int, float)) and not isinstance(iv, bool)):
+                        continue
+                    if (lv_num and isinstance(iv, str)):
+                        continue
+                filtered.append(item)
+            if not filtered:
+                return "(1=0)"
+            non_null_items = filtered
         def _serialize_in_item(item):
             if isinstance(item, ast.Literal):
                 v = item.value
@@ -4688,7 +4705,7 @@ def translate_boolean_expression(expr, context) -> str:
     if left.startswith("CASE WHEN ") and " END" in left:
         left = f"({left})"
     if op == ast.BooleanOperator.IN:
-        in_sql = _boolean_expr_in(left, right_expr, context)
+        in_sql = _boolean_expr_in(left, right_expr, context, left_expr)
         if in_sql is not None:
             return in_sql
     right_inlined = _inline_literal(right_expr)
