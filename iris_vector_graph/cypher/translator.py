@@ -6116,6 +6116,15 @@ def translate_boolean_expression(expr, context) -> str:
         # preserving Cypher 3VL semantics: (a AND b) IS NULL where a=NULL, b=TRUE → TRUE
         if isinstance(left_expr, ast.BooleanExpression):
             inner = translate_boolean_expression(left_expr, context)
+            # Short-circuit when inner is a known constant.
+            # "NULL IS NULL" = TRUE; "1 IS NULL" = "0 IS NULL" = FALSE.
+            if inner == "NULL":
+                return "(1=1)" if op == ast.BooleanOperator.IS_NULL else "(1=0)"
+            if inner in ("1", "0", "(1=1)", "(1=0)"):
+                return "(1=0)" if op == ast.BooleanOperator.IS_NULL else "(1=1)"
+            # General case: CASE WHEN inner THEN 0 WHEN NOT inner THEN 0 ELSE 1 END = 1
+            # (result is 1 only when inner is SQL NULL — neither truthy nor falsy).
+            # IRIS requires a non-NULL condition in CASE WHEN, so guard against inner="NULL".
             null_check = (
                 f"CASE WHEN {inner} THEN 0 "
                 f"WHEN NOT ({inner}) THEN 0 "
@@ -11621,6 +11630,10 @@ def _expr_boolean(expr, context, segment):
         cond = cond.replace("THEN (1=0)", "THEN 0").replace("THEN (1=1)", "THEN 1")
         if " THEN 1 ELSE NULL END" in cond or " THEN 0 ELSE NULL END" in cond or " THEN 1 ELSE 0 END" in cond:
             return cond
+    # IRIS rejects parentheses around IS NULL/IS NOT NULL predicates in CASE WHEN.
+    # e.g. CASE WHEN (NULL IS NULL) fails; CASE WHEN NULL IS NULL works.
+    if cond.endswith(" IS NULL") or cond.endswith(" IS NOT NULL"):
+        return f"CASE WHEN {cond} THEN 1 ELSE 0 END"
     return f"CASE WHEN ({cond}) THEN 1 ELSE 0 END"
 
 
