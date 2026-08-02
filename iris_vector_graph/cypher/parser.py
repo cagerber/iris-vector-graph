@@ -1223,28 +1223,35 @@ class Parser:
         left = self.parse_string_list_null_expression()
 
         # Binary comparisons (= <> < > <= >=) — these bind LESS tightly than IS NULL / IN.
-        tok = self.peek()
-        op = None
-        match tok.kind:
-            case TokenType.EQUALS:
-                op = ast.BooleanOperator.EQUALS
-            case TokenType.NOT_EQUALS:
-                op = ast.BooleanOperator.NOT_EQUALS
-            case TokenType.LESS_THAN:
-                op = ast.BooleanOperator.LESS_THAN
-            case TokenType.LESS_THAN_OR_EQUAL:
-                op = ast.BooleanOperator.LESS_THAN_OR_EQUAL
-            case TokenType.GREATER_THAN:
-                op = ast.BooleanOperator.GREATER_THAN
-            case TokenType.GREATER_THAN_OR_EQUAL:
-                op = ast.BooleanOperator.GREATER_THAN_OR_EQUAL
+        # Supports chained comparisons: `1 < n.num < 3` → `(1 < n.num) AND (n.num < 3)`.
+        _CMP_OPS = {
+            TokenType.EQUALS: ast.BooleanOperator.EQUALS,
+            TokenType.NOT_EQUALS: ast.BooleanOperator.NOT_EQUALS,
+            TokenType.LESS_THAN: ast.BooleanOperator.LESS_THAN,
+            TokenType.LESS_THAN_OR_EQUAL: ast.BooleanOperator.LESS_THAN_OR_EQUAL,
+            TokenType.GREATER_THAN: ast.BooleanOperator.GREATER_THAN,
+            TokenType.GREATER_THAN_OR_EQUAL: ast.BooleanOperator.GREATER_THAN_OR_EQUAL,
+        }
+        op = _CMP_OPS.get(self.peek().kind)
+        if not op:
+            return left
 
-        if op:
+        self.eat()
+        right = self.parse_string_list_null_expression()
+        result = ast.BooleanExpression(op, [left, right])
+
+        # Chained: each additional comparison op ANDs with the previous, sharing the middle term.
+        while True:
+            next_op = _CMP_OPS.get(self.peek().kind)
+            if not next_op:
+                break
             self.eat()
-            right = self.parse_string_list_null_expression()
-            return ast.BooleanExpression(op, [left, right])
+            next_right = self.parse_string_list_null_expression()
+            next_cmp = ast.BooleanExpression(next_op, [right, next_right])
+            result = ast.BooleanExpression(ast.BooleanOperator.AND, [result, next_cmp])
+            right = next_right
 
-        return left
+        return result
 
     def parse_primary_expression(self) -> Any:
         """Parse atomic expression elements"""
