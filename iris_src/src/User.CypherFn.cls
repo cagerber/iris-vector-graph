@@ -128,4 +128,96 @@ ClassMethod IVGLISTTAIL(json As %String = "") As %String [ SqlProc ]
     } Catch { Return "[]" }
 }
 
+/// List element access with strict integer type checking (Cypher TCK compliance).
+/// idx must be a string representation of an integer (no decimals, no leading zeros beyond "0").
+/// Raises an error for non-integer indices (boolean, float, string, list, map).
+/// Returns the array element at 0-based index idx, or NULL for out-of-bounds.
+ClassMethod IVGLISTGET(json As %String = "", idx As %String = "") As %String [ SqlProc ]
+{
+    // Reject empty/null list
+    If json = "" || json = "null" { Return "" }
+    // Type-check: idx must parse as an exact integer (no decimal point)
+    // IRIS $IsValidNum returns 1 for integers and floats; use $Find for dot check
+    If $Find(idx, ".") > 0 {
+        // Float index: TypeError
+        Throw ##class(%Exception.General).%New("TypeError","5001",,"Non-integer index for list subscript: "_idx)
+    }
+    // Check if idx looks like a JSON array or object (starts with [ or {)
+    Set firstChar = $Extract($ZStrip(idx,"<W"), 1)
+    If firstChar = "[" || (firstChar = "{") {
+        Throw ##class(%Exception.General).%New("TypeError","5001",,"Non-integer index for list subscript: "_idx)
+    }
+    // Must be a valid integer
+    If '$IsValidNum(idx, 0) {
+        Throw ##class(%Exception.General).%New("TypeError","5001",,"Non-integer index for list subscript: "_idx)
+    }
+    Set intIdx = +idx
+    Try {
+        Set arr = ##class(%DynamicArray).%FromJSON(json)
+        If arr = "" { Return "" }
+        If arr.%IsA("%DynamicArray") = 0 {
+            // Not an array (it's an object): TypeError
+            Throw ##class(%Exception.General).%New("TypeError","5001",,"Cannot use list subscript on non-list value")
+        }
+        // Negative index: wrap around
+        If intIdx < 0 {
+            Set intIdx = arr.%Size() + intIdx
+        }
+        If intIdx < 0 || intIdx >= arr.%Size() { Return "" }
+        Return arr.%Get(intIdx)
+    } Catch e {
+        Throw e
+    }
+}
+
+/// Always raises a TypeError. Used to signal type errors at SQL execution time.
+ClassMethod IVGTYPEERROR(msg As %String = "TypeError") As %String [ SqlProc ]
+{
+    Throw ##class(%Exception.General).%New("TypeError","5001",,msg)
+}
+
+/// Map property access by dynamic key. Returns NULL for missing keys.
+ClassMethod IVGMAPGET(json As %String = "", key As %String = "") As %String [ SqlProc ]
+{
+    If json = "" || json = "null" { Return "" }
+    Try {
+        Set obj = ##class(%DynamicObject).%FromJSON(json)
+        If obj = "" { Return "" }
+        Return obj.%Get(key)
+    } Catch { Return "" }
+}
+
+/// Set a key in a JSON object, returning the updated JSON string.
+/// Creates a new empty object if json is null/empty.
+/// Numeric values are stored as numbers; others as strings.
+ClassMethod IVGJSONSET(json As %String = "", key As %String = "", val As %String = "") As %String [ SqlProc ]
+{
+    Try {
+        If json = "" || json = "null" {
+            Set obj = ##class(%DynamicObject).%New()
+        } Else {
+            Set obj = ##class(%DynamicObject).%FromJSON(json)
+            If '$IsObject(obj) { Set obj = ##class(%DynamicObject).%New() }
+        }
+        If $IsValidNum(val) {
+            Set obj = obj.%Set(key, +val)
+        } Else {
+            Set obj = obj.%Set(key, val)
+        }
+        Return obj.%ToJSON()
+    } Catch { Return json }
+}
+
+/// Remove a key from a JSON object, returning the updated JSON string.
+ClassMethod IVGJSONREMOVE(json As %String = "", key As %String = "") As %String [ SqlProc ]
+{
+    If json = "" || json = "null" { Return "{}" }
+    Try {
+        Set obj = ##class(%DynamicObject).%FromJSON(json)
+        If obj = "" { Return "{}" }
+        Do obj.%Remove(key)
+        Return obj.%ToJSON()
+    } Catch { Return json }
+}
+
 }

@@ -15,29 +15,70 @@ NAMED_GRAPHS = {
     "binary-tree-2": "TCK_BINARY_TREE_2",
 }
 
-# Binary tree structures (from openCypher tck/graphs/ directory)
+# Binary tree structures — exact copies of vendor/opencypher/tck/graphs/binary-tree-*/
+# These must match the graphs used by the TCK feature files exactly.
 _BINARY_TREE_1_CQL = """
-CREATE
-  (root:A {name: 'root'}),
-  (n1:A {name: 'n1'}), (n2:A {name: 'n2'}),
-  (n3:B {name: 'n3'}), (n4:B {name: 'n4'}),
-  (n5:B {name: 'n5'}), (n6:B {name: 'n6'}),
-  (root)-[:KNOWS]->(n1), (root)-[:KNOWS]->(n2),
-  (n1)-[:KNOWS]->(n3), (n1)-[:KNOWS]->(n4),
-  (n2)-[:KNOWS]->(n5), (n2)-[:KNOWS]->(n6)
+CREATE (a:A {name: 'a'}),
+       (b1:X {name: 'b1'}),
+       (b2:X {name: 'b2'}),
+       (b3:X {name: 'b3'}),
+       (b4:X {name: 'b4'}),
+       (c11:X {name: 'c11'}),
+       (c12:X {name: 'c12'}),
+       (c21:X {name: 'c21'}),
+       (c22:X {name: 'c22'}),
+       (c31:X {name: 'c31'}),
+       (c32:X {name: 'c32'}),
+       (c41:X {name: 'c41'}),
+       (c42:X {name: 'c42'})
+CREATE (a)-[:KNOWS]->(b1),
+       (a)-[:KNOWS]->(b2),
+       (a)-[:FOLLOWS]->(b3),
+       (a)-[:FOLLOWS]->(b4)
+CREATE (b1)-[:FRIEND]->(c11),
+       (b1)-[:FRIEND]->(c12),
+       (b2)-[:FRIEND]->(c21),
+       (b2)-[:FRIEND]->(c22),
+       (b3)-[:FRIEND]->(c31),
+       (b3)-[:FRIEND]->(c32),
+       (b4)-[:FRIEND]->(c41),
+       (b4)-[:FRIEND]->(c42)
+CREATE (b1)-[:FRIEND]->(b2),
+       (b2)-[:FRIEND]->(b3),
+       (b3)-[:FRIEND]->(b4),
+       (b4)-[:FRIEND]->(b1)
 """
 
 _BINARY_TREE_2_CQL = """
-CREATE
-  (root:A {name: 'root'}),
-  (n1:A {name: 'n1'}), (n2:A {name: 'n2'}),
-  (n3:B {name: 'n3'}), (n4:B {name: 'n4'}),
-  (n5:B {name: 'n5'}), (n6:B {name: 'n6'}),
-  (n7:C {name: 'n7'}),
-  (root)-[:KNOWS]->(n1), (root)-[:KNOWS]->(n2),
-  (n1)-[:KNOWS]->(n3), (n1)-[:KNOWS]->(n4),
-  (n2)-[:KNOWS]->(n5), (n2)-[:KNOWS]->(n6),
-  (n3)-[:KNOWS]->(n7)
+CREATE (a:A {name: 'a'}),
+       (b1:X {name: 'b1'}),
+       (b2:X {name: 'b2'}),
+       (b3:X {name: 'b3'}),
+       (b4:X {name: 'b4'}),
+       (c11:X {name: 'c11'}),
+       (c12:Y {name: 'c12'}),
+       (c21:X {name: 'c21'}),
+       (c22:Y {name: 'c22'}),
+       (c31:X {name: 'c31'}),
+       (c32:Y {name: 'c32'}),
+       (c41:X {name: 'c41'}),
+       (c42:Y {name: 'c42'})
+CREATE (a)-[:KNOWS]->(b1),
+       (a)-[:KNOWS]->(b2),
+       (a)-[:FOLLOWS]->(b3),
+       (a)-[:FOLLOWS]->(b4)
+CREATE (b1)-[:FRIEND]->(c11),
+       (b1)-[:FRIEND]->(c12),
+       (b2)-[:FRIEND]->(c21),
+       (b2)-[:FRIEND]->(c22),
+       (b3)-[:FRIEND]->(c31),
+       (b3)-[:FRIEND]->(c32),
+       (b4)-[:FRIEND]->(c41),
+       (b4)-[:FRIEND]->(c42)
+CREATE (b1)-[:FRIEND]->(b2),
+       (b2)-[:FRIEND]->(b3),
+       (b3)-[:FRIEND]->(b4),
+       (b4)-[:FRIEND]->(b1)
 """
 
 
@@ -164,7 +205,12 @@ def _ensure_named_graph(context, graph_name: str, label: str):
         result = context.engine.execute_cypher(
             f"MATCH (n:{label}) RETURN count(n) AS cnt", {}
         )
-        cnt = result.rows[0].get("cnt", 0) if result.rows else 0
+        row0 = result.rows[0] if result.rows else None
+        if row0 is not None:
+            # rows may be a list or dict depending on IVGResult format
+            cnt = row0.get("cnt", 0) if isinstance(row0, dict) else (row0[0] if row0 else 0)
+        else:
+            cnt = 0
         if cnt > 0:
             return  # already built
     except Exception:

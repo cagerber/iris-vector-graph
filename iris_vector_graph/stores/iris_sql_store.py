@@ -348,16 +348,29 @@ class IRISGraphStore:
             pre_captured_rows = None
             pre_captured_description = None
 
-            # When a transactional query has DELETE NODES followed by a final
-            # SELECT, the SELECT must see the pre-delete snapshot.  Detect that
-            # pattern and run the SELECT first so its results reflect the rows
-            # that are about to be deleted.
-            # BUT: only for node deletions (DELETE FROM nodes), not property/label deletions
-            # (DELETE FROM rdf_props / rdf_labels).
+            # When a transactional query has DELETE NODES or REMOVE label followed
+            # by a final SELECT, the SELECT must see the pre-delete snapshot.
+            # Detect that pattern and run the SELECT first so its results reflect
+            # the rows that are about to be deleted/unlabeled.
+            #
+            # Pre-snapshot is needed for:
+            #   DELETE FROM nodes         — node deletion (nodes gone after DELETE)
+            #   DELETE FROM rdf_labels    — label removal (MATCH by label fails after removal)
+            #
+            # Pre-snapshot is NOT needed for:
+            #   DELETE FROM rdf_props     — property removal (nodes still exist, SELECT
+            #                               should see the post-removal state where the
+            #                               property is NULL, not the pre-removal value)
             import re as _del_re
+            # Use re.search (not re.match) so CTE-prefixed DELETE statements like
+            # "WITH Stage1 AS (...) DELETE FROM nodes ..." are also detected.
+            # Include rdf_edges so relationship DELETE also triggers pre-snapshot.
             has_delete_dml = any(
-                isinstance(s, str) and "DELETE " in s.upper() and
-                _del_re.search(r'FROM\s+(?:\w+\.)?nodes\s+', s, _del_re.IGNORECASE) and
+                isinstance(s, str) and
+                _del_re.search(
+                    r'DELETE\s+FROM\s+(?:\w+\.)?(?:nodes|rdf_labels|rdf_edges)\b',
+                    s, _del_re.IGNORECASE
+                ) and
                 not s.startswith("__constraint_check_delete_connected__")
                 for s in stmts
             )

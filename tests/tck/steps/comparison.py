@@ -624,12 +624,54 @@ def _rows_equal(exp: dict, act: dict, columns: list[str], list_unordered: bool) 
                 and isinstance(av, str)
                 and ev[0][1:] == av):
             continue
-        if list_unordered and isinstance(ev, list) and isinstance(av, list):
-            if sorted(str(x) for x in ev) != sorted(str(x) for x in av):
-                return False
-        else:
-            if ev != av:
-                return False
+        # List-of-nodes comparison: TCK [(), ()] vs actual [{"_id":..., "_labels":..., "_props":...}]
+        if isinstance(ev, list) and isinstance(av, list):
+            # Parse items that are JSON strings of node objects (from collect(nodeVar))
+            import json as _json_list
+            def _parse_node_item(item):
+                if isinstance(item, str):
+                    try:
+                        parsed = _json_list.loads(item)
+                        if isinstance(parsed, dict) and "_id" in parsed:
+                            return parsed
+                    except (ValueError, TypeError):
+                        pass
+                return item
+            av_parsed = [_parse_node_item(x) for x in av]
+            # Detect if all expected items are node patterns
+            ev_patterns = [_parse_node_pattern(x) if isinstance(x, str) else None for x in ev]
+            all_node_patterns = all(p is not None for p in ev_patterns)
+            if all_node_patterns and all(isinstance(x, dict) and "_id" in x for x in av_parsed):
+                if len(ev_patterns) != len(av_parsed):
+                    return False
+                if list_unordered:
+                    # Backtracking match for unordered node lists
+                    def _list_nodes_match(patterns, avail):
+                        if not patterns:
+                            return True
+                        p = patterns[0]
+                        for i in avail:
+                            if _node_matches(av_parsed[i], p):
+                                remaining = [j for j in avail if j != i]
+                                if _list_nodes_match(patterns[1:], remaining):
+                                    return True
+                        return False
+                    if not _list_nodes_match(ev_patterns, list(range(len(av_parsed)))):
+                        return False
+                else:
+                    for pat, node in zip(ev_patterns, av_parsed):
+                        if not _node_matches(node, pat):
+                            return False
+                continue
+            if list_unordered:
+                if sorted(str(x) for x in ev) != sorted(str(x) for x in av_parsed):
+                    return False
+            else:
+                if ev != av_parsed:
+                    return False
+            continue
+        if ev != av:
+            return False
     return True
 
 
