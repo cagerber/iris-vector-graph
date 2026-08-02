@@ -1645,7 +1645,9 @@ def _tts_finalize_context(cypher_query, context):
     any_part_had_with = any(
         qp.with_clause is not None for qp in cypher_query.query_parts
     ) if cypher_query.query_parts else False
-    if context.stages and (last_part_had_with or any_part_had_with):
+    if context.stages and last_part_had_with:
+        # The last query part ended with a WITH clause, which just created Stage{N}.
+        # RETURN must select directly from that stage with no additional JOINs.
         # Preserve UNWIND CROSS JOIN JSON_TABLE clauses before reset — they were
         # added by translate_unwind_clause and must survive the stage reset.
         unwind_joins = [
@@ -1658,6 +1660,13 @@ def _tts_finalize_context(cypher_query, context):
             list(unwind_joins),
             [],
         )
+        context.where_conditions, context.where_params = [], []
+    elif context.stages and any_part_had_with and not last_part_had_with:
+        # A prior part had WITH (produced stages), but the last part is a plain MATCH/RETURN.
+        # _to_sql_init_part_from already set from_clauses to Stage{N} and the MATCH clauses
+        # added join_clauses correctly. Do NOT reset join_clauses — they are needed.
+        # Only clear select_items/where_conditions (already reset at part start).
+        context.select_items, context.select_params = [], []
         context.where_conditions, context.where_params = [], []
 
     # UNWIND+CREATE+RETURN: foreach expansion created nodes/relationships and tracked their IDs.
@@ -2954,7 +2963,7 @@ def translate_node_pattern(node, context, metadata, optional=False):
                     context.where_conditions.append(f"{l_alias}.s IS NOT NULL")
             for k, v in node.properties.items():
                 val_sql = translate_expression(v, context, segment="where")
-                if k in ("node_id", "id"):
+                if k == "node_id":
                     context.where_conditions.append(f"{alias}.node_id = {val_sql}")
                 else:
                     if not optional:
@@ -3038,7 +3047,7 @@ def translate_node_pattern(node, context, metadata, optional=False):
                     context.optional_null_row_labels.append(label)
     for k, v in node.properties.items():
         val_sql = translate_expression(v, context, segment="where")
-        if k in ("node_id", "id"):
+        if k == "node_id":
             context.where_conditions.append(f"{alias}.node_id = {val_sql}")
         else:
             if not optional:
@@ -3104,6 +3113,8 @@ def _trp_variable_length(rel, source_node, target_node, context, metadata):
                     k: (v.value if isinstance(v, ast.Literal) else v)
                     for k, v in rel.properties.items()
                 } if rel.properties else {},
+                "source_labels": list(source_node.labels) if source_node.labels else [],
+                "target_labels": list(target_node.labels) if target_node.labels else [],
             }
         )
         if not context.from_clauses:
@@ -3358,7 +3369,7 @@ def _trp_apply_inline_props(source_node, source_alias, target_node, target_alias
             continue
         for k, v in prop_node.properties.items():
             val_sql = translate_expression(v, context, segment="where")
-            if k in ("node_id", "id"):
+            if k == "node_id":
                 context.where_conditions.append(f"{prop_alias}.node_id = {val_sql}")
             else:
                 p_alias = context.next_alias("p")
@@ -3447,7 +3458,7 @@ def _trp_apply_anon_source_constraints(source_node, edge_alias, src_col, context
         )
     for k, v in (source_node.properties or {}).items():
         val_sql = translate_expression(v, context, segment="where")
-        if k in ("node_id", "id"):
+        if k == "node_id":
             context.where_conditions.append(f"{src_ref} = {val_sql}")
         else:
             p_alias = context.next_alias("p")
