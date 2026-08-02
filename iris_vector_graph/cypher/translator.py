@@ -6816,6 +6816,17 @@ def _expr_to_cypher_text(expr) -> str:
     if isinstance(expr, ast.FunctionCall):
         args = ", ".join(_expr_to_cypher_text(a) for a in expr.arguments)
         return f"{expr.function_name}({args})"
+    if isinstance(expr, ast.MapLiteral):
+        entries = ", ".join(
+            f"{k}: {_expr_to_cypher_text(v)}" for k, v in expr.entries.items()
+        )
+        return "{" + entries + "}"
+    if isinstance(expr, ast.ListLiteral):
+        items = ", ".join(_expr_to_cypher_text(i) for i in expr.elements)
+        return f"[{items}]"
+    if isinstance(expr, ast.ArithmeticExpression):
+        parts = [_expr_to_cypher_text(o) for o in expr.operands]
+        return f" {expr.operator} ".join(parts)
     return ""
 
 
