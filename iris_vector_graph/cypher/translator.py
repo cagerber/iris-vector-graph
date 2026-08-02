@@ -1798,8 +1798,12 @@ def _tts_finalize_context(cypher_query, context):
         set_properties = getattr(context, '_set_properties', set())
         if set_properties and context.where_conditions:
             # Filter out WHERE conditions that reference modified properties.
-            # A WHERE condition is property-related if it contains a " = ?" or similar
-            # and the property name appears in the SET properties list.
+            # Examples of conditions to remove:
+            #   p2.val = 'Andres'  (literal value filter on property)
+            #   p2.val = ?         (parameterized value filter on property)
+            # Keep conditions that don't touch modified properties:
+            #   l1.s IS NOT NULL   (label check)
+            #   EXISTS (... "key" = 'name') (property existence, not value)
             filtered_conditions = []
             filtered_params = []
             param_offset = 0
@@ -1808,20 +1812,21 @@ def _tts_finalize_context(cypher_query, context):
                 cond_params = context.where_params[param_offset : param_offset + param_count]
                 param_offset += param_count
 
-                # Check if this condition involves a modified property.
-                # Look for patterns like `p2."key" = ?` where the value is a SET property.
+                # Check if this condition is a value filter on a modified property.
+                # Patterns to reject:
+                #   p<N>.val = <literal or ?>  (property value filter)
+                #   rdf_props.val = <literal>  (qualified property value filter)
                 is_modified_property_condition = False
-                for prop_name in set_properties:
-                    # Check for patterns like 'key' = ? or "key" = ?
-                    if f'"{prop_name}"' in cond or f"'{prop_name}'" in cond or f'key' in cond and prop_name in str(cond_params):
-                        # This is a property value filter on a modified property
+
+                # Check for .val = pattern (property value comparisons)
+                if '.val = ' in cond:
+                    is_modified_property_condition = True
+                    # Verify this isn't part of a sub-SELECT (like "NOT IN (SELECT 1 ... .val = ?)")
+                    # by checking it's at the top level
+                    if 'SELECT' in cond and cond.index('.val = ') < cond.rindex('SELECT'):
+                        # This might be in a subquery, be more careful
+                        # For now, assume it's a property value condition
                         is_modified_property_condition = True
-                        break
-                    # Also check for direct property references like p.val = ?
-                    if f'.val = ?' in cond and cond_params:
-                        # This looks like a property value condition
-                        is_modified_property_condition = True
-                        break
 
                 if not is_modified_property_condition:
                     filtered_conditions.append(cond)
@@ -7527,6 +7532,17 @@ def _translate_where_with_alias_expansion(expr, alias_to_expr: dict, context) ->
         elif op == ast.BooleanOperator.NOT:
             inner = _translate_where_with_alias_expansion(expr.operands[0], alias_to_expr, context)
             return f"NOT ({inner})"
+        elif op in (ast.BooleanOperator.IS_NULL, ast.BooleanOperator.IS_NOT_NULL):
+            # Handle unary IS NULL / IS NOT NULL operators
+            operand_expr = expr.operands[0]
+            if isinstance(operand_expr, ast.Variable) and operand_expr.name in alias_to_expr:
+                operand_sql = translate_expression(alias_to_expr[operand_expr.name], context, segment="where")
+            else:
+                operand_sql = translate_expression(operand_expr, context, segment="where")
+            if op == ast.BooleanOperator.IS_NULL:
+                return f"{operand_sql} IS NULL"
+            else:
+                return f"{operand_sql} IS NOT NULL"
         else:
             # For comparison operators, translate left and right with alias expansion
             left_expr = expr.operands[0]
