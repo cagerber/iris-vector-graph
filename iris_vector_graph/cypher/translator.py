@@ -6674,7 +6674,14 @@ def _expr_fn_keys(args):
     if not args:
         return "JSON_ARRAY()"
     id_expr = args[0]
-    return f"COALESCE((SELECT JSON_ARRAYAGG(rp.\"key\") FROM {_table('rdf_props')} rp WHERE rp.s = {id_expr}), CAST('[]' AS VARCHAR(256)))"
+    # Check if id_expr is a JSON object (starts with '{') - if so, use JSON_KEYS instead of rdf_props
+    # Otherwise, assume it's a node ID and look up rdf_props
+    return (
+        f"CASE WHEN SUBSTRING({id_expr}, 1, 1) = '{{' "
+        f"THEN COALESCE(SQLUser.JSON_KEYS({id_expr}), CAST('[]' AS VARCHAR(256))) "
+        f"ELSE COALESCE((SELECT JSON_ARRAYAGG(rp.\"key\") FROM {_table('rdf_props')} rp WHERE rp.s = {id_expr}), CAST('[]' AS VARCHAR(256))) "
+        f"END"
+    )
 
 
 _EMPTY_JSON_ARRAY = "CAST('[]' AS VARCHAR(256))"
@@ -7266,11 +7273,9 @@ def translate_with_clause(with_clause, context):
         isinstance(i.expression, ast.AggregationFunction) for i in with_clause.items
     )
     agg_aliases: set = set()
+    agg_alias_sql: dict = {}  # Maps aggregate alias -> SQL expression (computed once)
 
-    # Build a map of new WITH aliases so we can temporarily add them to context.variable_aliases
-    # before translating the WHERE clause. WITH WHERE should see both old variables (pre-WITH)
-    # and new aliases (projected in this WITH).
-    with_item_aliases: dict = {}  # Maps new alias -> placeholder (will be filled in by caller)
+    # Process WITH clause items: translate expressions and add to select
     for item in with_clause.items:
         sql = translate_expression(item.expression, context, segment="select")
         alias = item.alias
@@ -7283,8 +7288,6 @@ def translate_with_clause(with_clause, context):
                 alias = f"{item.expression.function_name}"
         if alias is None:
             alias = context.next_alias("v")
-
-        with_item_aliases[alias] = "__TEMP_WITH_ALIAS__"
 
         # Track temporal types for property access extraction
         if isinstance(item.expression, ast.FunctionCall):
@@ -7324,14 +7327,8 @@ def translate_with_clause(with_clause, context):
             context.group_by_items.append(sql)
         if isinstance(item.expression, ast.AggregationFunction):
             agg_aliases.add(alias)
-
-    agg_alias_sql: dict = {}
-    for item in with_clause.items:
-        if isinstance(item.expression, ast.AggregationFunction):
-            alias = item.alias
-            if alias is None:
-                alias = item.expression.function_name
-            agg_alias_sql[alias] = translate_expression(item.expression, context, segment="select")
+            # Store SQL for this aggregate so it can be reused in HAVING without re-translating
+            agg_alias_sql[alias] = sql
 
     if with_clause.where_clause:
         expr = with_clause.where_clause.expression
@@ -7363,6 +7360,77 @@ def translate_with_clause(with_clause, context):
             # Translate the WHERE using a substitute function that expands aliases to original expressions
             where_sql = _translate_where_with_alias_expansion(expr, alias_to_expr, context)
             context.where_conditions.append(where_sql)
+
+
+def _translate_where_with_alias_expansion(expr, alias_to_expr: dict, context) -> str:
+    """Translate a WHERE expression for WITH clause, expanding aliases to their original expressions.
+
+    In SQL, WHERE is evaluated before SELECT aliases are bound. When a Cypher WITH clause has
+    `WITH a.name AS n WHERE n = 'x'`, the WHERE must use the original expression (a.name),
+    not the alias (n). This function recursively expands alias references to their expressions.
+
+    Args:
+        expr: The boolean expression AST to translate
+        alias_to_expr: Map from alias name -> original expression AST
+        context: Translation context
+
+    Returns:
+        SQL string for the WHERE clause
+    """
+    if isinstance(expr, ast.Variable):
+        # If this variable is an alias defined in the WITH, substitute it with the original expression
+        if expr.name in alias_to_expr:
+            original_expr = alias_to_expr[expr.name]
+            # Recursively translate the original expression
+            return translate_expression(original_expr, context, segment="where")
+        # Otherwise, translate normally
+        return translate_expression(expr, context, segment="where")
+
+    if isinstance(expr, ast.BooleanExpression):
+        op = expr.operator
+        if op in (ast.BooleanOperator.AND, ast.BooleanOperator.OR):
+            op_str = " AND " if op == ast.BooleanOperator.AND else " OR "
+            parts = [_translate_where_with_alias_expansion(o, alias_to_expr, context) for o in expr.operands]
+            return "(" + op_str.join(parts) + ")"
+        elif op == ast.BooleanOperator.NOT:
+            inner = _translate_where_with_alias_expansion(expr.operands[0], alias_to_expr, context)
+            return f"NOT ({inner})"
+        else:
+            # For comparison operators, translate left and right with alias expansion
+            left_expr = expr.operands[0]
+            right_expr = expr.operands[1] if len(expr.operands) > 1 else None
+
+            # Translate left side with alias expansion
+            if isinstance(left_expr, ast.Variable) and left_expr.name in alias_to_expr:
+                left = translate_expression(alias_to_expr[left_expr.name], context, segment="where")
+            else:
+                left = translate_expression(left_expr, context, segment="where")
+
+            # Translate right side with alias expansion
+            if right_expr:
+                if isinstance(right_expr, ast.Variable) and right_expr.name in alias_to_expr:
+                    right = translate_expression(alias_to_expr[right_expr.name], context, segment="where")
+                else:
+                    right = translate_expression(right_expr, context, segment="where")
+            else:
+                right = ""
+
+            # Map operator to SQL
+            op_map = {
+                ast.BooleanOperator.EQUALS: "=",
+                ast.BooleanOperator.NOT_EQUALS: "<>",
+                ast.BooleanOperator.LESS_THAN: "<",
+                ast.BooleanOperator.LESS_THAN_OR_EQUAL: "<=",
+                ast.BooleanOperator.GREATER_THAN: ">",
+                ast.BooleanOperator.GREATER_THAN_OR_EQUAL: ">=",
+            }
+            if op in op_map:
+                return f"{left} {op_map[op]} {right}"
+            # For other operators, fall through to standard translation
+            return translate_boolean_expression(expr, context)
+
+    # For non-variable, non-boolean expressions, translate normally
+    return translate_boolean_expression(expr, context)
 
 
 def _references_agg_alias(expr, agg_aliases: set) -> bool:
