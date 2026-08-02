@@ -7719,7 +7719,7 @@ def _expr_property_reference(expr, context, segment):
         stage_col = _safe_alias(expr.variable)
         prop_key = expr.property_name
         if segment == "inline":
-            context.join_params.append(prop_key)
+            context.select_params.append(prop_key)
             return f"(SELECT val FROM {_table('rdf_props')} WHERE s = {stage_col} AND \"key\" = ?)"
         p_alias = context.next_alias("p")
         context.join_clauses.append(
@@ -7746,7 +7746,7 @@ def _expr_property_reference(expr, context, segment):
     # %qaqpre SIGSEGV in IRIS 2026.3.0AI on multi-JOIN+FETCH FIRST queries.
     # Use the variable name as the node_id column (it's projected as the variable alias in WITH).
     if segment == "inline":
-        context.join_params.append(expr.property_name)
+        context.select_params.append(expr.property_name)
         # Use the table alias (n0.node_id) not the SELECT alias (n) — SELECT aliases are
         # not referenceable within the same SELECT's correlated subexpressions in IRIS SQL.
         var_col = f"{alias}.node_id"
@@ -12163,6 +12163,7 @@ _IRIS_RESERVED = frozenset({
     "table","schema","column","row","data","id","user","date","time",
     "result","results","null","true","false","top","exists","not","and","or",
     "input","first","second","only","rows","fetch","with","offset","limit",
+    "values",
 })
 
 
