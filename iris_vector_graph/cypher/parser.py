@@ -1154,11 +1154,27 @@ class Parser:
         """
         left = self.parse_additive_expression()
 
-        # Handle label predicate immediately (n:Label)
+        # Handle label predicate (n:Label or conjunctive n:A:B:C)
         if isinstance(left, ast.Variable) and self.peek().kind == TokenType.COLON:
             self.eat()
             label_tok = self.expect_label()
-            return ast.LabelPredicate(variable=left.name, label=label_tok.value or "")
+            labels = [label_tok.value or ""]
+            # Collect additional labels for conjunctive label expression (n:A:B:C)
+            while self.peek().kind == TokenType.COLON:
+                self.eat()
+                lbl = self.expect_label()
+                labels.append(lbl.value or "")
+            if len(labels) == 1:
+                return ast.LabelPredicate(variable=left.name, label=labels[0])
+            # Conjunctive: AND together multiple LabelPredicates
+            predicates = [ast.LabelPredicate(variable=left.name, label=lbl) for lbl in labels]
+            # Reduce: AND(pred1, AND(pred2, ...))
+            result = predicates[0]
+            for pred in predicates[1:]:
+                result = ast.BooleanExpression(
+                    operator=ast.BooleanOperator.AND, operands=[result, pred]
+                )
+            return result
 
         # Postfix predicates — these bind tighter than binary comparisons.
         # We loop to allow chaining (though most combinations are semantically odd,

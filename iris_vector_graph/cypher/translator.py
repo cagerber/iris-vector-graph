@@ -2896,6 +2896,12 @@ def translate_match_clause(match_clause, context, metadata):
                     _ = context.next_alias("n")
             else:
                 _ = context.next_alias("n")
+        # Track (edge_alias, is_undirected) for each hop in this pattern — used
+        # after each hop to add isomorphic-edge-exclusion WHERE conditions.
+        # Cypher guarantees the same physical edge cannot be traversed twice in
+        # a single path pattern.
+        _pattern_edge_aliases: list = []  # list of (alias, is_undirected)
+
         for i, rel in enumerate(pattern.relationships):
             src_node = pattern.nodes[i]
             tgt_node = pattern.nodes[i + 1]
@@ -2936,6 +2942,37 @@ def translate_match_clause(match_clause, context, metadata):
                 pass  # truly anonymous target — edge join covers it
             # else: anonymous labeled/propertied target — _trp_directed_edge already
             # added label JOINs against the edge-joined alias; no standalone JOIN needed.
+
+            # Isomorphic edge exclusion: this hop's physical edge must differ from
+            # every previous hop's physical edge in this pattern.
+            new_ea = context.rel_obj_aliases.get(id(rel))
+            if new_ea and _pattern_edge_aliases:
+                new_is_und = new_ea in context._undirected_aliases
+                # Physical identity columns for the new edge:
+                if new_is_und:
+                    # Undirected: CTE exposes _os/_oo as physical s/o_id
+                    new_s = f"{new_ea}._os"
+                    new_p = f"{new_ea}._p"
+                    new_o = f"{new_ea}._oo"
+                else:
+                    new_s = f"{new_ea}.s"
+                    new_p = f"{new_ea}.p"
+                    new_o = f"{new_ea}.o_id"
+                for prev_ea, prev_is_und in _pattern_edge_aliases:
+                    if prev_is_und:
+                        prev_s = f"{prev_ea}._os"
+                        prev_p = f"{prev_ea}._p"
+                        prev_o = f"{prev_ea}._oo"
+                    else:
+                        prev_s = f"{prev_ea}.s"
+                        prev_p = f"{prev_ea}.p"
+                        prev_o = f"{prev_ea}.o_id"
+                    context.where_conditions.append(
+                        f"NOT ({new_s} = {prev_s} AND {new_p} = {prev_p} AND {new_o} = {prev_o})"
+                    )
+            if new_ea:
+                new_is_und = new_ea in context._undirected_aliases
+                _pattern_edge_aliases.append((new_ea, new_is_und))
 
     for np in match_clause.named_paths:
         context.named_paths[np.variable] = np
@@ -3526,9 +3563,15 @@ def _trp_undirected_edge(
     source_alias, target_alias, edge_alias, s_col, t_col, jt, is_new_target,
     is_anon_source=False,
 ):
-    """Handle undirected (BOTH direction) patterns via UNION ALL derived table."""
-    # UNION ALL of two indexed scans replaces OR-join:
-    # OR-join forces full table scan; UNION ALL uses two index seeks (10-50× faster on IRIS).
+    """Handle undirected (BOTH direction) patterns via CTE-based UNION ALL.
+
+    Using a CTE (rather than an inline derived table) avoids an IRIS 2026.x
+    UNDEFINED crash that occurs when a UNION ALL subquery appears inside a
+    multi-table JOIN chain.  The CTE also exposes _os/_oo columns (the physical
+    (s, o_id) pair regardless of traversal direction) so that callers can add
+    isomorphic-edge-exclusion WHERE conditions to prevent the same physical edge
+    from being matched twice in one pattern.
+    """
     pred_filter = ""
     if rel.types:
         if len(rel.types) == 1:
@@ -3538,39 +3581,46 @@ def _trp_undirected_edge(
             safe_ps = ", ".join(f"'{t.replace(chr(39), chr(39)+chr(39))}'" for t in rel.types)
             pred_filter = f" AND p IN ({safe_ps})"
     edges_tbl = _table("rdf_edges")
-    if is_anon_source:
-        # No source node table to anchor on — scan the full edge table.
-        # Self-loops (s = o_id) must appear exactly once; non-self-loops appear twice
-        # (once forward, once reversed).  The guard "WHERE s != o_id" on the reversed
-        # half achieves this without needing DISTINCT.
-        where_fwd = f"WHERE 1=1{pred_filter}" if pred_filter else ""
+
+    # Build an unfiltered (or predicate-filtered) UNION ALL CTE.
+    # Forward rows:  s  -> o_id  (all edges including self-loops)
+    # Backward rows: o_id -> s   (self-loops excluded to avoid double-counting)
+    # _os/_oo carry the physical edge identity so isomorphic-edge exclusion
+    # WHERE conditions can be added by translate_match_clause.
+    if pred_filter:
+        where_fwd = f"WHERE 1=1{pred_filter}"
         where_rev = f"WHERE s != o_id{pred_filter}"
-        if where_fwd:
-            union_derived = (
-                f"(\n"
-                f"  SELECT s AS _src, p AS _p, o_id AS _dst\n"
-                f"  FROM {edges_tbl}\n"
-                f"  {where_fwd}\n"
-                f"  UNION ALL\n"
-                f"  SELECT o_id AS _src, p AS _p, s AS _dst\n"
-                f"  FROM {edges_tbl}\n"
-                f"  {where_rev}\n"
-                f") {edge_alias}"
-            )
-        else:
-            union_derived = (
-                f"(\n"
-                f"  SELECT s AS _src, p AS _p, o_id AS _dst FROM {edges_tbl}\n"
-                f"  UNION ALL\n"
-                f"  SELECT o_id AS _src, p AS _p, s AS _dst FROM {edges_tbl} WHERE s != o_id\n"
-                f") {edge_alias}"
-            )
-        edge_cond = "1=1"
-        target_on = f"{target_alias}.{t_col} = {edge_alias}._dst"
+        cte_body = (
+            f"  SELECT s AS _src, p AS _p, o_id AS _dst, s AS _os, o_id AS _oo\n"
+            f"  FROM {edges_tbl}\n"
+            f"  {where_fwd}\n"
+            f"  UNION ALL\n"
+            f"  SELECT o_id AS _src, p AS _p, s AS _dst, s AS _os, o_id AS _oo\n"
+            f"  FROM {edges_tbl}\n"
+            f"  {where_rev}"
+        )
+    else:
+        cte_body = (
+            f"  SELECT s AS _src, p AS _p, o_id AS _dst, s AS _os, o_id AS _oo\n"
+            f"  FROM {edges_tbl}\n"
+            f"  UNION ALL\n"
+            f"  SELECT o_id AS _src, p AS _p, s AS _dst, s AS _os, o_id AS _oo\n"
+            f"  FROM {edges_tbl} WHERE s != o_id"
+        )
+
+    cte_name = f"_u{edge_alias}"
+    if not hasattr(context, "cte_clauses"):
+        context.cte_clauses = []
+    context.cte_clauses.append(f"{cte_name}(_src, _p, _dst, _os, _oo) AS (\n{cte_body}\n)")
+
+    # Join the CTE as the edge alias.
+    target_on = f"{target_alias}.{t_col} = {edge_alias}._dst"
+    if is_anon_source:
+        # No bound source node — the first hop; use as FROM or cross-JOIN.
         if not context.from_clauses:
-            context.from_clauses.append(f"{union_derived}")
+            context.from_clauses.append(f"{cte_name} {edge_alias}")
         else:
-            context.join_clauses.append(f"{jt} {union_derived} ON {edge_cond}")
+            context.join_clauses.append(f"{jt} {cte_name} {edge_alias} ON 1=1")
         # Apply source node labels via _src column (anonymous source has no node table)
         for label in (source_node.labels or []):
             l_alias = context.next_alias("l")
@@ -3579,20 +3629,10 @@ def _trp_undirected_edge(
                 f"ON {l_alias}.s = {edge_alias}._src AND {l_alias}.label = {context.add_join_param(label)}"
             )
     else:
-        union_derived = (
-            f"(\n"
-            f"  SELECT s AS _src, p AS _p, o_id AS _dst\n"
-            f"  FROM {edges_tbl}\n"
-            f"  WHERE s = {source_alias}.{s_col}{pred_filter}\n"
-            f"  UNION ALL\n"
-            f"  SELECT o_id AS _src, p AS _p, s AS _dst\n"
-            f"  FROM {edges_tbl}\n"
-            f"  WHERE o_id = {source_alias}.{s_col} AND s != o_id{pred_filter}\n"
-            f") {edge_alias}"
-        )
-        edge_cond = f"1=1"
-        target_on = f"{target_alias}.{t_col} = {edge_alias}._dst"
-        context.join_clauses.append(f"{jt} {union_derived} ON {edge_cond}")
+        # Bound source: filter by source node id in the JOIN condition.
+        src_filter = f"{cte_name}._src = {source_alias}.{s_col}"
+        context.join_clauses.append(f"{jt} {cte_name} {edge_alias} ON {src_filter}")
+
     context._undirected_aliases.add(edge_alias)
     if is_new_target and not target_alias.startswith("Stage"):
         context.join_clauses.append(
@@ -6229,6 +6269,15 @@ def translate_expression(expr, context, segment="select") -> str:
         return _expr_boolean(expr, context, segment)
     if isinstance(expr, ast.LabelPredicate):
         alias = context.variable_aliases.get(expr.variable)
+        # Detect relationship variables (alias starts with 'e' for rdf_edges)
+        is_rel = alias and (alias.startswith("e") or expr.variable in getattr(context, "edge_stage_variables", set()))
+        if is_rel:
+            # For relationships, r:TYPE means edge type matches — check rdf_edges.p
+            if segment in ("select", "inline", None):
+                safe_lbl = context.add_select_param(expr.label)
+                return f"CASE WHEN ({alias}.p = {safe_lbl}) THEN 1 ELSE 0 END"
+            safe_lbl = context.add_where_param(expr.label)
+            return f"({alias}.p = {safe_lbl})"
         node_col = f"{alias}.node_id" if alias else "node_id"
         labels_tbl = _table("rdf_labels")
         if segment in ("select", "inline", None):

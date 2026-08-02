@@ -537,6 +537,24 @@ def normalise_iris_value(iris_val: Any, expected_tck_val: Any) -> Any:
                 parsed = json.loads(iris_val)
                 if isinstance(parsed, dict):
                     return parsed
+                # properties() returns [{key:..., value:...}] array — convert to dict
+                if isinstance(parsed, list) and all(
+                    isinstance(item, dict) and "key" in item and "value" in item
+                    for item in parsed
+                ):
+                    result = {}
+                    for item in parsed:
+                        k = item["key"]
+                        v = item["value"]
+                        # Try to parse numeric values
+                        try:
+                            result[k] = int(v)
+                        except (ValueError, TypeError):
+                            try:
+                                result[k] = float(v)
+                            except (ValueError, TypeError):
+                                result[k] = v
+                    return result
             except (json.JSONDecodeError, ValueError):
                 pass
     if isinstance(expected_tck_val, list):
