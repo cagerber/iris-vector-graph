@@ -43,9 +43,9 @@ def _parse_tck_value(s: str) -> Any:
             k, _, v = pair.partition(":")
             result[k.strip()] = _parse_tck_value(v.strip())
         return result
-    # numeric
+    # numeric — handle int, float (1.5), and scientific notation (1e4, 1.5E-3)
     try:
-        if "." in s:
+        if "." in s or "e" in s.lower():
             return float(s)
         return int(s)
     except ValueError:

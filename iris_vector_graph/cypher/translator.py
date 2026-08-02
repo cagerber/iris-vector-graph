@@ -4000,6 +4000,11 @@ def _expr_list_predicate(expr, context, segment):
                 _lst[_i] = str(_lst[_i])
             elif isinstance(_lst[_i], int) and not isinstance(_lst[_i], bool):
                 _lst[_i] = str(_lst[_i])
+    # Also replace inline CAST('...' AS DOUBLE) with string literal for VARCHAR column comparison.
+    import re as _re_qp
+    def _cast_double_to_str(m):
+        return f"'{m.group(1)}'"
+    pred_sql = _re_qp.sub(r"CAST\('([^']+)' AS DOUBLE\)", _cast_double_to_str, pred_sql)
     del context.variable_aliases[expr.variable]
     context.scalar_variables.discard(expr.variable)
     pred_with_alias = pred_sql
@@ -4350,7 +4355,10 @@ def _expr_literal(expr, context, segment):
         )
         if all_simple:
             items = [item.value for item in v]
-            return f"'{_json.dumps(items)}'"
+            json_str = _json.dumps(items)
+            str_len = max(len(json_str) + 1, 256)
+            escaped = json_str.replace("'", "''")
+            return f"CAST('{escaped}' AS VARCHAR({str_len}))"
         sql_items = []
         for item in v:
             if isinstance(item, ast.Literal):
@@ -4366,6 +4374,22 @@ def _expr_literal(expr, context, segment):
             else:
                 sql_items.append(translate_expression(item, context, segment=segment))
         return f"JSON_ARRAY({', '.join(sql_items)})"
+    if isinstance(v, float):
+        import math as _math
+        if _math.isinf(v) or _math.isnan(v):
+            if segment == "select":
+                return context.add_select_param(v)
+            if segment == "join":
+                return context.add_join_param(v)
+            if segment == "inline":
+                return repr(v)
+            return context.add_where_param(v)
+        float_str = repr(v)
+        return f"CAST({float_str!r} AS DOUBLE)"
+    if isinstance(v, str):
+        escaped = v.replace("'", "''")
+        str_len = max(len(v) + 1, 256)
+        return f"CAST('{escaped}' AS VARCHAR({str_len}))"
     if segment == "select":
         return context.add_select_param(v)
     if segment == "join":
