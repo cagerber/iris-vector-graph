@@ -616,11 +616,11 @@ class TestQuantifierExpressions:
         query = "RETURN single(x IN [1, 2, 3] WHERE x = 2) AS result"
         result = translate_to_sql(parse_query(query))
         sql = result.sql if isinstance(result.sql, str) else "\n".join(result.sql)
-        # Should use exactly one JSON_TABLE scan (aggregation approach)
+        # Should use exactly one JSON_TABLE scan (single-pass aggregation approach)
         assert "JSON_TABLE" in sql
         assert sql.count("JSON_TABLE") == 1
-        # Aggregation approach uses sat/dfail/tot aliases
-        assert ".sat" in sql and ".dfail" in sql and ".tot" in sql
+        # Single-pass approach uses inline SUM(CASE WHEN ...) without sat/dfail/tot CTEs
+        assert "SUM(CASE WHEN" in sql
 
     def test_all_quantifier_literal_list(self):
         """Test all(x IN list WHERE condition) with literal list."""

@@ -602,7 +602,8 @@ class Parser:
                 # Property access inside the paren — this is an expression like (a.x + 1)
                 return False
             elif depth == 1 and t.kind in (TokenType.PLUS, TokenType.SLASH,
-                                            TokenType.STAR, TokenType.PERCENT):
+                                            TokenType.STAR, TokenType.PERCENT,
+                                            TokenType.CARET, TokenType.MINUS):
                 return False
             j += 1
         else:
@@ -1124,10 +1125,10 @@ class Parser:
 
     def parse_power_expression(self) -> Any:
         base = self.parse_primary_expression()
-        if self.peek().kind == TokenType.CARET:
+        while self.peek().kind == TokenType.CARET:
             self.eat()
-            exp = self.parse_power_expression()
-            return ast.FunctionCall(function_name="__arith_^", arguments=[base, exp])
+            exp = self.parse_primary_expression()
+            base = ast.FunctionCall(function_name="__arith_^", arguments=[base, exp])
         while self.peek().kind in (TokenType.LBRACKET, TokenType.DOT) and not (
             # DOT followed by FLOAT_LITERAL starting with '.' is the second half of
             # a slice range (e.g. n..m tokenized as INTEGER + DOT + FLOAT('.m')).
@@ -1591,9 +1592,8 @@ class Parser:
             inner = self.parse_primary_expression()
             if isinstance(inner, ast.Literal) and isinstance(inner.value, (int, float)):
                 return ast.Literal(-inner.value)
-            return (
-                ast.UnaryOp(op="-", operand=inner) if hasattr(ast, "UnaryOp") else inner
-            )
+            # Emit (0 - inner) so the translator generates correct SQL negation.
+            return ast.FunctionCall(function_name="__arith_-", arguments=[ast.Literal(0), inner])
 
         if (
             tok.kind == TokenType.ALL

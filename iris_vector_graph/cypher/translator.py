@@ -6389,6 +6389,28 @@ def _prop_ref_cast(arg, sql):
     return sql
 
 
+def _is_integer_expr(arg):
+    """Return True if arg is statically known to produce an integer value.
+    Used to emit FLOOR() for Cypher integer division semantics (3/2=1 not 1.5).
+    IRIS returns DOUBLE for integer-literal division, so we must compensate."""
+    if isinstance(arg, ast.Literal):
+        return isinstance(arg.value, int) and not isinstance(arg.value, bool)
+    if isinstance(arg, ast.FunctionCall):
+        fn = arg.function_name
+        # Arithmetic operators applied to integer sub-expressions
+        if fn in ("__arith_*", "__arith_-", "__arith_%", "__arith_+") and all(
+            _is_integer_expr(a) for a in arg.arguments
+        ):
+            return True
+        # Integer / integer is still integer under floor semantics
+        if fn == "__arith_/" and all(_is_integer_expr(a) for a in arg.arguments):
+            return True
+        # Functions with guaranteed integer return
+        if fn in ("id", "size", "length", "toInteger", "abs", "sign", "round"):
+            return True
+    return False
+
+
 def _expr_arith(expr, context, segment):
     op = expr.function_name[len("__arith_") :]
     left = translate_expression(expr.arguments[0], context, segment=segment)
@@ -6403,7 +6425,8 @@ def _expr_arith(expr, context, segment):
     if op == "^":
         left = _prop_ref_cast(expr.arguments[0], left)
         right = _prop_ref_cast(expr.arguments[1], right)
-        return f"POWER({left}, {right})"
+        # Cypher ^ always returns float (4^3 = 64.0 per spec)
+        return f"CAST(POWER({left}, {right}) AS DOUBLE)"
     if op == "+":
         def _is_str(arg):
             return (isinstance(arg, ast.Literal) and isinstance(arg.value, str)) or \
@@ -6469,9 +6492,16 @@ def _expr_arith(expr, context, segment):
         left = _prop_ref_cast(expr.arguments[0], left)
         right = _prop_ref_cast(expr.arguments[1], right)
         if op == "/":
+            both_int = _is_integer_expr(expr.arguments[0]) and _is_integer_expr(expr.arguments[1])
             rhs_arg = expr.arguments[1]
             if isinstance(rhs_arg, ast.Literal) and isinstance(rhs_arg.value, (int, float)) and rhs_arg.value != 0:
+                # Cypher: integer/integer = floor division (3/2=1, -7/2=-4).
+                # IRIS promotes to DOUBLE (3/2=1.5), so wrap in FLOOR for integer operands.
+                if both_int:
+                    return f"FLOOR({left} {op} {right})"
                 return f"({left} {op} {right})"
+            if both_int:
+                return f"CASE WHEN {right} = 0 AND {left} IS NOT NULL THEN CAST('NaN' AS DOUBLE) ELSE FLOOR({left} {op} {right}) END"
             return f"CASE WHEN {right} = 0 AND {left} IS NOT NULL THEN CAST('NaN' AS DOUBLE) ELSE ({left} {op} {right}) END"
     return f"({left} {op} {right})"
 
