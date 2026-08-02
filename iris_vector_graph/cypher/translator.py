@@ -3066,6 +3066,8 @@ def translate_merge_clause(merge, context, metadata):
     # UUID-based DMLs and WHERE with label/property-based equivalents.
     _pre_dml_len = len(context.dml_statements)
     _pre_from_len = len(context.from_clauses)
+    _pre_join_len = len(context.join_clauses)
+    _pre_join_params_len = len(context.join_params)
     _pre_where_len = len(context.where_conditions)
     _pre_where_params_len = len(context.where_params)
 
@@ -3282,12 +3284,13 @@ def translate_merge_clause(merge, context, metadata):
                         else:
                             # Node is MATCH-bound (actual_id unknown at translate time).
                             # Build a self-contained INSERT that finds the node via its
-                            # current MATCH context (from_clauses + join_clauses + where_conditions).
-                            from_parts = list(context.from_clauses)
-                            join_parts = list(context.join_clauses)
-                            where_parts = list(context.where_conditions)
-                            where_params_parts = list(context.where_params)
-                            join_params_parts = list(context.join_params)
+                            # MATCH context — slice to pre-MERGE snapshot to exclude any
+                            # FROM/JOIN entries added by translate_create_clause.
+                            from_parts = context.from_clauses[:_pre_from_len]
+                            join_parts = context.join_clauses[:_pre_join_len]
+                            where_parts = context.where_conditions[:_pre_where_len]
+                            where_params_parts = context.where_params[:_pre_where_params_len]
+                            join_params_parts = context.join_params[:_pre_join_params_len]
                             if from_parts:
                                 from_sql = ", ".join(from_parts)
                                 join_sql = (" " + " ".join(join_parts)) if join_parts else ""
@@ -3318,12 +3321,12 @@ def translate_merge_clause(merge, context, metadata):
                                 [val, actual_id, k],
                             )
                         else:
-                            # MATCH-bound node: use the full MATCH context subquery.
-                            from_parts = list(context.from_clauses)
-                            join_parts = list(context.join_clauses)
-                            where_parts = list(context.where_conditions)
-                            where_params_parts = list(context.where_params)
-                            join_params_parts = list(context.join_params)
+                            # MATCH-bound node: use pre-MERGE MATCH context subquery.
+                            from_parts = context.from_clauses[:_pre_from_len]
+                            join_parts = context.join_clauses[:_pre_join_len]
+                            where_parts = context.where_conditions[:_pre_where_len]
+                            where_params_parts = context.where_params[:_pre_where_params_len]
+                            join_params_parts = context.join_params[:_pre_join_params_len]
                             if from_parts:
                                 from_sql = ", ".join(from_parts)
                                 join_sql = (" " + " ".join(join_parts)) if join_parts else ""
