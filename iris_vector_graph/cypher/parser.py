@@ -852,6 +852,9 @@ class Parser:
                     types.append(next_type_tok.value)
 
         # Optional variable length *1..3
+        # The lexer may tokenize "1..2" as INTEGER_LITERAL(1) DOT FLOAT_LITERAL(.2)
+        # because ".2" looks like a float.  We handle that by extracting the integer
+        # from the FLOAT_LITERAL token when it starts with '.'.
         var_len = None
         if self.matches(TokenType.STAR):
             min_h = 1
@@ -862,18 +865,28 @@ class Parser:
                     min_h = int(min_tok.value)
                 if self.peek().kind == TokenType.DOT:
                     self.eat()
-                    self.expect(TokenType.DOT)
-                    max_tok = self.expect(TokenType.INTEGER_LITERAL)
-                    if max_tok.value:
-                        max_h = int(max_tok.value)
+                    # Next token might be FLOAT_LITERAL '.N' (lexer consumed second dot+digit)
+                    # or DOT followed by INTEGER_LITERAL.
+                    if self.peek().kind == TokenType.FLOAT_LITERAL and self.peek().value.startswith('.'):
+                        max_tok = self.eat()
+                        max_h = int(max_tok.value.lstrip('.'))
+                    else:
+                        self.expect(TokenType.DOT)
+                        max_tok = self.expect(TokenType.INTEGER_LITERAL)
+                        if max_tok.value:
+                            max_h = int(max_tok.value)
                 else:
                     max_h = min_h
             elif self.peek().kind == TokenType.DOT:
                 self.eat()
-                self.expect(TokenType.DOT)
-                max_tok = self.expect(TokenType.INTEGER_LITERAL)
-                if max_tok.value:
-                    max_h = int(max_tok.value)
+                if self.peek().kind == TokenType.FLOAT_LITERAL and self.peek().value.startswith('.'):
+                    max_tok = self.eat()
+                    max_h = int(float(max_tok.value))
+                else:
+                    self.expect(TokenType.DOT)
+                    max_tok = self.expect(TokenType.INTEGER_LITERAL)
+                    if max_tok.value:
+                        max_h = int(max_tok.value)
             var_len = ast.VariableLength(min_h, max_h)
 
         props = {}
