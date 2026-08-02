@@ -8249,11 +8249,11 @@ def _build_date_sql_from_dynamic_base(map_expr, context, target_fn="date"):
             # dayOfWeek from base date (ISO: Mon=1..Sun=7). IRIS weekday: Sun=1..Sat=7
             # Convert: ISO dow = (IRIS_dow + 5) % 7 + 1 where IRIS_dow=1..7
             base_iris_dow = f"DATEPART('weekday', CAST({base_sql} AS DATE))"
-            base_iso_dow = f"(({base_iris_dow} + 5) % 7 + 1)"
+            base_iso_dow = f"(MOD({base_iris_dow} + 5, 7) + 1)"
             # First Monday of ISO week 1 of the year:
             jan4_str = f"CAST({year_sql_raw} || '-01-04' AS DATE)"
             jan4_iris_dow = f"DATEPART('weekday', {jan4_str})"
-            first_mon = f"DATEADD('day', -({jan4_iris_dow} - 2 + 7) % 7, {jan4_str})"
+            first_mon = f"DATEADD('day', -MOD({jan4_iris_dow} - 2 + 7, 7), {jan4_str})"
             # Target date = first_mon + (week-1)*7 + (base_iso_dow - 1) days
             target_date = f"DATEADD('day', ({week_val} - 1) * 7 + ({base_iso_dow} - 1), {first_mon})"
             return (
@@ -8339,18 +8339,23 @@ def _build_date_sql_from_dynamic_base(map_expr, context, target_fn="date"):
         mi_str = _padded(mi_sql, 2)
         s_str = _padded(s_sql, 2)
 
-        # Get the fractional part from base; no fractional overrides handled here
-        # frac_sql: everything from frac_start to end of the time-only portion
-        frac_expr = f"SUBSTRING({time_base}, {frac_start})"
-        # Strip timezone suffix from fraction
-        if base_key == "time":
-            # Remove trailing tz offset: find position of Z, +, or - after frac
-            frac_expr = f"REGEXP_REPLACE({frac_expr}, '[Z][^\\\\$]*$', '')"
-            frac_expr = f"REGEXP_REPLACE({frac_expr}, '[+-]\\\\d{{2}}:.*$', '')"
-
-        # Basic time string: HH:MM:SS where SS defaults from base
-        # Use a CASE to check if fractional part exists
-        time_str = f"({h_str} || ':' || {mi_str} || ':' || {s_str})"
+        # Build time string with optional fractional seconds from base
+        # Check for fractional second overrides
+        _has_frac_override = any(k in overrides for k in ("second", "nanosecond", "microsecond", "millisecond"))
+        if not _has_frac_override:
+            _frac_raw = f"SUBSTRING({time_base}, {frac_start})"
+            if base_key in ("time", "datetime"):
+                # Strip tz suffix from fractional part
+                _frac_clean = f"REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE({_frac_raw}, '[+][0-9]{{2}}.*$', ''), '[-][0-9]{{2}}:.*$', ''), '[Z].*$', '')"
+            else:
+                _frac_clean = _frac_raw
+            time_str = (
+                f"(CASE WHEN SUBSTRING({time_base}, {frac_start}, 1) = '.' "
+                f"THEN {h_str} || ':' || {mi_str} || ':' || {s_str} || {_frac_clean} "
+                f"ELSE {h_str} || ':' || {mi_str} || ':' || {s_str} END)"
+            )
+        else:
+            time_str = f"({h_str} || ':' || {mi_str} || ':' || {s_str})"
 
         if target_fn == "time":
             # Output needs timezone
@@ -8358,11 +8363,13 @@ def _build_date_sql_from_dynamic_base(map_expr, context, target_fn="date"):
             if tz_override and isinstance(tz_override, str):
                 tz_sql = f"'{_normalize_tz_str(tz_override)}'"
             elif base_key == "time":
-                # Preserve input timezone from base time string
-                # Extract tz suffix: everything from the Z/+/- char
-                tz_sql = f"REGEXP_REPLACE(SUBSTRING({base_sql}, CHARINDEX({base_sql}, 'Z')), ...)"
-                # Too complex for inline SQL; fall back
-                return None
+                # Extract tz suffix from time string: Z, or +HH:MM, or -HH:MM after seconds
+                tz_sql = (
+                    f"CASE WHEN {base_sql} LIKE '%Z' THEN 'Z' "
+                    f"WHEN {base_sql} LIKE '%+%' THEN '+' || SUBSTRING({base_sql}, CHARINDEX('+', {base_sql}) + 1) "
+                    f"WHEN CHARINDEX('-', {base_sql}, 6) > 0 THEN '-' || SUBSTRING({base_sql}, CHARINDEX('-', {base_sql}, 6) + 1) "
+                    f"ELSE 'Z' END"
+                )
             else:
                 tz_sql = "'Z'"
             return f"({time_str} || {tz_sql})"
@@ -8475,6 +8482,13 @@ def _build_date_from_map(m, with_time=False, with_tz=False):
                 base_iso_week_day = iso_cal[2]
         if base_year is None:
             return None  # dynamic base date — can't resolve at compile time
+
+    # For other temporal base keys with dynamic (non-literal) values, defer to dynamic builder
+    for _dyn_key in ("time", "localtime", "localdatetime", "datetime"):
+        if _has_map_key(m, _dyn_key):
+            _dyn_expr = m.entries[_dyn_key]
+            if not isinstance(_dyn_expr, ast.Literal):
+                return None
 
     # year (for week calculations, use ISO week-year from base date if year not explicit)
     if _has_map_key(m, "year"):
@@ -8651,6 +8665,12 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
         if not args:
             return "NULL"
         if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
+            # Check if map has a dynamic temporal base (time: var, localtime: var, etc.)
+            _dyn_result = _build_date_sql_from_dynamic_base(
+                args_exprs[0], context, target_fn=fn
+            )
+            if _dyn_result is not None:
+                return _dyn_result
             m = args_exprs[0]
             h = _extract_int_from_map_entry(m, "hour", 0)
             mi = _extract_int_from_map_entry(m, "minute", 0)
