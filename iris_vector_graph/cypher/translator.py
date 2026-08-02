@@ -128,7 +128,7 @@ def _table(name: str, prefix: Optional[str] = None) -> str:
 
 
 def labels_subquery(node_expr: str) -> str:
-    return f"(SELECT JSON_ARRAYAGG(label) FROM {_table('rdf_labels')} WHERE s = {node_expr})"
+    return f"COALESCE((SELECT JSON_ARRAYAGG(label) FROM {_table('rdf_labels')} WHERE s = {node_expr}), CAST('[]' AS VARCHAR(256)))"
 
 
 def properties_subquery(node_expr: str) -> str:
@@ -6047,7 +6047,7 @@ def _expr_fn_keys(args):
     if not args:
         return "JSON_ARRAY()"
     id_expr = args[0]
-    return f"(SELECT JSON_ARRAYAGG(rp.key) FROM {_table('rdf_props')} rp WHERE rp.s = {id_expr})"
+    return f"COALESCE((SELECT JSON_ARRAYAGG(rp.\"key\") FROM {_table('rdf_props')} rp WHERE rp.s = {id_expr}), CAST('[]' AS VARCHAR(256)))"
 
 
 def _expr_fn_range(args_exprs):
