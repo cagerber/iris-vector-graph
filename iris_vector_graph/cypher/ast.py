@@ -73,8 +73,8 @@ class VariableLength:
     all_shortest: bool = False
 
     def __post_init__(self):
-        if self.min_hops < 1:
-            raise ValueError("min_hops must be >= 1")
+        if self.min_hops < 0:
+            raise ValueError("min_hops must be >= 0")
         if self.max_hops < self.min_hops:
             raise ValueError("max_hops must be >= min_hops")
         limit = 15 if (self.shortest or self.all_shortest) else 10

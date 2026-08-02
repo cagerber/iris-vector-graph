@@ -468,8 +468,11 @@ class IRISGraphStore:
 
         val = bfs_json if isinstance(bfs_json, str) else str(bfs_json)
         if val.startswith("SORTED:"):
-            from iris_vector_graph.engine import _bfs_stream_pages
             tag = val.split(":", 2)[1]
+            if tag == "0":
+                # ^KG not built or source has no edges — fall back to SQL BFS
+                return self._sql_bfs_fallback(source_id, predicates, max_hops, direction, max_results)
+            from iris_vector_graph.engine import _bfs_stream_pages
             results = list(_bfs_stream_pages(self.conn, tag))
             rows = [[r.get("o", r.get("id", "")), r.get("step", r.get("hops", 0)), r.get("pred", r.get("p", ""))] for r in results]
             return IVGResult(columns=["id", "hops", "pred"], rows=rows)

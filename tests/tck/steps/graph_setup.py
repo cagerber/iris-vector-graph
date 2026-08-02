@@ -107,14 +107,17 @@ def _inject_label(query: str, label: str, inject_anonymous: bool = True) -> str:
     lines = query.split('\n')
     result_lines = []
     in_create = False
-    create_block_injected_vars = set()  # Track vars injected across entire CREATE/MERGE block
+    # Track vars injected across ALL CREATE/MERGE clauses in the query.
+    # Variables bound in an earlier CREATE remain in scope for later CREATE
+    # clauses in the same Cypher query, so do NOT reset per-clause.
+    create_block_injected_vars = set()
 
     for line in lines:
         stripped = line.strip().upper()
         first_word = stripped.split()[0] if stripped.split() else ''
         if first_word in ('CREATE', 'MERGE'):
             in_create = True
-            create_block_injected_vars = set()  # Reset for new CREATE/MERGE
+            # Do NOT reset create_block_injected_vars here — prior CREATE vars stay bound
         elif first_word in ('MATCH', 'OPTIONAL', 'WITH', 'RETURN', 'WHERE',
                             'ORDER', 'SKIP', 'LIMIT', 'UNWIND', 'SET',
                             'DELETE', 'REMOVE', 'CALL', 'UNION'):

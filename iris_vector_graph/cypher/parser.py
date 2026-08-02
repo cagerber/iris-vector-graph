@@ -907,27 +907,46 @@ class Parser:
                 if self.peek().kind == TokenType.DOT:
                     self.eat()
                     # Next token might be FLOAT_LITERAL '.N' (lexer consumed second dot+digit)
-                    # or DOT followed by INTEGER_LITERAL.
+                    # or DOT followed by INTEGER_LITERAL (or nothing for unbounded *N..).
                     if self.peek().kind == TokenType.FLOAT_LITERAL and self.peek().value.startswith('.'):
+                        # e.g. *1..3 tokenized as INTEGER(1) DOT FLOAT(.3)
                         max_tok = self.eat()
-                        max_h = int(max_tok.value.lstrip('.'))
-                    else:
-                        self.expect(TokenType.DOT)
-                        max_tok = self.expect(TokenType.INTEGER_LITERAL)
+                        max_h = int(float(max_tok.value.lstrip('.')))
+                    elif self.peek().kind == TokenType.DOT:
+                        # Second DOT: *N.. (unbounded upper) or *N..M
+                        self.eat()
+                        if self.peek().kind == TokenType.INTEGER_LITERAL:
+                            max_tok = self.eat()
+                            if max_tok.value:
+                                max_h = int(max_tok.value)
+                        # else: *N.. with no upper bound — keep max_h = default (10)
+                    elif self.peek().kind == TokenType.INTEGER_LITERAL:
+                        # e.g. *1.2 treated as *1..2 where lexer split differently
+                        max_tok = self.eat()
                         if max_tok.value:
                             max_h = int(max_tok.value)
+                    # else: single DOT with no second DOT and no integer → treat as exact *N
                 else:
                     max_h = min_h
             elif self.peek().kind == TokenType.DOT:
                 self.eat()
                 if self.peek().kind == TokenType.FLOAT_LITERAL and self.peek().value.startswith('.'):
+                    # e.g. *..3 tokenized as DOT FLOAT(.3) — strip leading '.' before int parse
                     max_tok = self.eat()
-                    max_h = int(float(max_tok.value))
-                else:
-                    self.expect(TokenType.DOT)
-                    max_tok = self.expect(TokenType.INTEGER_LITERAL)
+                    max_h = int(max_tok.value.lstrip('.'))
+                elif self.peek().kind == TokenType.DOT:
+                    # Second DOT: *.. (unbounded) or *..M
+                    self.eat()
+                    if self.peek().kind == TokenType.INTEGER_LITERAL:
+                        max_tok = self.eat()
+                        if max_tok.value:
+                            max_h = int(max_tok.value)
+                    # else: *.. with no upper bound — keep max_h = default (10)
+                elif self.peek().kind == TokenType.INTEGER_LITERAL:
+                    max_tok = self.eat()
                     if max_tok.value:
                         max_h = int(max_tok.value)
+                # else: single dot with no number — treat as plain * (unbounded)
             var_len = ast.VariableLength(min_h, max_h)
 
         props = {}
