@@ -4878,6 +4878,395 @@ def _expr_arith(expr, context, segment):
     return f"({left} {op} {right})"
 
 
+# ── Temporal / date-time helper functions ──────────────────────────────────────
+
+def _extract_int_from_map_entry(map_literal, key, default=0):
+    if key not in map_literal.entries:
+        return default
+    val_expr = map_literal.entries[key]
+    if isinstance(val_expr, ast.Literal) and isinstance(val_expr.value, int):
+        return val_expr.value
+    return default
+
+
+def _extract_num_from_map_entry(map_literal, key, default=0):
+    if key not in map_literal.entries:
+        return default
+    val_expr = map_literal.entries[key]
+    if isinstance(val_expr, ast.Literal) and isinstance(val_expr.value, (int, float)):
+        return val_expr.value
+    return default
+
+
+def _has_map_key(map_literal, key):
+    return key in map_literal.entries
+
+
+def _date_from_iso_week(year, week, dow=1):
+    import datetime as _dt
+    jan4 = _dt.date(year, 1, 4)
+    week1_monday = jan4 - _dt.timedelta(days=jan4.isoweekday() - 1)
+    return week1_monday + _dt.timedelta(weeks=week - 1, days=dow - 1)
+
+
+def _date_from_ordinal_day(year, ordinal):
+    import datetime as _dt
+    return _dt.date(year, 1, 1) + _dt.timedelta(days=ordinal - 1)
+
+
+def _date_from_quarter(year, quarter, day_of_quarter=1):
+    import datetime as _dt
+    first_month = (quarter - 1) * 3 + 1
+    start = _dt.date(year, first_month, 1)
+    return start + _dt.timedelta(days=day_of_quarter - 1)
+
+
+def _normalize_tz_offset(tz):
+    import re as _re
+    m = _re.match(r'^([+-]\d{2}:\d{2}):00$', tz)
+    if m:
+        return m.group(1)
+    return tz
+
+
+def _normalize_tz_str(tz):
+    import re as _re
+    if not tz:
+        return ""
+    if tz in ("Z", "z"):
+        return "Z"
+    m = _re.match(r'^([+-])(\d{2})(\d{2})$', tz)
+    if m:
+        sign, hh, mm = m.group(1), m.group(2), m.group(3)
+        if hh == "00" and mm == "00":
+            return "Z"
+        return f"{sign}{hh}:{mm}"
+    m = _re.match(r'^([+-])(\d{2}):(\d{2})$', tz)
+    if m:
+        sign, hh, mm = m.group(1), m.group(2), m.group(3)
+        if hh == "00" and mm == "00":
+            return "Z"
+        return f"{sign}{hh}:{mm}"
+    m = _re.match(r'^([+-])(\d{2})$', tz)
+    if m:
+        sign, hh = m.group(1), m.group(2)
+        return f"{sign}{hh}:00"
+    return _normalize_tz_offset(tz)
+
+
+def _iana_tz_offset(iana_name, ref_year=2015, ref_month=7, ref_day=21):
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        import datetime as _dt2
+        _zi = _ZI(iana_name)
+        _aware = _dt2.datetime(ref_year, ref_month, ref_day, tzinfo=_zi)
+        _off = _aware.utcoffset()
+        _total_s = int(_off.total_seconds())
+        _sign = "+" if _total_s >= 0 else "-"
+        _abs_s = abs(_total_s)
+        _hh = _abs_s // 3600
+        _mm = (_abs_s % 3600) // 60
+        _ss = _abs_s % 60
+        if _ss:
+            return f"{_sign}{_hh:02d}:{_mm:02d}:{_ss:02d}"
+        return f"{_sign}{_hh:02d}:{_mm:02d}"
+    except Exception:
+        return ""
+
+
+def _subsecond_frac(ns, us, ms):
+    total_ns = 0
+    if ms >= 0:
+        total_ns += ms * 1_000_000
+    if us >= 0:
+        total_ns += us * 1_000
+    if ns >= 0:
+        total_ns += ns
+    if ms < 0 and us < 0 and ns < 0:
+        return None
+    if total_ns == 0:
+        return None
+    return f"{total_ns:09d}".rstrip('0')
+
+
+def _parse_date_string(s):
+    import datetime as _dt
+    import re as _re
+    s = s.strip()
+    m = _re.match(r'^(\d{4})-(\d{2})-(\d{2})$', s)
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    m = _re.match(r'^(\d{4})(\d{2})(\d{2})$', s)
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    m = _re.match(r'^(\d{4})-(\d{2})$', s)
+    if m:
+        return int(m.group(1)), int(m.group(2)), 1
+    m = _re.match(r'^(\d{4})(\d{2})$', s)
+    if m:
+        return int(m.group(1)), int(m.group(2)), 1
+    m = _re.match(r'^(\d{4})$', s)
+    if m:
+        return int(m.group(1)), 1, 1
+    m = _re.match(r'^(\d{4})-W(\d{2})-(\d)$', s)
+    if m:
+        d = _date_from_iso_week(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return d.year, d.month, d.day
+    m = _re.match(r'^(\d{4})W(\d{2})(\d)$', s)
+    if m:
+        d = _date_from_iso_week(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return d.year, d.month, d.day
+    m = _re.match(r'^(\d{4})-W(\d{2})$', s)
+    if m:
+        d = _date_from_iso_week(int(m.group(1)), int(m.group(2)), 1)
+        return d.year, d.month, d.day
+    m = _re.match(r'^(\d{4})W(\d{2})$', s)
+    if m:
+        d = _date_from_iso_week(int(m.group(1)), int(m.group(2)), 1)
+        return d.year, d.month, d.day
+    m = _re.match(r'^(\d{4})-(\d{3})$', s)
+    if m:
+        d = _date_from_ordinal_day(int(m.group(1)), int(m.group(2)))
+        return d.year, d.month, d.day
+    m = _re.match(r'^(\d{4})(\d{3})$', s)
+    if m:
+        d = _date_from_ordinal_day(int(m.group(1)), int(m.group(2)))
+        return d.year, d.month, d.day
+    return None
+
+
+def _parse_time_string(s, ref_year=2015, ref_month=7, ref_day=21):
+    import re as _re
+    s = s.strip()
+    iana_suffix = ""
+    iana_name = ""
+    m_iana = _re.match(r'^(.*?)(\[([^\]]+)\])$', s)
+    if m_iana:
+        s = m_iana.group(1)
+        iana_name = m_iana.group(3)
+        iana_suffix = f"[{iana_name}]"
+    tz = ""
+    m = _re.match(r'^(.*?)([Zz]|[+-]\d{2}(?::?\d{2}(?::?\d{2})?)?)$', s)
+    if m:
+        time_part = m.group(1)
+        tz_raw = m.group(2)
+        tz = _normalize_tz_str(tz_raw)
+        if iana_name and not tz:
+            tz = _iana_tz_offset(iana_name, ref_year, ref_month, ref_day)
+    else:
+        time_part = s
+        if iana_name:
+            tz = _iana_tz_offset(iana_name, ref_year, ref_month, ref_day)
+    m = _re.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', time_part)
+    if m:
+        h, mi, s_str, frac = m.group(1), m.group(2), m.group(3), m.group(4)
+        if s_str:
+            if frac:
+                return f"{h}:{mi}:{s_str}.{frac}{tz}{iana_suffix}"
+            return f"{h}:{mi}:{s_str}{tz}{iana_suffix}"
+        return f"{h}:{mi}{tz}{iana_suffix}"
+    m = _re.match(r'^(\d{2})(?:(\d{2})(?:(\d{2})(?:\.(\d+))?)?)?$', time_part)
+    if m:
+        h = m.group(1)
+        mi = m.group(2) or "00"
+        s_str = m.group(3)
+        frac = m.group(4)
+        if s_str:
+            if frac:
+                return f"{h}:{mi}:{s_str}.{frac}{tz}{iana_suffix}"
+            return f"{h}:{mi}:{s_str}{tz}{iana_suffix}"
+        if m.group(2):
+            return f"{h}:{mi}{tz}{iana_suffix}"
+        return f"{h}:00{tz}{iana_suffix}"
+    return None
+
+
+def _parse_datetime_string(s):
+    s = s.strip()
+    if "T" not in s and "t" not in s:
+        return None
+    sep_idx = s.upper().index("T")
+    date_str = s[:sep_idx]
+    rest = s[sep_idx + 1:]
+    parsed_date = _parse_date_string(date_str)
+    if not parsed_date:
+        return None
+    y_out, mo_out, d_out = parsed_date
+    parsed_time = _parse_time_string(rest, ref_year=y_out, ref_month=mo_out, ref_day=d_out)
+    if not parsed_time:
+        return None
+    return f"{y_out:04d}-{mo_out:02d}-{d_out:02d}T{parsed_time}"
+
+
+def _format_duration(yr_int, mo_int, d_int, h_int, m_int, s_int, rem_ns):
+    date_part = ""
+    if yr_int:
+        date_part += f"{yr_int}Y"
+    if mo_int:
+        date_part += f"{mo_int}M"
+    if d_int:
+        date_part += f"{d_int}D"
+    time_part = ""
+    if h_int:
+        time_part += f"{h_int}H"
+    if m_int:
+        time_part += f"{m_int}M"
+    if rem_ns > 0:
+        ns_str = f"{rem_ns:09d}".rstrip('0')
+        time_part += f"{s_int}.{ns_str}S"
+    elif s_int:
+        time_part += f"{s_int}S"
+    if not date_part and not time_part:
+        return "PT0S"
+    if time_part:
+        return f"P{date_part}T{time_part}"
+    return f"P{date_part}"
+
+
+def _parse_duration_string(s):
+    import re as _re
+    s = s.strip()
+    m = _re.match(r'^P(-?\d+)-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$', s)
+    if m:
+        yr, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        h, mi, sec = int(m.group(4)), int(m.group(5)), int(m.group(6))
+        frac_str = m.group(7) or ""
+        rem_ns = int(frac_str.ljust(9, '0')[:9]) if frac_str else 0
+        return _format_duration(yr, mo, d, h, mi, sec, rem_ns)
+    m = _re.match(
+        r'^P(?:(-?[\d.]+)Y)?(?:(-?[\d.]+)M)?(?:(-?[\d.]+)W)?(?:(-?[\d.]+)D)?'
+        r'(?:T(?:(-?[\d.]+)H)?(?:(-?[\d.]+)M)?(?:(-?[\d.]+)S)?)?$', s
+    )
+    if not m or not any(m.groups()):
+        return None
+    years = float(m.group(1) or 0)
+    months = float(m.group(2) or 0)
+    weeks = float(m.group(3) or 0)
+    days = float(m.group(4) or 0)
+    hours = float(m.group(5) or 0)
+    minutes = float(m.group(6) or 0)
+    seconds = float(m.group(7) or 0)
+    mo_int = int(months)
+    days = days + (months - mo_int) * 30.436875 + weeks * 7
+    d_int = int(days)
+    hours = hours + (days - d_int) * 24
+    h_int = int(hours)
+    minutes = minutes + (hours - h_int) * 60
+    m_int = int(minutes)
+    seconds = seconds + (minutes - m_int) * 60
+    s_int = int(seconds)
+    rem_ns = round((seconds - s_int) * 1_000_000_000)
+    extra_s = rem_ns // 1_000_000_000
+    rem_ns %= 1_000_000_000
+    s_int += extra_s
+    m_int += s_int // 60; s_int %= 60
+    h_int += m_int // 60; m_int %= 60
+    d_int += h_int // 24; h_int %= 24
+    return _format_duration(int(years), mo_int, d_int, h_int, m_int, s_int, rem_ns)
+
+
+def _build_date_from_map(m, with_time=False, with_tz=False):
+    import datetime as _dt
+    base_year, base_month, base_day = None, None, None
+    base_iso_year = None
+    base_iso_week_day = None
+    if _has_map_key(m, "date"):
+        base_expr = m.entries["date"]
+        if (isinstance(base_expr, ast.FunctionCall) and
+                base_expr.function_name.lower() == "date" and
+                base_expr.arguments and
+                isinstance(base_expr.arguments[0], ast.Literal) and
+                isinstance(base_expr.arguments[0].value, str)):
+            parsed = _parse_date_string(base_expr.arguments[0].value)
+            if parsed:
+                base_year, base_month, base_day = parsed
+                base_dt = _dt.date(base_year, base_month, base_day)
+                iso_cal = base_dt.isocalendar()
+                base_iso_year = iso_cal[0]
+                base_iso_week_day = iso_cal[2]
+        if base_year is None:
+            return None
+    if _has_map_key(m, "year"):
+        year = _extract_int_from_map_entry(m, "year", 1970)
+        iso_year = year
+    elif base_year is not None:
+        year = base_year
+        iso_year = base_iso_year if base_iso_year is not None else base_year
+    else:
+        year = 1970
+        iso_year = 1970
+    if _has_map_key(m, "week"):
+        week = _extract_int_from_map_entry(m, "week", 1)
+        if _has_map_key(m, "dayOfWeek"):
+            dow = _extract_int_from_map_entry(m, "dayOfWeek", 1)
+        elif base_iso_week_day is not None:
+            dow = base_iso_week_day
+        else:
+            dow = 1
+        try:
+            d = _date_from_iso_week(iso_year, week, dow)
+            y_out, mo_out, d_out = d.year, d.month, d.day
+        except Exception:
+            return None
+    elif _has_map_key(m, "ordinalDay"):
+        ordinal = _extract_int_from_map_entry(m, "ordinalDay", 1)
+        try:
+            d = _date_from_ordinal_day(year, ordinal)
+            y_out, mo_out, d_out = d.year, d.month, d.day
+        except Exception:
+            return None
+    elif _has_map_key(m, "quarter"):
+        quarter = _extract_int_from_map_entry(m, "quarter", 1)
+        doq = _extract_int_from_map_entry(m, "dayOfQuarter", 1)
+        try:
+            d = _date_from_quarter(year, quarter, doq)
+            y_out, mo_out, d_out = d.year, d.month, d.day
+        except Exception:
+            return None
+    else:
+        mo_out = _extract_int_from_map_entry(m, "month", base_month if base_month else 1)
+        d_out = _extract_int_from_map_entry(m, "day", base_day if base_day else 1)
+        y_out = year
+    if not with_time:
+        return f"'{y_out:04d}-{mo_out:02d}-{d_out:02d}'"
+    h = _extract_int_from_map_entry(m, "hour", 0)
+    mi = _extract_int_from_map_entry(m, "minute", 0)
+    s = _extract_int_from_map_entry(m, "second", 0)
+    ns_val = _extract_int_from_map_entry(m, "nanosecond", -1)
+    us_val = _extract_int_from_map_entry(m, "microsecond", -1)
+    ms_val = _extract_int_from_map_entry(m, "millisecond", -1)
+    frac = _subsecond_frac(ns_val, us_val, ms_val)
+    time_str = f"{h:02d}:{mi:02d}:{s:02d}"
+    if frac:
+        time_str += f".{frac}"
+    if with_tz:
+        tz = ""
+        if _has_map_key(m, "timezone"):
+            tz_expr = m.entries["timezone"]
+            if isinstance(tz_expr, ast.Literal) and isinstance(tz_expr.value, str):
+                tz_raw = tz_expr.value.strip()
+                if "[" in tz_raw:
+                    import re as _re
+                    iana_m = _re.match(r'^(.*)\[([^\]]+)\]$', tz_raw)
+                    if iana_m:
+                        offset_part = iana_m.group(1).strip()
+                        iana_name = iana_m.group(2)
+                        tz = (_normalize_tz_str(offset_part) if offset_part
+                              else _iana_tz_offset(iana_name, y_out, mo_out, d_out))
+                        tz += f"[{iana_name}]"
+                    else:
+                        tz = _iana_tz_offset(tz_raw, y_out, mo_out, d_out)
+                elif "/" in tz_raw:
+                    tz = _iana_tz_offset(tz_raw, y_out, mo_out, d_out)
+                else:
+                    tz = _normalize_tz_str(tz_raw)
+        return f"'{y_out:04d}-{mo_out:02d}-{d_out:02d}T{time_str}{tz}'"
+    return f"'{y_out:04d}-{mo_out:02d}-{d_out:02d}T{time_str}'"
+
+
+# ── End temporal helpers ────────────────────────────────────────────────────────
+
+
 def _expr_list_predicate(expr, context, segment):
     source_sql = translate_expression(expr.source, context, segment=segment)
     var = sanitize_identifier(expr.variable)
