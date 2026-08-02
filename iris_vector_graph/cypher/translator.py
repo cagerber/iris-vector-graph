@@ -5659,6 +5659,12 @@ def _expr_to_cypher_text(expr) -> str:
         }.get(op, str(op))
         parts = [_expr_to_cypher_text(o) for o in expr.operands]
         return f" {op_str} ".join(parts)
+    if isinstance(expr, ast.AggregationFunction):
+        if expr.argument is None and expr.function_name == "count":
+            return "count(*)"
+        distinct = "DISTINCT " if expr.distinct else ""
+        arg_text = _expr_to_cypher_text(expr.argument) if expr.argument is not None else "*"
+        return f"{expr.function_name}({distinct}{arg_text})"
     if isinstance(expr, ast.FunctionCall):
         args = ", ".join(_expr_to_cypher_text(a) for a in expr.arguments)
         return f"{expr.function_name}({args})"

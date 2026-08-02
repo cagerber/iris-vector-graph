@@ -1338,6 +1338,14 @@ class Parser:
 
         if tok.kind == TokenType.MINUS:
             self.eat()
+            # Special-case: INTEGER_LITERAL token for 2^63 is rejected by the literal
+            # parser (> max), but -2^63 is valid. Handle it here directly.
+            next_tok = self.peek()
+            if next_tok.kind == TokenType.INTEGER_LITERAL:
+                raw = int(next_tok.value) if next_tok.value is not None else 0
+                if raw == 9223372036854775808:
+                    self.eat()
+                    return ast.Literal(-9223372036854775808)
             inner = self.parse_primary_expression()
             if isinstance(inner, ast.Literal) and isinstance(inner.value, (int, float)):
                 return ast.Literal(-inner.value)
@@ -1368,11 +1376,22 @@ class Parser:
 
         if tok.kind == TokenType.INTEGER_LITERAL:
             val = self.eat().value
-            return ast.Literal(int(val) if val is not None else 0)
+            int_val = int(val) if val is not None else 0
+            if int_val > 9223372036854775807:
+                raise CypherParseError(
+                    "SyntaxError: IntegerOverflow: integer literal out of range"
+                )
+            return ast.Literal(int_val)
 
         if tok.kind == TokenType.FLOAT_LITERAL:
             val = self.eat().value
-            return ast.Literal(float(val) if val is not None else 0.0)
+            float_val = float(val) if val is not None else 0.0
+            import math as _math
+            if _math.isinf(float_val) or _math.isnan(float_val):
+                raise CypherParseError(
+                    f"SyntaxError: FloatingPointOverflow: float literal {val} overflows"
+                )
+            return ast.Literal(float_val)
 
         if tok.kind == TokenType.STRING_LITERAL:
             return ast.Literal(self.eat().value)
