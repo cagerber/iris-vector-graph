@@ -2678,11 +2678,22 @@ def translate_match_clause(match_clause, context, metadata):
             and last_node_bound
             and bool(pattern.relationships)
         )
+        has_rels = bool(pattern.relationships)
         if not skip_first_node_join:
-            if first_node.variable or first_node.labels or first_node.properties:
+            if first_node.variable:
                 translate_node_pattern(
                     first_node, context, metadata, optional=match_clause.optional
                 )
+            elif first_node.labels or first_node.properties:
+                if not has_rels:
+                    # Standalone anonymous labeled/propertied node — translate normally.
+                    translate_node_pattern(
+                        first_node, context, metadata, optional=match_clause.optional
+                    )
+                else:
+                    # Anonymous labeled source in a relationship — edge join handles it.
+                    # Adding a standalone nodes JOIN here would create a Cartesian product.
+                    _ = context.next_alias("n")
             else:
                 _ = context.next_alias("n")
         for i, rel in enumerate(pattern.relationships):
@@ -2695,10 +2706,14 @@ def translate_match_clause(match_clause, context, metadata):
                 optional=match_clause.optional,
             )
             last_node = pattern.nodes[i + 1]
-            if last_node.variable or last_node.labels or last_node.properties:
+            if last_node.variable:
                 translate_node_pattern(
                     last_node, context, metadata, optional=match_clause.optional
                 )
+            elif not (last_node.labels or last_node.properties):
+                pass  # truly anonymous target — edge join covers it
+            # else: anonymous labeled/propertied target — _trp_directed_edge already
+            # added label JOINs against the edge-joined alias; no standalone JOIN needed.
 
     for np in match_clause.named_paths:
         context.named_paths[np.variable] = np
@@ -3107,26 +3122,10 @@ def _trp_setup_aliases(rel, source_node, target_node, context):
     node joined from the edge.  This fixes the direction-symmetry bug: patterns
     (t)-[:R]->(f) and (f)<-[:R]-(t) must produce identical SQL when f is bound.
     """
-    is_anon_source = (
-        source_node.variable is None
-        and not source_node.labels
-        and not source_node.properties
-    )
+    is_anon_source = source_node.variable is None
     is_unbound_src = False
     if is_anon_source:
         source_alias = context.next_alias("n")
-    elif source_node.variable is None:
-        source_alias = context.next_alias("n")
-        joined = any(
-            source_alias in fc for fc in context.from_clauses + context.join_clauses
-        )
-        if not joined:
-            if not context.from_clauses:
-                context.from_clauses.append(f"{_table('nodes')} {source_alias}")
-            else:
-                context.join_clauses.append(
-                    f"JOIN {_table('nodes')} {source_alias} ON 1=1"
-                )
     else:
         existing = context.variable_aliases.get(source_node.variable)
         if existing is None:
@@ -3355,7 +3354,7 @@ def _trp_apply_inline_props(source_node, source_alias, target_node, target_alias
         (source_node, source_alias),
         (target_node, target_alias),
     ):
-        if not prop_node.properties:
+        if prop_node is None or not prop_node.properties:
             continue
         for k, v in prop_node.properties.items():
             val_sql = translate_expression(v, context, segment="where")
@@ -3433,6 +3432,32 @@ def _trp_directed_edge_join(
             )
 
 
+def _trp_apply_anon_source_constraints(source_node, edge_alias, src_col, context, jt):
+    """Apply label/property constraints for an anonymous source node via the edge column.
+
+    When source has no variable there is no nodes JOIN for it — the edge table
+    provides the source id via edge_alias.<src_col> ('s' for OUTGOING, 'o_id' for INCOMING).
+    """
+    src_ref = f"{edge_alias}.{src_col}"
+    for label in (source_node.labels or []):
+        l_alias = context.next_alias("l")
+        context.join_clauses.append(
+            f"{jt} {_table('rdf_labels')} {l_alias} "
+            f"ON {l_alias}.s = {src_ref} AND {l_alias}.label = {context.add_join_param(label)}"
+        )
+    for k, v in (source_node.properties or {}).items():
+        val_sql = translate_expression(v, context, segment="where")
+        if k in ("node_id", "id"):
+            context.where_conditions.append(f"{src_ref} = {val_sql}")
+        else:
+            p_alias = context.next_alias("p")
+            context.join_clauses.append(
+                f"{jt} {_table('rdf_props')} {p_alias} "
+                f'ON {p_alias}.s = {src_ref} AND {p_alias}."key" = {context.add_join_param(k)}'
+            )
+            context.where_conditions.append(f"{p_alias}.val = {val_sql}")
+
+
 def _trp_directed_edge(
     rel, source_node, target_node, context,
     source_alias, target_alias, edge_alias, s_col, t_col,
@@ -3455,7 +3480,24 @@ def _trp_directed_edge(
     else:
         context.where_conditions.append(target_on)
 
-    _trp_apply_inline_props(source_node, source_alias, target_node, target_alias, context, jt)
+    if is_anon_source and (source_node.labels or source_node.properties):
+        # Source node has constraints but no variable — filter via edge column.
+        # OUTGOING: target is on edge.o_id → source is edge.s
+        # INCOMING: target is on edge.s → source is edge.o_id
+        anon_src_col = "s" if target_on.endswith(f"{edge_alias}.o_id") else "o_id"
+        _trp_apply_anon_source_constraints(source_node, edge_alias, anon_src_col, context, jt)
+        _trp_apply_inline_props(None, None, target_node, target_alias, context, jt)
+    else:
+        _trp_apply_inline_props(source_node, source_alias, target_node, target_alias, context, jt)
+
+    # Apply label constraints for anonymous target nodes inline.
+    if target_node.variable is None and target_node.labels and not target_alias.startswith("Stage"):
+        for label in target_node.labels:
+            l_alias = context.next_alias("l")
+            context.join_clauses.append(
+                f"{jt} {_table('rdf_labels')} {l_alias} "
+                f"ON {l_alias}.s = {target_alias}.node_id AND {l_alias}.label = {context.add_join_param(label)}"
+            )
 
 
 def translate_relationship_pattern(
@@ -3519,8 +3561,12 @@ def translate_relationship_pattern(
             edge_cond = f"{edge_alias}.s = {source_alias}.{s_col}"
             target_on = f"{target_alias}.{t_col} = {edge_alias}.o_id"
     else:
-        edge_cond = f"{edge_alias}.o_id = {source_alias}.{s_col}"
-        target_on = f"{target_alias}.{t_col} = {edge_alias}.s"
+        if is_anon_source:
+            edge_cond = "1=1"
+            target_on = f"{target_alias}.{t_col} = {edge_alias}.s"
+        else:
+            edge_cond = f"{edge_alias}.o_id = {source_alias}.{s_col}"
+            target_on = f"{target_alias}.{t_col} = {edge_alias}.s"
     _trp_directed_edge(rel, source_node, target_node, context,
                        source_alias, target_alias, edge_alias, s_col, t_col,
                        edge_cond, target_on, jt, is_anon_source, is_new_target)
@@ -4300,11 +4346,8 @@ def _expr_property_reference(expr, context, segment):
             f"CASE WHEN ({col_ref}) IS NULL OR SUBSTRING({col_ref}, 1, 1) <> '{{' "
             f"THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{prop}') END"
         )
-    if expr.property_name in ("node_id", "id"):
-        # Use node_id shortcut unless this variable's 'id' is a regular user property
-        id_as_prop = getattr(context, '_id_as_property_vars', set())
-        if expr.variable not in id_as_prop:
-            return f"{alias}.node_id"
+    if expr.property_name == "node_id":
+        return f"{alias}.node_id"
     if segment == "where":
         context.where_conditions.append(
             TranslationContext._structural_guard_sql(alias, expr.property_name)
