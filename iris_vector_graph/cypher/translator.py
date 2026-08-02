@@ -2496,8 +2496,191 @@ def translate_delete_clause(delete, context, metadata):
             )
 
 
+def _merge_pattern_existence_sql(merge_node):
+    """Build the NOT EXISTS sub-SELECT that checks whether any node already matches
+    the MERGE pattern (labels + properties).  Returns (sql_fragment, params_list).
+
+    The fragment is suitable for use in:
+        INSERT INTO nodes (node_id) SELECT ? WHERE NOT EXISTS (<fragment>)
+    """
+    labels = merge_node.labels if merge_node else []
+    props = merge_node.properties if merge_node else {}
+
+    if not labels and not props:
+        # No constraints — any node in the graph matches; check by a sentinel always-true.
+        return f"SELECT 1 FROM {_table('nodes')} WHERE 1=1", []
+
+    joins = []
+    params: list = []
+    for i, label in enumerate(labels):
+        alias = f"_ml{i}"
+        if i == 0:
+            joins.append(f"{_table('nodes')} {alias}")
+        else:
+            # Additional label: re-join rdf_labels on same node
+            first_alias = "_ml0"
+            l_alias = f"_ml{i}"
+            joins.append(
+                f"JOIN {_table('rdf_labels')} {l_alias} ON "
+                f"{l_alias}.s = _ml0.node_id AND {l_alias}.label = ?"
+            )
+            params.append(label)
+
+    if labels:
+        # Primary label checked via rdf_labels
+        primary_label = labels[0]
+        lbl0_join = (
+            f"SELECT 1 FROM {_table('nodes')} _ml0 "
+            f"JOIN {_table('rdf_labels')} _lbl0 ON _lbl0.s = _ml0.node_id AND _lbl0.label = ?"
+        )
+        params_prefix = [primary_label]
+        extra_label_joins = ""
+        for i, label in enumerate(labels[1:], start=1):
+            l_alias = f"_ml{i}"
+            extra_label_joins += (
+                f" JOIN {_table('rdf_labels')} {l_alias} ON "
+                f"{l_alias}.s = _ml0.node_id AND {l_alias}.label = ?"
+            )
+            params_prefix.append(label)
+        prop_joins = ""
+        prop_params: list = []
+        for ki, (k, v) in enumerate(props.items()):
+            val = v.value if isinstance(v, ast.Literal) else v
+            p_alias = f"_mp{ki}"
+            prop_joins += (
+                f' JOIN {_table("rdf_props")} {p_alias} ON '
+                f'{p_alias}.s = _ml0.node_id AND {p_alias}."key" = ? AND {p_alias}.val = ?'
+            )
+            prop_params.extend([k, str(val)])
+        return (
+            lbl0_join + extra_label_joins + prop_joins,
+            params_prefix + prop_params,
+        )
+
+    # No labels, only properties
+    prop_joins_parts = []
+    prop_params = []
+    for ki, (k, v) in enumerate(props.items()):
+        val = v.value if isinstance(v, ast.Literal) else v
+        p_alias = f"_mp{ki}"
+        if ki == 0:
+            prop_joins_parts.append(
+                f"SELECT 1 FROM {_table('nodes')} _ml0 "
+                f'JOIN {_table("rdf_props")} {p_alias} ON '
+                f'{p_alias}.s = _ml0.node_id AND {p_alias}."key" = ? AND {p_alias}.val = ?'
+            )
+        else:
+            prop_joins_parts.append(
+                f'JOIN {_table("rdf_props")} {p_alias} ON '
+                f'{p_alias}.s = _ml0.node_id AND {p_alias}."key" = ? AND {p_alias}.val = ?'
+            )
+        prop_params.extend([k, str(val)])
+    return " ".join(prop_joins_parts), prop_params
+
+
 def translate_merge_clause(merge, context, metadata):
+    # Snapshot context state before translate_create_clause so we can replace the
+    # UUID-based DMLs and WHERE with label/property-based equivalents.
+    _pre_dml_len = len(context.dml_statements)
+    _pre_from_len = len(context.from_clauses)
+    _pre_where_len = len(context.where_conditions)
+    _pre_where_params_len = len(context.where_params)
+
     translate_create_clause(ast.CreateClause(patterns=[merge.pattern]), context, metadata)
+
+    # --- Rewrite DML + SELECT for single-node MERGE patterns ---
+    # translate_create_clause generates INSERT ... WHERE NOT EXISTS (node_id = <uuid>).
+    # For MERGE we need INSERT ... WHERE NOT EXISTS (<label/prop pattern match>)
+    # so that a pre-existing node prevents a new node from being created.
+    merge_node = merge.pattern.nodes[0] if merge.pattern.nodes else None
+    if merge_node is not None and not merge.pattern.relationships:
+        var_name = merge_node.variable
+        node_alias = context.variable_aliases.get(var_name) if var_name else None
+        generated_uuid = (
+            context.input_params.get(f"__create_id_{var_name}")
+            if var_name else None
+        )
+        if generated_uuid is None and hasattr(context, '_anon_node_keys'):
+            generated_uuid = context._anon_node_keys.get(id(merge_node))
+
+        # Check whether translate_create_clause added UUID-based from/where entries.
+        added_froms = context.from_clauses[_pre_from_len:]
+        added_wheres = context.where_conditions[_pre_where_len:]
+        _has_uuid_from = (
+            len(added_froms) == 1
+            and node_alias
+            and f"{_table('nodes')} {node_alias}" in added_froms[0]
+        )
+        _has_uuid_where = (
+            len(added_wheres) == 1
+            and node_alias
+            and f"{node_alias}.node_id = ?" in added_wheres[0]
+        )
+
+        exist_sql, exist_params = _merge_pattern_existence_sql(merge_node)
+        new_uuid = generated_uuid
+
+        if new_uuid and (_has_uuid_from or _has_uuid_where or True):
+            # Replace UUID-based node DML statements with label/prop-aware equivalents.
+            # We only touch the DML added by translate_create_clause for THIS merge node.
+            added_dmls = context.dml_statements[_pre_dml_len:]
+            new_dmls = []
+            for sql, params in added_dmls:
+                if "INSERT INTO " + _table("nodes") in sql and new_uuid in str(params):
+                    # Replace "WHERE NOT EXISTS (SELECT 1 FROM nodes WHERE node_id = ?)"
+                    # with a pattern-based check so existing matching nodes block the INSERT.
+                    new_dmls.append((
+                        f"INSERT INTO {_table('nodes')} (node_id) SELECT ? "
+                        f"WHERE NOT EXISTS ({exist_sql})",
+                        [new_uuid] + exist_params,
+                    ))
+                elif "INSERT INTO " + _table("rdf_labels") in sql and new_uuid in str(params):
+                    # The rdf_labels insert must also be guarded by pattern existence.
+                    # Extract the label from the original params (second param).
+                    label_val = params[1] if len(params) > 1 else None
+                    if label_val is not None:
+                        new_dmls.append((
+                            f"INSERT INTO {_table('rdf_labels')} (s, label) SELECT ?, ? "
+                            f"WHERE NOT EXISTS ({exist_sql})",
+                            [new_uuid, label_val] + exist_params,
+                        ))
+                    else:
+                        new_dmls.append((sql, params))
+                else:
+                    new_dmls.append((sql, params))
+
+            # Swap out the DML statements.
+            del context.dml_statements[_pre_dml_len:]
+            context.dml_statements.extend(new_dmls)
+
+        # --- Fix SELECT query to find the node by label/property, not by the new UUID ---
+        if _has_uuid_from and _has_uuid_where:
+            del context.from_clauses[_pre_from_len:]
+            del context.where_conditions[_pre_where_len:]
+            del context.where_params[_pre_where_params_len:]
+
+            # Re-add FROM nodes + label JOINs + property JOINs so the SELECT finds the
+            # matching node whether it was just created or already existed.
+            context.from_clauses.append(f"{_table('nodes')} {node_alias}")
+            for label in merge_node.labels:
+                l_alias = context.next_alias("l")
+                context.join_clauses.append(
+                    f"JOIN {_table('rdf_labels')} {l_alias} ON "
+                    f"{l_alias}.s = {node_alias}.node_id AND "
+                    f"{l_alias}.label = {context.add_join_param(label)}"
+                )
+            for k, v in merge_node.properties.items():
+                val = v.value if isinstance(v, ast.Literal) else (
+                    context.input_params.get(v.name) if isinstance(v, ast.Variable) else v
+                )
+                p_alias = context.next_alias("p")
+                context.join_clauses.append(
+                    f'JOIN {_table("rdf_props")} {p_alias} ON '
+                    f'{p_alias}.s = {node_alias}.node_id AND '
+                    f'{p_alias}."key" = {context.add_join_param(k)} AND '
+                    f'{p_alias}.val = {context.add_join_param(str(val))}'
+                )
+
     var = merge.pattern.nodes[0].variable if merge.pattern.nodes else None
     for action, is_create in [(merge.on_create, True), (merge.on_match, False)]:
         if action:
