@@ -6871,8 +6871,8 @@ def _expr_subscript(expr, context, segment):
         # placeholders in the JSON path expression (IRIS can't use ? in '$[?]').
         # However, if the index is non-integer (a string key for maps), use property notation.
         if isinstance(idx, ast.Literal) and isinstance(idx.value, int) and not isinstance(idx.value, bool):
-            # Integer index → array notation
-            return f"SQLUser.JSON_VALUE({base_sql}, '$[{idx.value}]')"
+            # Integer index → use JSON_ARRAYGET (handles array JSON correctly without UDF lock issues)
+            return f"SQLUser.JSON_ARRAYGET({base_sql}, {idx.value})"
         if isinstance(idx, ast.Literal) and isinstance(idx.value, str):
             # String literal key → map property notation
             safe_key = idx.value.replace("'", "''")
@@ -6930,7 +6930,7 @@ def _expr_subscript(expr, context, segment):
                                 f"CASE WHEN ({base_sql}) IS NULL THEN NULL "
                                 f"ELSE SQLUser.CypherFn_IVGTYPEERROR('Map element access by non-string') END"
                             )
-                    return f"SQLUser.JSON_VALUE({base_sql}, '$[{pval}]')"
+                    return f"SQLUser.JSON_ARRAYGET({base_sql}, {pval})"
         idx_sql = translate_expression(idx, context, segment=segment)
         return f"SQLUser.JSON_VALUE({base_sql}, '$.' || CAST(({idx_sql}) AS VARCHAR))"
     base_sql = translate_expression(base, context, segment=segment)
@@ -6941,7 +6941,7 @@ def _expr_subscript(expr, context, segment):
             f"'$[{i}]' COLUMNS (elem VARCHAR(1000) PATH '$')) __jt)"
         )
     idx_sql = translate_expression(idx, context, segment=segment)
-    return f"SQLUser.JSON_VALUE({base_sql}, '$[' || CAST(({idx_sql}) AS VARCHAR) || ']')"
+    return f"SQLUser.JSON_ARRAYGET({base_sql}, CAST(({idx_sql}) AS INTEGER))"
 
 
 def _expr_slice(expr, context, segment):
