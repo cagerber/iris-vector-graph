@@ -1243,12 +1243,28 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
         (item.alias or (item.expression.name if isinstance(item.expression, ast.Variable) else None))
         for item in part.with_clause.items
     } - {None}
+    # Map (variable, property_name) -> alias for PropertyReference WITH projections.
+    # ORDER BY a.name after WITH DISTINCT a.name AS name should use alias 'name', not add a new JOIN.
+    prop_alias_map: dict = {}
+    for wi in part.with_clause.items:
+        if wi.alias and isinstance(wi.expression, ast.PropertyReference):
+            prop_alias_map[(wi.expression.variable, wi.expression.property_name)] = wi.alias
     # sort_projections: list of (alias, sql_expr) for complex ORDER BY expressions that
     # need to be projected into the inner SELECT so the outer ORDER BY can reference them.
     sort_projections: list = []
     if part.with_clause.order_by_clause:
         for item in part.with_clause.order_by_clause.items:
             direction = "ASC" if item.ascending else "DESC"
+            # If ORDER BY expression is a PropertyReference projected as a WITH alias, use the alias.
+            # This avoids adding a second JOIN that would break DISTINCT semantics.
+            if isinstance(item.expression, ast.PropertyReference):
+                _pk = (item.expression.variable, item.expression.property_name)
+                if _pk in prop_alias_map:
+                    col = _safe_alias(prop_alias_map[_pk])
+                    order_by_items.append(
+                        f"CASE WHEN ISNUMERIC({col}) = 1 THEN CAST({col} AS DOUBLE) END {direction}, {col} {direction}"
+                    )
+                    continue
             # If the expression is a variable that matches a WITH alias, emit as bare column name
             # (but quote it if it's a SQL reserved word, same as the SELECT alias)
             if isinstance(item.expression, ast.Variable) and item.expression.name in with_aliases:
@@ -5631,6 +5647,16 @@ def _expr_to_cypher_text(expr) -> str:
 
 
 def translate_return_clause(ret, context):
+    # RETURN * after a WITH stage: the star is parsed as Literal('*').
+    # When we're selecting from a stage CTE, don't add any select_items — the
+    # _tts_select_result fallback (line ~1814) will emit "SELECT *" instead.
+    if (
+        len(ret.items) == 1
+        and isinstance(ret.items[0].expression, ast.Literal)
+        and ret.items[0].expression.value == "*"
+        and context.stages
+    ):
+        return
     for item in ret.items:
         if isinstance(item.expression, ast.Variable):
             var_name = item.expression.name
