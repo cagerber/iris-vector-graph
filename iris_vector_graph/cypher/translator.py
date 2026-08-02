@@ -296,25 +296,29 @@ class TranslationContext:
             self.variable_aliases[variable] = self.next_alias(prefix)
         return self.variable_aliases[variable]
 
-    def bind_variable_type(self, variable: str, var_type: str) -> None:
+    def bind_variable_type(self, variable: str, var_type: str, force: bool = False) -> None:
         """Track variable type and validate no type conflicts.
 
         Args:
             variable: Cypher variable name
             var_type: One of "node", "relationship", or "scalar"
+            force: If True, allow rebinding to a different type (used for WITH scope transitions)
 
         Raises:
-            CypherParseError: If variable is rebound to a different type
+            CypherParseError: If variable is rebound to a different type (unless force=True)
         """
         if not variable:
             return
         if variable in self.variable_types:
             existing_type = self.variable_types[variable]
             if existing_type != var_type:
-                raise CypherParseError(
-                    f"VariableTypeConflict: variable '{variable}' is bound as "
-                    f"{existing_type!r}, cannot rebind as {var_type!r}"
-                )
+                if not force:
+                    raise CypherParseError(
+                        f"VariableTypeConflict: variable '{variable}' is bound as "
+                        f"{existing_type!r}, cannot rebind as {var_type!r}"
+                    )
+                # force=True: allow rebinding in new scope (e.g., WITH clause)
+                self.variable_types[variable] = var_type
         else:
             self.variable_types[variable] = var_type
 
@@ -1399,18 +1403,19 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
                 # Track the type of the variable in WITH clause.
                 # If it's a reference to an existing variable, preserve its type.
                 # Otherwise, it's a scalar (function result, literal, etc.)
+                # WITH creates a new scope: force=True allows rebinding existing names to new types
                 if isinstance(item.expression, ast.Variable):
                     # Passthrough: preserve the bound variable's type
                     # (from MATCH, previous WITH, etc.)
                     existing_type = context.variable_types.get(item.expression.name)
                     if existing_type:
-                        context.bind_variable_type(alias, existing_type)
+                        context.bind_variable_type(alias, existing_type, force=True)
                     else:
                         # If not yet typed, assume node (safest for graph ops)
-                        context.bind_variable_type(alias, "node")
+                        context.bind_variable_type(alias, "node", force=True)
                 else:
                     # Everything else is scalar: aggregation, function call, literal, etc.
-                    context.bind_variable_type(alias, "scalar")
+                    context.bind_variable_type(alias, "scalar", force=True)
             if isinstance(item.expression, ast.AggregationFunction) and alias:
                 context.scalar_variables.add(alias)
             elif alias and not isinstance(item.expression, ast.Variable):

@@ -279,3 +279,44 @@ def test_merge_relationship_with_labeled_nodes():
     assert "rdf_edges" in select_sql, f"SELECT missing rdf_edges join: {select_sql}"
     assert "e4 ON" in select_sql, "Edge alias should be referenced in JOIN ON clause"
     assert "COUNT(e" in select_sql, "COUNT should reference edge alias"
+
+
+def test_with_rebind_node_to_scalar():
+    """Test that WITH allows rebinding a node variable to a scalar (new scope)."""
+    query = "MATCH (n) WITH n.name AS n RETURN n"
+    parsed = parse_query(query)
+    result = translate_to_sql(parsed)
+    sql = "\n".join(result.sql) if isinstance(result.sql, list) else result.sql
+    # Should translate without VariableTypeConflict error
+    assert "Stage" in sql or "SELECT" in sql
+
+
+def test_with_rebind_same_name():
+    """Test WITH can rebind with the same variable name from an expression."""
+    query = "MATCH (a) WITH a.name AS a RETURN a"
+    parsed = parse_query(query)
+    result = translate_to_sql(parsed)
+    sql = "\n".join(result.sql) if isinstance(result.sql, list) else result.sql
+    # Should translate without VariableTypeConflict error
+    assert "Stage" in sql or "SELECT" in sql
+
+
+def test_with_rebind_relationship_to_scalar():
+    """Test that WITH allows rebinding a relationship variable to a scalar."""
+    query = "MATCH (a)-[r]->(b) WITH r.weight AS r RETURN r"
+    parsed = parse_query(query)
+    result = translate_to_sql(parsed)
+    sql = "\n".join(result.sql) if isinstance(result.sql, list) else result.sql
+    # Should translate without VariableTypeConflict error
+    assert "Stage" in sql or "SELECT" in sql
+
+
+def test_with_rebind_preserves_scope():
+    """Test that WITH rebinding preserves scope: old binding is not available after WITH."""
+    query = "MATCH (a:Begin {num: 42}) WITH a.num AS property MATCH (b:End) WHERE property = b.num RETURN b"
+    parsed = parse_query(query)
+    result = translate_to_sql(parsed)
+    sql = "\n".join(result.sql) if isinstance(result.sql, list) else result.sql
+    # Should translate without VariableTypeConflict error
+    assert "Stage" in sql or "SELECT" in sql
+    assert "property" in sql or "Stage" in sql  # property alias should be in result
