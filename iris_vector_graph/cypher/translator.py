@@ -1243,21 +1243,55 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
         (item.alias or (item.expression.name if isinstance(item.expression, ast.Variable) else None))
         for item in part.with_clause.items
     } - {None}
+    # sort_projections: list of (alias, sql_expr) for complex ORDER BY expressions that
+    # need to be projected into the inner SELECT so the outer ORDER BY can reference them.
+    sort_projections: list = []
     if part.with_clause.order_by_clause:
         for item in part.with_clause.order_by_clause.items:
             direction = "ASC" if item.ascending else "DESC"
             # If the expression is a variable that matches a WITH alias, emit as bare column name
             # (but quote it if it's a SQL reserved word, same as the SELECT alias)
             if isinstance(item.expression, ast.Variable) and item.expression.name in with_aliases:
-                order_by_items.append(f"{_safe_alias(item.expression.name)} {direction}")
+                col = _safe_alias(item.expression.name)
+                # Emit numeric-aware sort: numeric values sort by DOUBLE, strings by VARCHAR.
+                # CASE WHEN ISNUMERIC(x)=1 THEN CAST(x AS DOUBLE) END returns NULL for strings
+                # (NULLs sort last in ASC, first in DESC — both correct for mixed-type data).
+                order_by_items.append(
+                    f"CASE WHEN ISNUMERIC({col}) = 1 THEN CAST({col} AS DOUBLE) END {direction}, {col} {direction}"
+                )
             else:
                 try:
-                    expr = translate_expression(item.expression, context, segment="select")
-                    order_by_items.append(f"{expr} {direction}")
+                    # Use segment="inline" so numeric literals become inline constants.
+                    # Property references add JOINs to context (join_params) as needed.
+                    expr = translate_expression(item.expression, context, segment="inline")
+                    # If the expression references JOIN aliases (p\d+.val), it cannot be used
+                    # directly in ORDER BY on the outer subquery — project it as a sort column.
+                    import re as _re_ob
+                    if _re_ob.search(r'\bp\d+\.val\b', expr):
+                        sort_alias = f"__sort{len(sort_projections)}"
+                        sort_projections.append((sort_alias, expr))
+                        order_by_items.append(f"{sort_alias} {direction}")
+                    else:
+                        order_by_items.append(f"{expr} {direction}")
                 except Exception:
                     pass
 
     sql, stage_params = context.build_stage_sql(part.with_clause.distinct)
+
+    # Inject sort projection columns into the inner SELECT if any complex ORDER BY expressions exist.
+    if sort_projections:
+        # The sql is "SELECT col1, col2, ... FROM ..." — inject sort columns after SELECT list.
+        # Find the first FROM (not inside a subquery) to insert sort columns before it.
+        for sort_alias, sort_expr in sort_projections:
+            # Inject into SELECT: "SELECT ..., (sort_expr) AS sort_alias\nFROM ..."
+            # Match the first \nFROM or " FROM " at the top level
+            _from_pat = _re_ob.search(r'\nFROM ', sql)
+            if _from_pat:
+                insert_at = _from_pat.start()
+                sql = sql[:insert_at] + f", ({sort_expr}) AS {sort_alias}" + sql[insert_at:]
+            else:
+                # Fallback: append to SELECT line
+                sql = sql + f", ({sort_expr}) AS {sort_alias}"
 
     # Apply ORDER BY, SKIP, LIMIT from the WITH clause (if present).
     # IRIS does not allow ORDER BY directly in a CTE body — it must be inside a subquery wrapper.
@@ -2026,6 +2060,9 @@ def _extract_literal_value(v):
         return v
 
 
+_TEMPORAL_CREATE_FNS = frozenset({"date", "time", "localtime", "localdatetime", "datetime", "duration"})
+
+
 def _create_resolve_prop_value(v, context):
     if isinstance(v, ast.Literal):
         val = _extract_literal_value(v)
@@ -2048,6 +2085,16 @@ def _create_resolve_prop_value(v, context):
         return val
     if isinstance(v, ast.Variable) and v.name not in context.variable_aliases:
         raise SyntaxError(f"Undefined variable: {v.name}")
+    # Temporal constructors (date(), time(), datetime(), etc.) in property expressions:
+    # translate to their ISO string value for storage in rdf_props.
+    if isinstance(v, ast.FunctionCall) and v.function_name.lower() in _TEMPORAL_CREATE_FNS:
+        try:
+            sql_val = translate_expression(v, context, segment="select")
+            # sql_val is a SQL string literal like '1910-05-06' — strip the quotes
+            if isinstance(sql_val, str) and sql_val.startswith("'") and sql_val.endswith("'"):
+                return sql_val[1:-1]
+        except Exception:
+            pass
     return v
 
 

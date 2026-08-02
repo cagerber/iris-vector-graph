@@ -431,9 +431,18 @@ def _node_matches(node_data: dict, pattern: dict, isolation_label: str | None = 
         if actual_props.get(k) != v:
             # try string/int normalisation
             av = actual_props.get(k)
-            if isinstance(v, int) and isinstance(av, str):
+            if isinstance(v, bool) and isinstance(av, str):
+                if (v and av in ("1", "true", "True")) or (not v and av in ("0", "false", "False")):
+                    continue
+            if isinstance(v, int) and not isinstance(v, bool) and isinstance(av, str):
                 try:
                     if int(av) == v:
+                        continue
+                except ValueError:
+                    pass
+            if isinstance(v, float) and isinstance(av, str):
+                try:
+                    if abs(float(av) - v) < 1e-9 * max(1.0, abs(v)):
                         continue
                 except ValueError:
                     pass

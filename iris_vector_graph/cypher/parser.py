@@ -1424,8 +1424,13 @@ class Parser:
             asc = True
             if self.matches(TokenType.DESC):
                 asc = False
-            else:
-                self.matches(TokenType.ASC)
+            elif self.peek().kind == TokenType.IDENTIFIER and self.peek().value.upper() == "DESCENDING":
+                self.eat()
+                asc = False
+            elif self.matches(TokenType.ASC):
+                pass
+            elif self.peek().kind == TokenType.IDENTIFIER and self.peek().value.upper() == "ASCENDING":
+                self.eat()
 
             if expr is not None:
                 items.append(ast.OrderByItem(expr, asc))
