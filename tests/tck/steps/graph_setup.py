@@ -49,6 +49,9 @@ def step_named_graph(context, graph_name):
     context.params = {}
     context.last_result = None
     context.last_error = None
+    # Ensure the named graph data is populated in the DB
+    from tests.tck.environment import _ensure_named_graph
+    _ensure_named_graph(context, graph_name, label)
 
 
 @step("there exists a procedure {procedure_sig}")
@@ -112,10 +115,9 @@ def step_procedure_exists(context, procedure_sig):
     # Extract test data from table
     rows = []
     if context.table:
-        # behave gives us context.table with headings and rows
+        # behave Row iterates as cell values, not (heading, cell) pairs — use as_dict()
         for row in context.table.rows:
-            # row is a dict with headings as keys
-            rows.append(dict(row))
+            rows.append(row.as_dict())
 
     # Register procedure
     context._tck_procedures[proc_name] = {

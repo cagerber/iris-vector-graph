@@ -103,7 +103,7 @@ class Parser:
         )
 
     def parse_procedure_call(self) -> ast.CypherProcedureCall:
-        """Parse CALL ivg.vector.search(args...) YIELD node, score [, ...]"""
+        """Parse CALL proc.name[(args...)] [YIELD item [AS alias], ... | *]"""
         self.expect(TokenType.CALL)
 
         # Parse dotted procedure name: IDENTIFIER (DOT IDENTIFIER)*
@@ -114,37 +114,56 @@ class Parser:
             part_tok = self.expect(TokenType.IDENTIFIER)
             procedure_name += "." + (part_tok.value or "")
 
-        # Parse argument list
-        self.expect(TokenType.LPAREN)
+        # Parse argument list — optional: implicit call has no parentheses at all
+        implicit_args = False
         arguments = []
         options: Dict[str, Any] = {}
-        if self.peek().kind != TokenType.RPAREN:
-            while True:
-                # Options map literal as last argument: {key: value, ...}
-                if self.peek().kind == TokenType.LBRACE:
-                    self.eat()  # consume LBRACE
-                    options = self.parse_map_literal()
-                    self.expect(TokenType.RBRACE)
-                else:
-                    arguments.append(self.parse_expression())
-                if not self.matches(TokenType.COMMA):
-                    break
-        self.expect(TokenType.RPAREN)
+        if self.peek().kind == TokenType.LPAREN:
+            self.eat()  # consume LPAREN
+            if self.peek().kind != TokenType.RPAREN:
+                while True:
+                    # Options map literal as last argument: {key: value, ...}
+                    if self.peek().kind == TokenType.LBRACE:
+                        self.eat()  # consume LBRACE
+                        options = self.parse_map_literal()
+                        self.expect(TokenType.RBRACE)
+                    else:
+                        arguments.append(self.parse_expression())
+                    if not self.matches(TokenType.COMMA):
+                        break
+            self.expect(TokenType.RPAREN)
+        else:
+            # Implicit call: no parentheses — args come from query parameters
+            implicit_args = True
 
-        # Parse YIELD items
-        yield_items: List[str] = []
+        # Parse YIELD clause: YIELD * | YIELD item [AS alias] [, ...]
+        yield_items: List = []
+        yield_star = False
         if self.peek().kind == TokenType.YIELD:
             self.eat()  # consume YIELD
-            while True:
-                tok = self.expect(TokenType.IDENTIFIER)
-                yield_items.append(tok.value or "")
-                if not self.matches(TokenType.COMMA):
-                    break
+            if self.peek().kind == TokenType.STAR:
+                self.eat()  # consume *
+                yield_star = True
+            else:
+                while True:
+                    tok = self.expect(TokenType.IDENTIFIER)
+                    item_name = tok.value or ""
+                    if self.peek().kind == TokenType.AS:
+                        self.eat()  # consume AS
+                        alias_tok = self.expect(TokenType.IDENTIFIER)
+                        alias_name = alias_tok.value or ""
+                        yield_items.append((item_name, alias_name))
+                    else:
+                        yield_items.append(item_name)
+                    if not self.matches(TokenType.COMMA):
+                        break
 
         return ast.CypherProcedureCall(
             procedure_name=procedure_name,
             arguments=arguments,
             yield_items=yield_items,
+            yield_star=yield_star,
+            implicit_args=implicit_args,
             options=options,
         )
 
@@ -184,8 +203,10 @@ class Parser:
                     if self.peek().kind == TokenType.WITH:
                         with_clause = self.parse_with_clause()
                         part = self.parse_query_part()
-                        if query_parts:
-                            query_parts[-1].with_clause = with_clause
+                        if not query_parts:
+                            # First WITH after CALL: create a synthetic empty part to hold it
+                            query_parts.append(ast.QueryPart(clauses=[]))
+                        query_parts[-1].with_clause = with_clause
                         query_parts.append(part)
                     else:
                         query_parts.append(self.parse_query_part())
@@ -1315,12 +1336,15 @@ class Parser:
                 if self.peek().kind == TokenType.WHERE:
                     self.eat()
                     where_cond = self.parse_expression()
+                with_clause = None
+                if self.peek().kind == TokenType.WITH:
+                    with_clause = self.parse_with_clause()
                 if self.peek().kind == TokenType.RETURN:
                     self.eat()
                     while self.peek().kind not in (TokenType.RBRACE, TokenType.EOF):
                         self.eat()
                 self.expect(TokenType.RBRACE)
-                return ast.ExistsExpression(pattern=pattern, negated=False, where_condition=where_cond)
+                return ast.ExistsExpression(pattern=pattern, negated=False, where_condition=where_cond, with_clause=with_clause)
 
             if name.lower() in ("shortestpath", "allshortestpaths") and self.peek().kind == TokenType.LPAREN:
                 self.eat()
@@ -1431,6 +1455,18 @@ class Parser:
                     raise CypherParseError(
                         "Expected property name", prop_tok.line, prop_tok.column
                     )
+                # Check if this is a namespace.function(...) call, e.g. duration.between(...)
+                if self.peek().kind == TokenType.LPAREN:
+                    self.eat()  # consume LPAREN
+                    ns_fn_name = f"{name.lower()}.{prop_tok.value.lower()}"
+                    args = []
+                    if not self.matches(TokenType.RPAREN):
+                        while True:
+                            args.append(self.parse_expression())
+                            if not self.matches(TokenType.COMMA):
+                                break
+                        self.expect(TokenType.RPAREN)
+                    return ast.FunctionCall(ns_fn_name, args)
                 return ast.PropertyReference(name, prop_tok.value)
             if self.peek().kind == TokenType.LBRACE:
                 lookahead = self.lexer.peek_ahead(1)

@@ -409,7 +409,10 @@ class CypherProcedureCall:
 
     procedure_name: str
     arguments: List[Union[Literal, Variable, PropertyReference]]
-    yield_items: List[str] = field(default_factory=list)
+    # Each yield item is either a plain string (no alias) or a (original, alias) tuple.
+    yield_items: List[Union[str, tuple]] = field(default_factory=list)
+    yield_star: bool = False  # YIELD * — expand all output columns
+    implicit_args: bool = False  # Called without parentheses (implicit arg passing)
     options: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -457,6 +460,7 @@ class ExistsExpression:
     pattern: "GraphPattern"
     negated: bool = False
     where_condition: Optional[Any] = None
+    with_clause: Optional[Any] = None  # WithClause for full exists with aggregation
 
 
 @dataclass(slots=True)

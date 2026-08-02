@@ -4030,12 +4030,22 @@ def _trp_variable_length(rel, source_node, target_node, context, metadata):
 
         direction_str = "both" if rel.direction == ast.Direction.BOTH else ("in" if rel.direction == ast.Direction.INCOMING else "out")
 
+        # If the relationship has a named variable (e.g. [r*1..3]), register it so
+        # that RETURN r does not raise "Undefined variable".  We use the sentinel alias
+        # "__vl_rel__" so _expr_variable can emit a NULL placeholder; the engine fills
+        # in the actual relationship list after BFS traversal.
+        if rel.variable:
+            context.variable_aliases[rel.variable] = "__vl_rel__"
+            context.rel_variables.add(rel.variable)
+            context.bind_variable_type(rel.variable, "relationship", force=True)
+
         context.var_length_paths.append(
             {
                 "source_var": source_node.variable,
                 "source_alias": source_alias,
                 "target_var": target_node.variable,
                 "target_alias": target_alias,
+                "rel_var": rel.variable,
                 "types": rel.types or [],
                 "direction": direction_str,
                 "min_hops": rel.variable_length.min_hops,
@@ -4940,6 +4950,68 @@ def _register_unbound_node(node, child_ctx, sub_froms, sub_wheres):
 
 def _boolean_expr_exists(expr, context) -> Optional[str]:
     pat = expr.pattern
+
+    # Full existential subquery with aggregation: EXISTS { MATCH ... WITH ..., count(*) AS alias WHERE alias = N }
+    # Translates to: (SELECT COUNT(*) FROM ... WHERE ...) = N
+    if getattr(expr, "with_clause", None) is not None:
+        with_cl = expr.with_clause
+        # Find the aggregation alias and comparison value from the WITH WHERE clause
+        agg_alias = None
+        agg_func = None
+        for item in with_cl.items:
+            if isinstance(item.expression, ast.AggregationFunction) and item.alias:
+                agg_alias = item.alias
+                agg_func = item.expression
+                break
+        if agg_alias and agg_func and with_cl.where_clause:
+            # The WHERE clause should be something like "numConnections = 3"
+            # Extract comparison: find the side that is not the agg_alias
+            wexpr = with_cl.where_clause.expression
+            if (
+                isinstance(wexpr, ast.BooleanExpression)
+                and wexpr.operator == ast.BooleanOperator.EQUALS
+                and len(wexpr.operands) == 2
+            ):
+                left_op, right_op = wexpr.operands
+                cmp_value = None
+                if isinstance(left_op, ast.Variable) and left_op.name == agg_alias:
+                    cmp_value = right_op
+                elif isinstance(right_op, ast.Variable) and right_op.name == agg_alias:
+                    cmp_value = left_op
+                if cmp_value is not None:
+                    # Build the count subquery
+                    child_ctx = TranslationContext()
+                    child_ctx.input_params = context.input_params
+                    child_ctx._alias_counter = context._alias_counter
+                    child_ctx.variable_aliases = dict(context.variable_aliases)
+                    sub_froms = []
+                    sub_wheres = []
+                    # Register unbound nodes
+                    for node in pat.nodes:
+                        _register_unbound_node(node, child_ctx, sub_froms, sub_wheres)
+                    # Add edge conditions for each relationship
+                    for i, rel in enumerate(pat.relationships):
+                        left_node = pat.nodes[i] if i < len(pat.nodes) else None
+                        right_node = pat.nodes[i + 1] if i + 1 < len(pat.nodes) else None
+                        edge_alias = child_ctx.next_alias("ex")
+                        sub_froms.append(f"{_table('rdf_edges')} {edge_alias}")
+                        conds = _exists_edge_conds(rel, left_node, right_node, edge_alias, child_ctx)
+                        sub_wheres.extend(conds)
+                    if expr.where_condition:
+                        wc_sql = translate_boolean_expression(expr.where_condition, child_ctx)
+                        _absorb_child_joins(child_ctx, context, sub_froms, sub_wheres)
+                        sub_wheres.append(wc_sql)
+                    else:
+                        for p in child_ctx.where_params:
+                            context.where_params.append(p)
+                        for p in child_ctx.join_params:
+                            context.where_params.append(p)
+                    # Translate the comparison value
+                    cmp_sql = translate_expression(cmp_value, context, segment="where")
+                    count_sub = f"SELECT COUNT(*) FROM {', '.join(sub_froms)} WHERE {' AND '.join(sub_wheres)}"
+                    prefix = "NOT " if expr.negated else ""
+                    return f"{prefix}({count_sub}) = {cmp_sql}"
+
     if pat.relationships:
         child_ctx = TranslationContext()
         child_ctx.input_params = context.input_params
@@ -6483,13 +6555,18 @@ def _expr_subscript(expr, context, segment):
             # String literal key → map property notation
             safe_key = idx.value.replace("'", "''")
             return f"SQLUser.JSON_VALUE({base_sql}, '$.{safe_key}')"
-        # Dynamic index: check if it's a known non-integer type variable → TypeError via IVGLISTGET
+        # Dynamic index: check if it's a known non-integer type variable → unconditional TypeError
         if isinstance(idx, ast.Variable):
             idx_var_name = idx.name
             if idx_var_name in getattr(context, "non_integer_index_vars", set()):
-                # Index was bound to a non-integer type literal — IVGLISTGET raises TypeError
-                idx_sql = translate_expression(idx, context, segment=segment)
-                return f"SQLUser.CypherFn_IVGLISTGET({base_sql}, CAST(({idx_sql}) AS VARCHAR))"
+                # Index was bound to a non-integer type literal at translation time.
+                # Emit a SQL expression that always raises TypeError regardless of value.
+                # Use IVGTYPEERROR() which always throws — IRIS SQL UDF error = result.error.
+                return (
+                    f"CASE WHEN ({base_sql}) IS NOT NULL "
+                    f"THEN SQLUser.CypherFn_IVGTYPEERROR('Non-integer index type for list subscript') "
+                    f"ELSE NULL END"
+                )
         idx_sql = translate_expression(idx, context, segment=segment)
         return f"SQLUser.JSON_VALUE({base_sql}, '$.' || CAST(({idx_sql}) AS VARCHAR))"
     base_sql = translate_expression(base, context, segment=segment)
@@ -6537,6 +6614,11 @@ def _expr_property_access(expr, context, segment):
 
 def _expr_variable(expr, context, segment):
     alias = context.variable_aliases.get(expr.name)
+    # Variable-length relationship variable: the engine fills in the actual path list.
+    # Emit NULL placeholder; the engine replaces this column with the relationship list.
+    if alias == "__vl_rel__":
+        safe = _safe_alias(expr.name)
+        return f"NULL AS {safe}"
     if alias == "__foreach_literal__":
         val = getattr(context, "foreach_literals", {}).get(expr.name)
         if val is not None:

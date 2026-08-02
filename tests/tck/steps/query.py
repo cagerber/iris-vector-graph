@@ -15,9 +15,12 @@ def step_executing_query(context, query=None):
         context.scenario_label,
     )
     params = getattr(context, "params", {}) or {}
+    procedures = getattr(context, "_tck_procedures", None) or {}
     context.last_error = None
     try:
-        context.last_result = context.engine.execute_cypher(injected, params)
+        context.last_result = context.engine.execute_cypher(
+            injected, params, procedures=procedures
+        )
     except Exception as exc:
         context.last_result = None
         context.last_error = exc
@@ -34,9 +37,12 @@ def step_control_query(context, query=None):
         context.scenario_label,
     )
     params = getattr(context, "params", {}) or {}
+    procedures = getattr(context, "_tck_procedures", None) or {}
     context.last_error = None
     try:
-        context.last_result = context.engine.execute_cypher(injected, params)
+        context.last_result = context.engine.execute_cypher(
+            injected, params, procedures=procedures
+        )
     except Exception as exc:
         context.last_result = None
         context.last_error = exc
