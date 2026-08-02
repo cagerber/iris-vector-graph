@@ -8971,20 +8971,113 @@ def _eval_truncate(fn, args_exprs):
         if temporal_expr.arguments and isinstance(temporal_expr.arguments[0], ast.Literal):
             temporal_str = temporal_expr.arguments[0].value
         elif temporal_expr.arguments and isinstance(temporal_expr.arguments[0], ast.MapLiteral):
-            # Handle date({year:...,month:...,day:...}) etc.
-            sql = _build_date_from_map(temporal_expr.arguments[0],
-                                       with_time=(temporal_fn in ("datetime", "localdatetime")),
-                                       with_tz=(temporal_fn == "datetime"))
-            if sql and sql.startswith("'") and sql.endswith("'"):
-                temporal_str = sql[1:-1]
+            map_arg = temporal_expr.arguments[0]
+            if temporal_fn in ("localtime", "time"):
+                # Build time-only string from map (no date component)
+                _h = _extract_int_from_map_entry(map_arg, "hour", 0)
+                _mi = _extract_int_from_map_entry(map_arg, "minute", 0)
+                _s = _extract_int_from_map_entry(map_arg, "second", 0)
+                _ns = _extract_int_from_map_entry(map_arg, "nanosecond", -1)
+                _us_v = _extract_int_from_map_entry(map_arg, "microsecond", -1)
+                _ms_v = _extract_int_from_map_entry(map_arg, "millisecond", -1)
+                _frac = _subsecond_frac(_ns, _us_v, _ms_v)
+                if _frac:
+                    _time_only = f"{_h:02d}:{_mi:02d}:{_s:02d}.{_frac}"
+                elif _s:
+                    _time_only = f"{_h:02d}:{_mi:02d}:{_s:02d}"
+                else:
+                    _time_only = f"{_h:02d}:{_mi:02d}"
+                if temporal_fn == "time":
+                    # Include timezone offset if present
+                    _tz_e = map_arg.entries.get("timezone")
+                    if _tz_e and isinstance(_tz_e, ast.Literal) and isinstance(_tz_e.value, str):
+                        _time_only += _normalize_tz_str(_tz_e.value)
+                    else:
+                        _time_only += "Z"
+                temporal_str = _time_only
+            else:
+                # Handle date({year:...,month:...,day:...}) etc.
+                sql = _build_date_from_map(map_arg,
+                                           with_time=(temporal_fn in ("datetime", "localdatetime")),
+                                           with_tz=(temporal_fn == "datetime"))
+                if sql and sql.startswith("'") and sql.endswith("'"):
+                    temporal_str = sql[1:-1]
 
     if temporal_str is None or temporal_fn is None:
         return None  # can't evaluate at compile time
 
-    # Parse the temporal into a datetime
-    dt = _temporal_to_datetime_obj(temporal_str, temporal_fn)
+    # Parse the temporal into a datetime — use LOCAL wall clock (no UTC adjustment).
+    # Truncation operates on the local time components, not UTC.
+    def _parse_local_dt(s, fn):
+        """Parse temporal string to Python datetime using local wall-clock time (no TZ conversion)."""
+        import datetime as _dt2
+        import re as _re2
+        if fn == "date":
+            parsed = _parse_date_string(s)
+            if parsed:
+                y, mo, d = parsed
+                return _dt2.datetime(y, mo, d, 0, 0, 0)
+            return None
+        if fn in ("localtime", "time"):
+            s2 = _re2.sub(r'\[.*\]$', '', s)
+            s2 = _re2.sub(r'[Z]$', '', s2)
+            s2 = _re2.sub(r'[+-]\d{2}:?\d{2}(?::\d{2})?$', '', s2)
+            m = _re2.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', s2)
+            if m:
+                h2, mi2 = int(m.group(1)), int(m.group(2))
+                sec = int(m.group(3) or 0)
+                frac = m.group(4) or ""
+                ns = int(frac.ljust(9, '0')[:9]) if frac else 0
+                return _dt2.datetime(2000, 1, 1, h2, mi2, sec, ns // 1000)
+            return None
+        if fn in ("localdatetime", "datetime"):
+            s2 = _re2.sub(r'\[.*\]$', '', s)
+            if "T" not in s2.upper():
+                return None
+            sep = s2.upper().index("T")
+            date_s = s2[:sep]
+            time_s = s2[sep+1:]
+            parsed_date = _parse_date_string(date_s)
+            if not parsed_date:
+                return None
+            y2, mo2, d2 = parsed_date
+            # Strip timezone without adjusting
+            time_s = _re2.sub(r'[Z]$', '', time_s)
+            time_s = _re2.sub(r'[+-]\d{2}:?\d{2}(?::\d{2})?$', '', time_s)
+            m = _re2.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', time_s)
+            if not m:
+                return None
+            h2, mi2 = int(m.group(1)), int(m.group(2))
+            sec = int(m.group(3) or 0)
+            frac = m.group(4) or ""
+            ns = int(frac.ljust(9, '0')[:9]) if frac else 0
+            try:
+                return _dt2.datetime(y2, mo2, d2, h2, mi2, sec, ns // 1000)
+            except ValueError:
+                return None
+        return None
+
+    dt = _parse_local_dt(temporal_str, temporal_fn)
     if dt is None:
         return "NULL"
+
+    # Extract timezone from input temporal string (for datetime/time output)
+    input_tz = ""
+    _input_iana_tz = None  # IANA timezone name from input (needs re-resolve post-truncation)
+    if temporal_fn in ("datetime", "time"):
+        _tz_m = _re.search(r'([+-]\d{2}:\d{2}(?::\d{2})?)(\[[\w/]+\])?$', temporal_str or "")
+        if _tz_m:
+            input_tz = _tz_m.group(1)
+            if _tz_m.group(2):
+                input_tz += _tz_m.group(2)
+                # Extract IANA name (e.g. 'Europe/Stockholm') for post-truncation re-resolve
+                # (only relevant for datetime; time doesn't have IANA tz in openCypher)
+                if temporal_fn == "datetime":
+                    _iana_raw = _tz_m.group(2)[1:-1]  # strip '[' ']'
+                    if "/" in _iana_raw or _iana_raw in ("UTC", "GMT"):
+                        _input_iana_tz = _iana_raw
+        elif temporal_str and temporal_str.endswith('Z'):
+            input_tz = "Z"
 
     # Optional map for overrides (3rd arg)
     overrides = {}
@@ -8994,103 +9087,150 @@ def _eval_truncate(fn, args_exprs):
             for k, v_expr in map_expr.entries.items():
                 if isinstance(v_expr, ast.Literal) and isinstance(v_expr.value, (int, float)):
                     overrides[k] = int(v_expr.value)
+                elif isinstance(v_expr, ast.Literal) and isinstance(v_expr.value, str):
+                    overrides[k] = v_expr.value  # e.g. timezone: '+01:00' or 'Europe/Stockholm'
 
     # Determine the target type
     target_type = fn.split(".")[0]  # "date", "datetime", "localdatetime", "localtime", "time"
 
+    # out_tz is resolved AFTER truncation so IANA timezone offset uses the output date
+    # (which may differ from input, e.g. millennium truncation 2017→2000 changes DST)
+    _pending_iana_tz = None  # IANA name to resolve post-truncation, if needed
+    out_tz = input_tz or "Z"
+    if "timezone" in overrides:
+        tz_val = overrides["timezone"]
+        if isinstance(tz_val, str):
+            if "/" in tz_val or tz_val in ("UTC", "GMT"):
+                _pending_iana_tz = tz_val  # defer until after truncation
+            else:
+                out_tz = _normalize_tz_str(tz_val)
+
     # Truncate based on unit
     y, mo, d = dt.year, dt.month, dt.day
     h, mi, s, us = dt.hour, dt.minute, dt.second, dt.microsecond
+    ns_extra = 0  # sub-microsecond nanoseconds (from nanosecond override)
 
     if unit == "millennium":
-        y = (y - 1) // 1000 * 1000 + 1
-        mo, d, h, mi, s, us = 1, 1, 0, 0, 0, 0
+        # openCypher: floor to nearest 1000-year boundary (e.g. 2017 → 2000)
+        y = (y // 1000) * 1000
+        mo, d, h, mi, s, us, ns_extra = 1, 1, 0, 0, 0, 0, 0
     elif unit == "century":
-        y = (y - 1) // 100 * 100 + 1
-        mo, d, h, mi, s, us = 1, 1, 0, 0, 0, 0
+        # openCypher: floor to nearest 100-year boundary (e.g. 1984 → 1900)
+        y = (y // 100) * 100
+        mo, d, h, mi, s, us, ns_extra = 1, 1, 0, 0, 0, 0, 0
     elif unit == "decade":
         y = y // 10 * 10
-        mo, d, h, mi, s, us = 1, 1, 0, 0, 0, 0
+        mo, d, h, mi, s, us, ns_extra = 1, 1, 0, 0, 0, 0, 0
     elif unit == "year":
-        mo, d, h, mi, s, us = 1, 1, 0, 0, 0, 0
+        mo, d, h, mi, s, us, ns_extra = 1, 1, 0, 0, 0, 0, 0
     elif unit == "weekyear":
         # ISO week year: find first Monday of the ISO week year
-        # The ISO week year starts on the Monday of the week containing Jan 4
         import datetime as _dt2
-        jan4 = _dt2.date(y, 1, 4)
-        # Monday of the week containing Jan 4
-        monday = jan4 - _dt2.timedelta(days=jan4.weekday())
-        # But we need the ISO week year of our date
-        # dt.isocalendar() → (iso_year, iso_week, iso_weekday)
         iso_year = dt.isocalendar()[0]
         jan4_iy = _dt2.date(iso_year, 1, 4)
         monday_iy = jan4_iy - _dt2.timedelta(days=jan4_iy.weekday())
         y, mo, d = monday_iy.year, monday_iy.month, monday_iy.day
-        h, mi, s, us = 0, 0, 0, 0
+        h, mi, s, us, ns_extra = 0, 0, 0, 0, 0
     elif unit == "quarter":
         mo = ((mo - 1) // 3) * 3 + 1
-        d, h, mi, s, us = 1, 0, 0, 0, 0
+        d, h, mi, s, us, ns_extra = 1, 0, 0, 0, 0, 0
     elif unit == "month":
-        d, h, mi, s, us = 1, 0, 0, 0, 0
+        d, h, mi, s, us, ns_extra = 1, 0, 0, 0, 0, 0
     elif unit == "week":
-        # Truncate to Monday of ISO week
+        # Truncate to Monday of ISO week; dayOfWeek override selects a different weekday
         import datetime as _dt2
         dt_date = _dt2.date(y, mo, d)
-        dt_date = dt_date - _dt2.timedelta(days=dt_date.weekday())
+        monday = dt_date - _dt2.timedelta(days=dt_date.weekday())
+        dow_override = overrides.get("dayOfWeek")
+        if dow_override is not None and isinstance(dow_override, int):
+            dt_date = monday + _dt2.timedelta(days=dow_override - 1)
+        else:
+            dt_date = monday
         y, mo, d = dt_date.year, dt_date.month, dt_date.day
-        h, mi, s, us = 0, 0, 0, 0
+        h, mi, s, us, ns_extra = 0, 0, 0, 0, 0
     elif unit == "day":
-        h, mi, s, us = 0, 0, 0, 0
+        h, mi, s, us, ns_extra = 0, 0, 0, 0, 0
     elif unit == "hour":
-        mi, s, us = 0, 0, 0
+        mi, s, us, ns_extra = 0, 0, 0, 0
     elif unit == "minute":
-        s, us = 0, 0
+        s, us, ns_extra = 0, 0, 0
     elif unit == "second":
-        us = 0
+        us, ns_extra = 0, 0
     elif unit == "millisecond":
         us = (us // 1000) * 1000
+        ns_extra = 0
     elif unit == "microsecond":
-        pass  # already at microsecond granularity
+        ns_extra = 0  # already at microsecond granularity
 
-    # Apply overrides from map
-    if "year" in overrides:
+    # Resolve IANA timezone offset using POST-truncation date (y/mo/d may have changed)
+    # e.g. millennium truncation of 2017-10-11 (summer, +02:00) → 2000-01-01 (winter, +01:00)
+    if _pending_iana_tz is not None:
+        _offset = _iana_tz_offset(_pending_iana_tz, ref_year=y, ref_month=mo, ref_day=d)
+        out_tz = f"{_offset}[{_pending_iana_tz}]" if _offset else _pending_iana_tz
+    elif _input_iana_tz is not None:
+        # Input temporal had IANA timezone; re-resolve offset for post-truncation date
+        _offset = _iana_tz_offset(_input_iana_tz, ref_year=y, ref_month=mo, ref_day=d)
+        out_tz = f"{_offset}[{_input_iana_tz}]" if _offset else _input_iana_tz
+
+    # Apply numeric overrides from map (timezone already handled above)
+    if "year" in overrides and isinstance(overrides["year"], int):
         y = overrides["year"]
-    if "month" in overrides:
+    if "month" in overrides and isinstance(overrides["month"], int):
         mo = overrides["month"]
-    if "day" in overrides:
+    if "day" in overrides and isinstance(overrides["day"], int):
         d = overrides["day"]
-    if "hour" in overrides:
+    if "hour" in overrides and isinstance(overrides["hour"], int):
         h = overrides["hour"]
-    if "minute" in overrides:
+    if "minute" in overrides and isinstance(overrides["minute"], int):
         mi = overrides["minute"]
-    if "second" in overrides:
+    if "second" in overrides and isinstance(overrides["second"], int):
         s = overrides["second"]
+    if "nanosecond" in overrides and isinstance(overrides["nanosecond"], int):
+        # nanosecond override sets the sub-microsecond part only; us from truncation is preserved.
+        # e.g. after millisecond truncation us=645000 + {nanosecond:2} → ns_extra=2, us stays 645000
+        # → total 645000002 ns = '645000002'
+        ns_extra = overrides["nanosecond"] % 1000
+    if "microsecond" in overrides and isinstance(overrides["microsecond"], int):
+        us = overrides["microsecond"]
+        ns_extra = 0
+    if "millisecond" in overrides and isinstance(overrides["millisecond"], int):
+        us = overrides["millisecond"] * 1000
+        ns_extra = 0
 
     # Clamp day to valid range
     max_day = _cal.monthrange(y, mo)[1]
     d = min(d, max_day)
 
+    # Build fractional seconds (nanosecond precision)
+    total_ns = us * 1000 + ns_extra
+    frac_str = f"{total_ns:09d}".rstrip('0') if total_ns else None
+
+    def _fmt_time_part(h, mi, s, frac_str):
+        """Format time as HH:MM[:SS[.frac]], omitting trailing zero components."""
+        if frac_str:
+            return f"{h:02d}:{mi:02d}:{s:02d}.{frac_str}"
+        if s:
+            return f"{h:02d}:{mi:02d}:{s:02d}"
+        return f"{h:02d}:{mi:02d}"
+
     # Format based on target type
-    ns = us * 1000
     if target_type == "date":
         return f"'{y:04d}-{mo:02d}-{d:02d}'"
-    elif target_type in ("datetime",):
-        frac_str = f"{us * 1000:09d}".rstrip('0') if us else None
-        if frac_str:
-            return f"'{y:04d}-{mo:02d}-{d:02d}T{h:02d}:{mi:02d}:{s:02d}.{frac_str}Z'"
-        return f"'{y:04d}-{mo:02d}-{d:02d}T{h:02d}:{mi:02d}:{s:02d}Z'"
+    elif target_type == "datetime":
+        time_part = _fmt_time_part(h, mi, s, frac_str)
+        return f"'{y:04d}-{mo:02d}-{d:02d}T{time_part}{out_tz}'"
     elif target_type == "localdatetime":
-        frac_str = f"{us * 1000:09d}".rstrip('0') if us else None
-        if frac_str:
-            return f"'{y:04d}-{mo:02d}-{d:02d}T{h:02d}:{mi:02d}:{s:02d}.{frac_str}'"
-        return f"'{y:04d}-{mo:02d}-{d:02d}T{h:02d}:{mi:02d}:{s:02d}'"
+        # If timezone override present in map → promote output to datetime
+        if "timezone" in overrides:
+            time_part = _fmt_time_part(h, mi, s, frac_str)
+            return f"'{y:04d}-{mo:02d}-{d:02d}T{time_part}{out_tz}'"
+        time_part = _fmt_time_part(h, mi, s, frac_str)
+        return f"'{y:04d}-{mo:02d}-{d:02d}T{time_part}'"
     elif target_type in ("localtime", "time"):
-        frac_str = f"{us * 1000:09d}".rstrip('0') if us else None
-        if frac_str:
-            return f"'{h:02d}:{mi:02d}:{s:02d}.{frac_str}'"
-        if s:
-            return f"'{h:02d}:{mi:02d}:{s:02d}'"
-        return f"'{h:02d}:{mi:02d}'"
+        time_part = _fmt_time_part(h, mi, s, frac_str)
+        if target_type == "time":
+            return f"'{time_part}{out_tz}'"
+        return f"'{time_part}'"
     return "NULL"
 
 
