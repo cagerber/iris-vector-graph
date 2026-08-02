@@ -285,6 +285,12 @@ class TranslationContext:
         self.variable_types: Dict[str, str] = (
             {} if parent is None else parent.variable_types.copy()
         )
+        # Temporal type tracking: maps variable name → temporal type
+        # Types: "date", "localtime", "time", "datetime", "localdatetime", "duration"
+        # Used to emit correct SQL extraction for property access (e.g., d.year, dur.months)
+        self.temporal_types: Dict[str, str] = (
+            {} if parent is None else parent.temporal_types.copy()
+        )
 
     def next_alias(self, prefix: str = "t") -> str:
         alias = f"{prefix}{self._alias_counter}"
@@ -1413,6 +1419,9 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
                     else:
                         # If not yet typed, assume node (safest for graph ops)
                         context.bind_variable_type(alias, "node", force=True)
+                    # Also preserve temporal type if applicable
+                    if item.expression.name in context.temporal_types:
+                        context.temporal_types[alias] = context.temporal_types[item.expression.name]
                 else:
                     # Everything else is scalar: aggregation, function call, literal, etc.
                     context.bind_variable_type(alias, "scalar", force=True)
@@ -5115,9 +5124,18 @@ def _expr_list_predicate(expr, context, segment):
             f" ELSE 1 END"
         )
     elif expr.quantifier == "single":
+        # For single, we need satisfy_sql twice with different aliases to avoid alias collision.
+        # Generate a second satisfy query for the zero-check case.
+        satisfy_alias_2 = context.next_alias("lp")
+        # Adapt where_pred for the new alias
+        where_pred_2 = where_pred.replace(f"{alias}.", f"{satisfy_alias_2}.")
+        satisfy_sql_2 = (
+            f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {satisfy_alias_2}"
+            f" WHERE {where_pred_2}"
+        )
         return (
             f"CASE WHEN (({satisfy_sql}) = 1) THEN 1"
-            f" WHEN (({satisfy_sql}) = 0) AND (({null_count_sql}) > 0) THEN NULL"
+            f" WHEN (({satisfy_sql_2}) = 0) AND (({null_count_sql}) > 0) THEN NULL"
             f" ELSE 0 END"
         )
     else:  # any
@@ -5258,6 +5276,114 @@ def _expr_propref_edge_alias(expr, context, alias):
     return f"CASE WHEN {alias}.qualifiers IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({alias}.qualifiers, '$.{expr.property_name}') END"
 
 
+def _detect_temporal_type(expr, context) -> Optional[str]:
+    """Detect if an expression returns a temporal type (date, time, datetime, duration, etc.).
+
+    Returns the temporal type string or None if not a temporal expression.
+    Temporal types: "date", "localtime", "time", "datetime", "localdatetime", "duration"
+    """
+    if isinstance(expr, ast.FunctionCall):
+        fn = expr.function_name.lower()
+        if fn in ("date", "localtime", "time", "datetime", "localdatetime", "duration"):
+            return fn
+    if isinstance(expr, ast.Variable):
+        # Check if this variable was marked as temporal in a previous WITH clause
+        temporal_type = context.temporal_types.get(expr.name)
+        if temporal_type:
+            return temporal_type
+    return None
+
+
+def _extract_temporal_component(base_sql: str, temporal_type: str, prop_name: str) -> Optional[str]:
+    """Generate SQL to extract a temporal component from an ISO temporal string.
+
+    Args:
+        base_sql: SQL expression yielding the temporal value
+        temporal_type: One of "date", "localtime", "time", "datetime", "localdatetime", "duration"
+        prop_name: Component name (e.g., "year", "month", "day", "hours", "minutes", "seconds")
+
+    Returns:
+        SQL expression to extract the component, or None if unsupported
+    """
+
+    # Date components: '2024-01-15'
+    if temporal_type == "date":
+        if prop_name == "year":
+            return f"CAST(SUBSTRING({base_sql}, 1, 4) AS INTEGER)"
+        elif prop_name == "month":
+            return f"CAST(SUBSTRING({base_sql}, 6, 2) AS INTEGER)"
+        elif prop_name == "day":
+            return f"CAST(SUBSTRING({base_sql}, 9, 2) AS INTEGER)"
+        # For more complex properties (week, weekYear, etc.), return None for now
+        # as they require complex date arithmetic that may not be consistent across databases
+        return None
+
+    # LocalDateTime: '2024-01-15T12:31:14[.nanos]' (with optional fractional seconds)
+    if temporal_type in ("localdatetime", "datetime"):
+        if prop_name == "hour":
+            return f"CAST(SUBSTRING({base_sql}, 12, 2) AS INTEGER)"
+        elif prop_name == "minute":
+            return f"CAST(SUBSTRING({base_sql}, 15, 2) AS INTEGER)"
+        elif prop_name == "second":
+            return f"CAST(SUBSTRING({base_sql}, 18, 2) AS INTEGER)"
+        elif prop_name == "millisecond":
+            return f"CAST(COALESCE(SUBSTRING({base_sql}, 21, 3), '0') AS INTEGER)"
+        elif prop_name == "microsecond":
+            return f"CAST(COALESCE(SUBSTRING({base_sql}, 21, 6), '0') AS INTEGER)"
+        elif prop_name == "nanosecond":
+            return f"CAST(COALESCE(SUBSTRING({base_sql}, 21, 9), '0') AS INTEGER)"
+        # Date components: extract date part before T
+        elif prop_name == "year":
+            return f"CAST(SUBSTRING({base_sql}, 1, 4) AS INTEGER)"
+        elif prop_name == "month":
+            return f"CAST(SUBSTRING({base_sql}, 6, 2) AS INTEGER)"
+        elif prop_name == "day":
+            return f"CAST(SUBSTRING({base_sql}, 9, 2) AS INTEGER)"
+        return None
+
+    # LocalTime: 'HH:MM:SS[.nanos]' (no timezone)
+    if temporal_type == "localtime":
+        if prop_name == "hour":
+            return f"CAST(SUBSTRING({base_sql}, 1, 2) AS INTEGER)"
+        elif prop_name == "minute":
+            return f"CAST(SUBSTRING({base_sql}, 4, 2) AS INTEGER)"
+        elif prop_name == "second":
+            return f"CAST(SUBSTRING({base_sql}, 7, 2) AS INTEGER)"
+        elif prop_name == "millisecond":
+            return f"CAST(COALESCE(SUBSTRING({base_sql}, 10, 3), '0') AS INTEGER)"
+        elif prop_name == "microsecond":
+            return f"CAST(COALESCE(SUBSTRING({base_sql}, 10, 6), '0') AS INTEGER)"
+        elif prop_name == "nanosecond":
+            return f"CAST(COALESCE(SUBSTRING({base_sql}, 10, 9), '0') AS INTEGER)"
+        return None
+
+    # Time (with timezone): 'HH:MM:SS[.nanos]±HH:MM' or 'HH:MM:SS[.nanos]Z'
+    if temporal_type == "time":
+        if prop_name == "hour":
+            return f"CAST(SUBSTRING({base_sql}, 1, 2) AS INTEGER)"
+        elif prop_name == "minute":
+            return f"CAST(SUBSTRING({base_sql}, 4, 2) AS INTEGER)"
+        elif prop_name == "second":
+            return f"CAST(SUBSTRING({base_sql}, 7, 2) AS INTEGER)"
+        elif prop_name == "millisecond":
+            return f"CAST(COALESCE(SUBSTRING({base_sql}, 10, 3), '0') AS INTEGER)"
+        elif prop_name == "microsecond":
+            return f"CAST(COALESCE(SUBSTRING({base_sql}, 10, 6), '0') AS INTEGER)"
+        elif prop_name == "nanosecond":
+            return f"CAST(COALESCE(SUBSTRING({base_sql}, 10, 9), '0') AS INTEGER)"
+        return None
+
+    # Duration: 'P[n]Y[n]M[n]DT[n]H[n]M[n]S' (ISO 8601)
+    if temporal_type == "duration":
+        if prop_name == "years":
+            # Extract text between 'P' and 'Y' (if Y exists)
+            return f"CASE WHEN CHARINDEX('Y', {base_sql}) > 0 THEN CAST(SUBSTRING({base_sql}, 2, CHARINDEX('Y', {base_sql}) - 2) AS INTEGER) ELSE 0 END"
+        # For more complex duration properties, return None for now
+        return None
+
+    return None
+
+
 def _expr_property_reference(expr, context, segment):
     alias = context.variable_aliases.get(expr.variable)
     if not alias:
@@ -5273,6 +5399,15 @@ def _expr_property_reference(expr, context, segment):
     if alias.startswith("Stage"):
         if expr.property_name in ("node_id", "id"):
             return _safe_alias(expr.variable)
+
+        # Check if this is a temporal scalar variable (date, time, datetime, duration, etc.)
+        if expr.variable in context.temporal_types:
+            temporal_type = context.temporal_types[expr.variable]
+            stage_col = _safe_alias(expr.variable)
+            temp_extract = _extract_temporal_component(stage_col, temporal_type, expr.property_name)
+            if temp_extract:
+                return f"CASE WHEN {stage_col} IS NULL THEN NULL ELSE {temp_extract} END"
+
         # Edge-qualifiers variables: use JSON_VALUE on the column value (Stage column = qualifiers JSON)
         edge_stage_vars = getattr(context, "edge_stage_variables", set())
         if expr.variable in context.scalar_variables or expr.variable in edge_stage_vars:
@@ -6773,6 +6908,9 @@ def _expr_to_cypher_text(expr) -> str:
         return f"{base}.{expr.property_name}" if base else f".{expr.property_name}"
     if isinstance(expr, ast.Variable):
         return expr.name
+    if isinstance(expr, ast.Literal) and isinstance(expr.value, list):
+        items = ", ".join(_expr_to_cypher_text(i) for i in expr.value)
+        return f"[{items}]"
     if isinstance(expr, ast.Literal):
         return repr(expr.value)
     if isinstance(expr, ast.BooleanExpression):
@@ -6821,12 +6959,6 @@ def _expr_to_cypher_text(expr) -> str:
             f"{k}: {_expr_to_cypher_text(v)}" for k, v in expr.entries.items()
         )
         return "{" + entries + "}"
-    if isinstance(expr, ast.ListLiteral):
-        items = ", ".join(_expr_to_cypher_text(i) for i in expr.elements)
-        return f"[{items}]"
-    if isinstance(expr, ast.ArithmeticExpression):
-        parts = [_expr_to_cypher_text(o) for o in expr.operands]
-        return f" {expr.operator} ".join(parts)
     return ""
 
 
@@ -7045,6 +7177,19 @@ def translate_with_clause(with_clause, context):
                 alias = f"{item.expression.function_name}"
         if alias is None:
             alias = context.next_alias("v")
+
+        # Track temporal types for property access extraction
+        if isinstance(item.expression, ast.FunctionCall):
+            fn = item.expression.function_name.lower()
+            if fn in ("date", "localtime", "time", "datetime", "localdatetime", "duration"):
+                context.temporal_types[alias] = fn
+        # Also detect temporal properties: properties named 'date', 'time', 'datetime', etc.
+        # from nodes stored in the database are assumed to contain temporal values
+        elif isinstance(item.expression, ast.PropertyReference):
+            prop_name = item.expression.property_name.lower()
+            if prop_name in ("date", "localtime", "time", "datetime", "localdatetime", "duration"):
+                context.temporal_types[alias] = prop_name
+
         # Edge variables: expose qualifiers JSON so downstream r.prop works via JSON_VALUE(r, '$.prop')
         if (isinstance(item.expression, ast.Variable)
                 and context.variable_aliases.get(item.expression.name, "").startswith("e")
