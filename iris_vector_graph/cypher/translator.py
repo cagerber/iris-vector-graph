@@ -511,6 +511,66 @@ class TranslationContext:
             cte_prefix = ""
         return cte_prefix, sql, params
 
+    def build_label_only_dml_subquery(self, node_alias: str, select_override: str) -> tuple[str, str, List[Any]]:
+        """Build a label-only DML subquery, stripping rdf_props JOINs/conditions for node_alias.
+
+        Used after SET n = {map} deletes all properties — subsequent INSERT/SELECT must not
+        JOIN rdf_props for the matched node since those rows no longer exist.
+        """
+        import re as _re_lo
+        # Save state
+        saved_joins = list(self.join_clauses)
+        saved_join_params = list(self.join_params)
+        saved_where = list(self.where_conditions)
+        saved_where_params = list(self.where_params)
+
+        # Strip rdf_props JOINs that reference this node_alias; track their aliases
+        prop_join_aliases = set()
+        new_joins = []
+        new_join_params = []
+        jp_offset = 0
+        for jc in saved_joins:
+            pc = jc.count("?")
+            if "rdf_props" in jc and f"{node_alias}.node_id" in jc:
+                m = _re_lo.search(r"JOIN\s+\S*rdf_props\s+(\w+)\s+ON", jc)
+                if m:
+                    prop_join_aliases.add(m.group(1))
+                # drop this JOIN and its params
+            else:
+                new_joins.append(jc)
+                new_join_params.extend(saved_join_params[jp_offset:jp_offset + pc])
+            jp_offset += pc
+
+        self.join_clauses = new_joins
+        self.join_params = new_join_params
+
+        # Strip WHERE conditions referencing stripped prop aliases, or EXISTS rdf_props for this alias
+        new_where = []
+        new_where_params = []
+        wp_offset = 0
+        for cond in saved_where:
+            pc = cond.count("?")
+            cond_params = saved_where_params[wp_offset:wp_offset + pc]
+            wp_offset += pc
+            drop = any(f"{pa}." in cond for pa in prop_join_aliases)
+            if not drop and "EXISTS" in cond and "rdf_props" in cond and f"{node_alias}.node_id" in cond:
+                drop = True
+            if not drop:
+                new_where.append(cond)
+                new_where_params.extend(cond_params)
+        self.where_conditions = new_where
+        self.where_params = new_where_params
+
+        result = self.build_dml_subquery(select_override)
+
+        # Restore original state
+        self.join_clauses = saved_joins
+        self.join_params = saved_join_params
+        self.where_conditions = saved_where
+        self.where_params = saved_where_params
+
+        return result
+
 
 def translate_procedure_call(
     proc: ast.CypherProcedureCall, context: TranslationContext
@@ -2210,6 +2270,7 @@ def _tts_finalize_context(cypher_query, context):
         set_properties = getattr(context, '_set_properties', set())
         removed_properties = getattr(context, '_removed_properties', set())
         modified_properties = set_properties | removed_properties
+        full_replace_aliases = getattr(context, '_full_replace_aliases', set())
         if modified_properties and context.where_conditions:
             # Filter out WHERE conditions that reference modified properties.
             # Examples of conditions to remove:
@@ -2248,6 +2309,51 @@ def _tts_finalize_context(cypher_query, context):
 
             context.where_conditions = filtered_conditions
             context.where_params = filtered_params
+
+        # For SET n = {map} (full replace), also strip property JOINs for the affected
+        # node aliases — all props were deleted so INNER JOINs to rdf_props return 0 rows.
+        if full_replace_aliases and context.join_clauses:
+            import re as _re_tts
+            prop_join_aliases_to_strip = set()
+            kept_joins = []
+            orig_join_params_offset = 0
+            kept_join_params = []
+            for jc in context.join_clauses:
+                pc = jc.count("?")
+                drop = False
+                for nalias in full_replace_aliases:
+                    if "rdf_props" in jc and f"{nalias}.node_id" in jc:
+                        m = _re_tts.search(r"JOIN\s+\S+rdf_props\s+(\w+)\s+ON", jc)
+                        if m:
+                            prop_join_aliases_to_strip.add(m.group(1))
+                        drop = True
+                        break
+                if not drop:
+                    kept_joins.append(jc)
+                    kept_join_params.extend(context.join_params[orig_join_params_offset:orig_join_params_offset + pc])
+                orig_join_params_offset += pc
+            context.join_clauses = kept_joins
+            context.join_params = kept_join_params
+            # Also strip WHERE conditions referencing stripped prop aliases or EXISTS rdf_props
+            if prop_join_aliases_to_strip:
+                new_where = []
+                new_where_params = []
+                wp_off = 0
+                for cond in context.where_conditions:
+                    pc = cond.count("?")
+                    cp = context.where_params[wp_off:wp_off + pc]
+                    wp_off += pc
+                    drop = any(f"{pa}." in cond for pa in prop_join_aliases_to_strip)
+                    if not drop:
+                        for nalias in full_replace_aliases:
+                            if "EXISTS" in cond and "rdf_props" in cond and f"{nalias}.node_id" in cond:
+                                drop = True
+                                break
+                    if not drop:
+                        new_where.append(cond)
+                        new_where_params.extend(cp)
+                context.where_conditions = new_where
+                context.where_params = new_where_params
 
         translate_return_clause(cypher_query.return_clause, context)
 
@@ -4118,6 +4224,36 @@ def translate_set_clause(set_cl, context, metadata):
                         f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
                         [k, val] + subparams + [k],
                     )
+        elif isinstance(item.expression, ast.Variable) and isinstance(item.value, ast.MapLiteral) and not getattr(item, "merge", False):
+            # SET n = {map} — full property replace: delete all existing props and insert new ones
+            alias = context.variable_aliases.get(item.expression.name)
+            # DELETE uses the full property-filtered subquery (fires before props are gone)
+            cte, subquery, subparams = context.build_dml_subquery(
+                select_override=f"SELECT {alias}.node_id"
+            )
+            context.add_dml(
+                f"{cte}DELETE FROM {_table('rdf_props')} WHERE s IN ({subquery})",
+                subparams,
+            )
+            # INSERT/SELECT use label-only subquery (props deleted, property JOINs would return 0 rows)
+            cte_lo, subquery_lo, subparams_lo = context.build_label_only_dml_subquery(
+                node_alias=alias,
+                select_override=f"SELECT {alias}.node_id",
+            )
+            # Track this alias so the final SELECT also drops property JOINs for it
+            if not hasattr(context, '_full_replace_aliases'):
+                context._full_replace_aliases = set()
+            context._full_replace_aliases.add(alias)
+            # Insert new properties (skip null values per openCypher semantics)
+            for k, v in item.value.entries.items():
+                val = v.value if isinstance(v, ast.Literal) else context.input_params.get(v.name) if isinstance(v, ast.Variable) else None
+                if val is None:
+                    continue
+                context._set_properties.add(k)
+                context.add_dml(
+                    f'{cte_lo}INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery_lo})',
+                    [k, val] + subparams_lo,
+                )
         elif isinstance(item.expression, ast.Variable):
             alias, label = (
                 context.variable_aliases.get(item.expression.name),
@@ -12416,6 +12552,22 @@ def translate_return_clause(ret, context):
                     sql_col = f"{alias_name}.{var_name}"
                 prefix = item.alias or var_name
                 context.select_items.append(f"{sql_col} AS {_safe_alias(prefix)}")
+                continue
+            # Edge variable in RETURN (alias starts with 'e', not a stage var):
+            # emit type + qualifiers as JSON object so comparison can match [:TYPE {props}]
+            if alias_name and alias_name.startswith("e") and not is_scalar:
+                prefix = item.alias or var_name
+                is_undirected = alias_name in getattr(context, "_undirected_aliases", set())
+                p_col = f"{alias_name}.{'_p' if is_undirected else 'p'}"
+                q_col = f"{alias_name}.qualifiers"
+                edge_json = (
+                    f"'{{\"type\":\"' || {p_col} || '\",\"props\":' || "
+                    f"COALESCE({q_col}, '{{}}') || '}}'"
+                )
+                context.select_items.append(f"{edge_json} AS {_safe_alias(prefix)}")
+                context.optional_null_row_items.append("NULL")
+                if has_agg:
+                    context.group_by_items.append(p_col)
                 continue
             if alias_name and not alias_name.startswith("e") and not is_scalar:
                 prefix = item.alias or var_name

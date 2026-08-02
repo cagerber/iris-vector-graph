@@ -664,12 +664,57 @@ def _rows_equal(exp: dict, act: dict, columns: list[str], list_unordered: bool) 
                     continue
                 # av is not a node dict — mismatch
                 return False
-        # Relationship pattern comparison: TCK expects "[:TYPE]" parsed as [':TYPE']
-        # Actual value from engine is just the type string 'TYPE'
-        if (isinstance(ev, list) and len(ev) == 1
-                and isinstance(ev[0], str) and ev[0].startswith(":")
-                and isinstance(av, str)
-                and ev[0][1:] == av):
+        # Relationship pattern comparison: TCK expects "[':TYPE']" or "[':TYPE {props}']"
+        # Actual value from engine is either the type string 'TYPE' or a JSON edge object.
+        if isinstance(ev, list) and len(ev) == 1 and isinstance(ev[0], str) and ev[0].startswith(":"):
+            rel_pattern_str = ev[0]  # e.g. ':REL' or ':REL {property2: 24}'
+            # Parse relationship type and properties from the TCK pattern string
+            import re as _re_rel, json as _json_rel
+            _rel_type_m = _re_rel.match(r':(\w+)\s*(?:\{(.*)\})?$', rel_pattern_str.strip())
+            if _rel_type_m:
+                _expected_type = _rel_type_m.group(1)
+                _expected_props_str = _rel_type_m.group(2)
+                _expected_props = _parse_tck_value('{' + _expected_props_str + '}') if _expected_props_str else {}
+                # av may be: type string 'TYPE', or JSON edge object '{"type":"TYPE","props":{...}}'
+                if isinstance(av, str):
+                    try:
+                        _av_obj = _json_rel.loads(av)
+                        if isinstance(_av_obj, dict) and "type" in _av_obj:
+                            _actual_type = _av_obj["type"]
+                            _actual_props_raw = _av_obj.get("props", {})
+                            if isinstance(_actual_props_raw, str):
+                                try:
+                                    _actual_props = _json_rel.loads(_actual_props_raw)
+                                except Exception:
+                                    _actual_props = {}
+                            else:
+                                _actual_props = _actual_props_raw
+                            if _actual_type != _expected_type:
+                                return False
+                            # Compare props: coerce numeric strings
+                            for pk, pv in _expected_props.items():
+                                _av = _actual_props.get(pk)
+                                if isinstance(pv, int) and not isinstance(pv, bool):
+                                    try:
+                                        _av = int(_av)
+                                    except (TypeError, ValueError):
+                                        pass
+                                elif isinstance(pv, float):
+                                    try:
+                                        _av = float(_av)
+                                    except (TypeError, ValueError):
+                                        pass
+                                if _av != pv:
+                                    return False
+                            if set(_actual_props.keys()) != set(_expected_props.keys()):
+                                return False
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                    # Fallback: type-only match (no props)
+                    if not _expected_props and av == _expected_type:
+                        continue
+                return False
             continue
         # List-of-nodes comparison: TCK [(), ()] vs actual [{"_id":..., "_labels":..., "_props":...}]
         if isinstance(ev, list) and isinstance(av, list):
