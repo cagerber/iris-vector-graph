@@ -4850,7 +4850,7 @@ def _expr_arith(expr, context, segment):
     if op == "%":
         left = _prop_ref_cast(expr.arguments[0], left)
         right = _prop_ref_cast(expr.arguments[1], right)
-        return f"MOD({left}, {right})"
+        return f"CASE WHEN {right} = 0 AND {left} IS NOT NULL THEN CAST('NaN' AS DOUBLE) ELSE MOD({left}, {right}) END"
     if op == "^":
         left = _prop_ref_cast(expr.arguments[0], left)
         right = _prop_ref_cast(expr.arguments[1], right)
@@ -4897,6 +4897,8 @@ def _expr_arith(expr, context, segment):
         # -, *, /: always numeric — cast property references to DOUBLE
         left = _prop_ref_cast(expr.arguments[0], left)
         right = _prop_ref_cast(expr.arguments[1], right)
+        if op == "/":
+            return f"CASE WHEN {right} = 0 AND {left} IS NOT NULL THEN CAST('NaN' AS DOUBLE) ELSE ({left} {op} {right}) END"
     return f"({left} {op} {right})"
 
 
@@ -5997,6 +5999,14 @@ def _build_date_from_map(m, with_time=False, with_tz=False):
 
 
 def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
+    if fn == "isnan":
+        if not args:
+            return "0"
+        return f"CASE WHEN {args[0]} = CAST('NaN' AS DOUBLE) THEN 1 ELSE 0 END"
+    if fn == "isinfinite":
+        if not args:
+            return "0"
+        return f"CASE WHEN {args[0]} = CAST('Infinity' AS DOUBLE) OR {args[0]} = CAST('-Infinity' AS DOUBLE) THEN 1 ELSE 0 END"
     if fn == "haversin":
         return f"(1 - COS({args[0]})) / 2" if args else "NULL"
     if fn == "e":
