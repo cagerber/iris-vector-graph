@@ -83,6 +83,25 @@ class Parser:
             column=tok.column,
         )
 
+    def expect_identifier_or_keyword(self) -> Token:
+        """Accept an IDENTIFIER or any keyword token as an identifier.
+
+        In Cypher, keywords like ROWS, FIRST, SECOND, etc. are contextual and valid
+        as variable/alias names in certain positions. Using expect(IDENTIFIER) would reject them.
+        """
+        tok = self.peek()
+        if tok.kind == TokenType.IDENTIFIER:
+            return self.eat()
+        # Accept any token that looks like it could be a keyword (has a string value)
+        # This allows keywords to be used as identifiers in contexts like alias names
+        if tok.value and tok.value.replace("_", "").replace("-", "").isalnum():
+            return self.eat()
+        raise CypherParseError(
+            f"Expected IDENTIFIER, got {tok.kind.value if tok.kind.value else tok.kind}",
+            line=tok.line,
+            column=tok.column,
+        )
+
     def parse_procedure_call(self) -> ast.CypherProcedureCall:
         """Parse CALL ivg.vector.search(args...) YIELD node, score [, ...]"""
         self.expect(TokenType.CALL)
