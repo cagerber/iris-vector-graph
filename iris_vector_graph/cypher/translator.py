@@ -3236,6 +3236,24 @@ def translate_merge_clause(merge, context, metadata):
                     f"{e_alias}.o_id = {tgt_alias}.node_id"
                 )
 
+    # Collect edge context for ON CREATE/ON MATCH SET on MATCH-bound node variables.
+    # When a node variable comes from MATCH (not created by this MERGE), actual_id is None
+    # and we need the edge's src/tgt aliases + rel_type to condition the INSERT.
+    _edge_contexts = []  # list of (src_alias, tgt_alias, rel_type) for each edge in this MERGE
+    if merge.pattern.relationships:
+        for rel_idx, rel in enumerate(merge.pattern.relationships):
+            if not rel.types or len(rel.types) > 1:
+                continue
+            left_node, right_node = merge.pattern.nodes[rel_idx], merge.pattern.nodes[rel_idx + 1]
+            if rel.direction == ast.Direction.INCOMING:
+                source_node, target_node = right_node, left_node
+            else:
+                source_node, target_node = left_node, right_node
+            src_a = context.variable_aliases.get(source_node.variable) if source_node.variable else None
+            tgt_a = context.variable_aliases.get(target_node.variable) if target_node.variable else None
+            if src_a and tgt_a:
+                _edge_contexts.append((src_a, tgt_a, rel.types[0]))
+
     var = merge.pattern.nodes[0].variable if merge.pattern.nodes else None
     for action, is_create in [(merge.on_create, True), (merge.on_match, False)]:
         if action:
@@ -3262,10 +3280,37 @@ def translate_merge_clause(merge, context, metadata):
                                 [k, val, actual_id],
                             )
                         else:
-                            context.add_dml(
-                                f'INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id = ? AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = ? AND "key" = ?)',
-                                [k, val, sql_alias, sql_alias, k],
-                            )
+                            # Node is MATCH-bound (actual_id unknown at translate time).
+                            # Build a self-contained INSERT that finds the node via its
+                            # current MATCH context (from_clauses + join_clauses + where_conditions).
+                            from_parts = list(context.from_clauses)
+                            join_parts = list(context.join_clauses)
+                            where_parts = list(context.where_conditions)
+                            where_params_parts = list(context.where_params)
+                            join_params_parts = list(context.join_params)
+                            if from_parts:
+                                from_sql = ", ".join(from_parts)
+                                join_sql = (" " + " ".join(join_parts)) if join_parts else ""
+                                where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+                                context.add_dml(
+                                    f'INSERT INTO {_table("rdf_props")} (s, "key", val) '
+                                    f'SELECT {sql_alias}.node_id, ?, ? '
+                                    f'FROM {from_sql}{join_sql}'
+                                    f'{where_sql}'
+                                    f'{" AND " if where_parts else " WHERE "}'
+                                    f'NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} '
+                                    f'WHERE s = {sql_alias}.node_id AND "key" = ?)',
+                                    join_params_parts + where_params_parts + [k, val, k],
+                                )
+                            else:
+                                context.add_dml(
+                                    f'INSERT INTO {_table("rdf_props")} (s, "key", val) '
+                                    f'SELECT {sql_alias}.node_id, ?, ? '
+                                    f'FROM {_table("nodes")} {sql_alias} '
+                                    f'WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} '
+                                    f'WHERE s = {sql_alias}.node_id AND "key" = ?)',
+                                    [k, val, k],
+                                )
                     else:
                         if actual_id:
                             context.add_dml(
@@ -3273,10 +3318,29 @@ def translate_merge_clause(merge, context, metadata):
                                 [val, actual_id, k],
                             )
                         else:
-                            context.add_dml(
-                                f'UPDATE {_table("rdf_props")} SET val = ? WHERE s IN (SELECT node_id FROM {_table("nodes")} WHERE node_id = ?) AND "key" = ?',
-                                [val, sql_alias, k],
-                            )
+                            # MATCH-bound node: use the full MATCH context subquery.
+                            from_parts = list(context.from_clauses)
+                            join_parts = list(context.join_clauses)
+                            where_parts = list(context.where_conditions)
+                            where_params_parts = list(context.where_params)
+                            join_params_parts = list(context.join_params)
+                            if from_parts:
+                                from_sql = ", ".join(from_parts)
+                                join_sql = (" " + " ".join(join_parts)) if join_parts else ""
+                                where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+                                context.add_dml(
+                                    f'UPDATE {_table("rdf_props")} SET val = ? '
+                                    f'WHERE s IN ('
+                                    f'SELECT {sql_alias}.node_id FROM {from_sql}{join_sql}{where_sql}'
+                                    f') AND "key" = ?',
+                                    [val] + join_params_parts + where_params_parts + [k],
+                                )
+                            else:
+                                context.add_dml(
+                                    f'UPDATE {_table("rdf_props")} SET val = ? '
+                                    f'WHERE s IN (SELECT node_id FROM {_table("nodes")} WHERE node_id = ?) AND "key" = ?',
+                                    [val, sql_alias, k],
+                                )
                 elif isinstance(item.expression, ast.Variable):
                     # Label assignment: MERGE (...) ON CREATE SET a:SomeLabel
                     var_name = item.expression.name
@@ -3516,11 +3580,22 @@ def translate_set_clause(set_cl, context, metadata):
                         val_params + subparams + [k],
                     )
                     # For INSERT (when property doesn't exist), build an insert-safe expression
-                    # where `val` is replaced by a correlated subquery from rdf_props.
+                    # where bare `val` references are replaced by correlated subqueries from rdf_props.
                     safe_k = k.replace("'", "''")
+                    _iv_subq = f"(SELECT _iv.val FROM {_table('rdf_props')} _iv WHERE _iv.s = {_table('nodes')}.node_id AND _iv.\"key\" = '{safe_k}')"
                     insert_val_sql = val_sql.replace(
                         "CAST(val AS NUMERIC)",
-                        f"CAST((SELECT _iv.val FROM {_table('rdf_props')} _iv WHERE _iv.s = {_table('nodes')}.node_id AND _iv.\"key\" = '{safe_k}') AS NUMERIC)",
+                        f"CAST({_iv_subq} AS NUMERIC)",
+                    ).replace(
+                        "CAST(val AS VARCHAR(4096))",
+                        f"CAST({_iv_subq} AS VARCHAR(4096))",
+                    ).replace(
+                        # bare `val` used directly (e.g. arithmetic on val without CAST)
+                        " val ", f" {_iv_subq} ",
+                    ).replace(
+                        "(val ", f"({_iv_subq} ",
+                    ).replace(
+                        " val)", f" {_iv_subq})",
                     )
                     context.add_dml(
                         f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) '
