@@ -4832,13 +4832,25 @@ def _expr_prop(expr, context, segment):
     return f"{inner}.{prop}"
 
 
+def _prop_ref_cast(arg, sql):
+    """Wrap a property-reference SQL expression in CAST(... AS DOUBLE) for arithmetic.
+    rdf_props.val is VARCHAR; arithmetic on VARCHAR does string-concat in IRIS."""
+    if isinstance(arg, ast.PropertyReference):
+        return f"CAST({sql} AS DOUBLE)"
+    return sql
+
+
 def _expr_arith(expr, context, segment):
     op = expr.function_name[len("__arith_") :]
     left = translate_expression(expr.arguments[0], context, segment=segment)
     right = translate_expression(expr.arguments[1], context, segment=segment)
     if op == "%":
+        left = _prop_ref_cast(expr.arguments[0], left)
+        right = _prop_ref_cast(expr.arguments[1], right)
         return f"MOD({left}, {right})"
     if op == "^":
+        left = _prop_ref_cast(expr.arguments[0], left)
+        right = _prop_ref_cast(expr.arguments[1], right)
         return f"POWER({left}, {right})"
     if op == "+":
         def _is_str(arg):
@@ -4875,6 +4887,13 @@ def _expr_arith(expr, context, segment):
                 f"SELECT JSON_VALUE({right}, '$[' || rn.n || ']') AS v FROM (SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) rn WHERE rn.n < JSON_ARRAYLENGTH({right})"
                 f") x)"
             )
+        # Numeric +: cast property references to DOUBLE
+        left = _prop_ref_cast(expr.arguments[0], left)
+        right = _prop_ref_cast(expr.arguments[1], right)
+    else:
+        # -, *, /: always numeric — cast property references to DOUBLE
+        left = _prop_ref_cast(expr.arguments[0], left)
+        right = _prop_ref_cast(expr.arguments[1], right)
     return f"({left} {op} {right})"
 
 
