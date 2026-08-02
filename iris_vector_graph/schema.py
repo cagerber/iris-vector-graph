@@ -641,7 +641,7 @@ CREATE OR REPLACE FUNCTION SQLUser.JSON_ARRAYLENGTH(j VARCHAR(32000)) RETURNS IN
 CREATE OR REPLACE FUNCTION SQLUser.JSON_ARRAYGET(j VARCHAR(32000), i INTEGER) RETURNS VARCHAR(4000) LANGUAGE OBJECTSCRIPT { Set a = ##class(%Library.DynamicArray).%FromJSON(j) Quit a.%Get(i) _ "" }
 """,
             """
-CREATE OR REPLACE FUNCTION SQLUser.JSON_VALUE(j VARCHAR(32000), p VARCHAR(1000)) RETURNS VARCHAR(4000) LANGUAGE OBJECTSCRIPT { Set obj = ##class(%Library.DynamicObject).%FromJSON(j), key = $Extract(p, 3, *) Quit obj.%Get(key) _ "" }
+CREATE OR REPLACE FUNCTION SQLUser.JSON_VALUE(j VARCHAR(32000), p VARCHAR(1000)) RETURNS VARCHAR(4000) LANGUAGE OBJECTSCRIPT { Set obj = ##class(%Library.DynamicObject).%FromJSON(j), key = $Extract(p, 3, *), val = obj.%Get(key) If $IsObject(val) { Quit val.%ToJSON() } Quit val _ "" }
 """,
             """
 CREATE OR REPLACE FUNCTION SQLUser.RAND() RETURNS DOUBLE LANGUAGE OBJECTSCRIPT { Quit $RANDOM(1000000) / 1000000.0 }
@@ -665,7 +665,7 @@ CREATE OR REPLACE FUNCTION SQLUser.LIST_HEAD(j VARCHAR(32000)) RETURNS VARCHAR(4
 CREATE OR REPLACE FUNCTION SQLUser.LIST_LAST(j VARCHAR(32000)) RETURNS VARCHAR(4000) LANGUAGE OBJECTSCRIPT { Set arr = ##class(%Library.DynamicArray).%FromJSON(j), n = arr.%Size()-1, t = arr.%GetTypeOf(n) If t = "number" Quit arr.%Get(n) Quit arr.%GetSerialized(n) }
 """,
             """
-CREATE OR REPLACE FUNCTION SQLUser.STR_SPLIT(str VARCHAR(4000), delim VARCHAR(100)) RETURNS VARCHAR(32000) LANGUAGE OBJECTSCRIPT { Set out = ##class(%Library.DynamicArray).%New(), n = $LENGTH(str, delim) For i=1:1:n { Do out.%Push($PIECE(str, delim, i)) } Quit out.%ToJSON() }
+CREATE OR REPLACE FUNCTION SQLUser.STR_SPLIT(str VARCHAR(4000), delim VARCHAR(100)) RETURNS VARCHAR(32000) LANGUAGE OBJECTSCRIPT { Set out = ##class(%Library.DynamicArray).%New(), n = $LENGTH(str, delim), i = 1 While i <= n { Do out.%Push($PIECE(str, delim, i)), i = i + 1 } Quit out.%ToJSON() }
 """,
             f"""
 CREATE OR REPLACE PROCEDURE {table_schema}.kg_KNN_VEC(

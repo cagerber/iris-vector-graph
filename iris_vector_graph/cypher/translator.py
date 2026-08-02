@@ -11,6 +11,7 @@ import logging
 import json
 from pydantic import BaseModel, Field
 from . import ast
+from .parser import CypherParseError
 from iris_vector_graph.security import (
     validate_table_name,
     VALID_GRAPH_TABLES,
@@ -102,7 +103,7 @@ def get_schema_prefix() -> str:
     return _schema_prefix
 
 
-def _table(name: str) -> str:
+def _table(name: str, prefix: Optional[str] = None) -> str:
     """Return fully qualified table name with schema prefix if configured.
 
     Security: Validates name against VALID_GRAPH_TABLES allowlist to prevent
@@ -110,6 +111,8 @@ def _table(name: str) -> str:
 
     Args:
         name: Table name (must be in VALID_GRAPH_TABLES)
+        prefix: Override the module-level prefix. Pass engine._schema_prefix
+                to get per-instance isolation instead of the process global.
 
     Returns:
         Schema-qualified table name (e.g., "Graph_KG.nodes")
@@ -117,11 +120,10 @@ def _table(name: str) -> str:
     Raises:
         ValueError: If name is not in the allowlist
     """
-    # Validate against allowlist - raises ValueError if invalid
     validate_table_name(name)
-
-    if _schema_prefix:
-        return f"{_schema_prefix}.{name}"
+    p = prefix if prefix is not None else _schema_prefix
+    if p:
+        return f"{p}.{name}"
     return name
 
 
@@ -171,6 +173,8 @@ class SQLQuery(BaseModel):
     query_metadata: QueryMetadata = Field(default_factory=QueryMetadata)
     is_transactional: bool = False
     var_length_paths: Optional[List[dict]] = None
+    # Mapping from SQL-safe column alias → desired Cypher column name, for renaming after execution.
+    column_name_map: Dict[str, str] = Field(default_factory=dict)
     # Parallel list to the result columns: each entry is "scalar", "node", or "relationship".
     # Consumed by the Bolt server to emit correct PackStream struct tags (TAG_NODE / TAG_RELATIONSHIP).
     bolt_column_types: List[str] = Field(default_factory=list)
@@ -204,6 +208,14 @@ class TranslationContext:
         )
         self.path_edge_aliases: Dict[str, List[str]] = (
             {} if parent is None else parent.path_edge_aliases.copy()
+        )
+        # Maps (pattern_id, relationship_index) → SQL alias for capturing anon rels in named paths
+        self.pattern_rel_aliases: Dict[tuple, str] = (
+            {} if parent is None else parent.pattern_rel_aliases.copy()
+        )
+        # Maps relationship object id() → SQL alias for anonymous relationship lookup
+        self.rel_obj_aliases: Dict[int, str] = (
+            {} if parent is None else parent.rel_obj_aliases.copy()
         )
         self.var_length_paths: List[dict] = (
             [] if parent is None else parent.var_length_paths
@@ -248,6 +260,22 @@ class TranslationContext:
         self.mapped_node_aliases: Dict[str, dict] = (
             {} if parent is None else parent.mapped_node_aliases.copy()
         )
+        # Maps SQL-safe column alias → Cypher expression text for post-execution column renaming.
+        self.column_name_map: Dict[str, str] = (
+            {} if parent is None else parent.column_name_map
+        )
+        # OPTIONAL MATCH null-row fallback: when set, the generated SQL gains a
+        # UNION ALL branch that emits one null row when the label has no nodes.
+        # List of (label_value, param_placeholder) tuples — one per optional label constraint.
+        self.optional_null_row_labels: List[tuple] = []
+        # Parallel list of SQL values for the null row, one per select item.
+        self.optional_null_row_items: List[str] = []
+        # Variable type tracking for semantic validation.
+        # Maps variable name → "node" | "relationship" | "scalar"
+        # Used to enforce type consistency and detect VariableTypeConflict/VariableAlreadyBound errors.
+        self.variable_types: Dict[str, str] = (
+            {} if parent is None else parent.variable_types.copy()
+        )
 
     def next_alias(self, prefix: str = "t") -> str:
         alias = f"{prefix}{self._alias_counter}"
@@ -258,6 +286,28 @@ class TranslationContext:
         if variable not in self.variable_aliases:
             self.variable_aliases[variable] = self.next_alias(prefix)
         return self.variable_aliases[variable]
+
+    def bind_variable_type(self, variable: str, var_type: str) -> None:
+        """Track variable type and validate no type conflicts.
+
+        Args:
+            variable: Cypher variable name
+            var_type: One of "node", "relationship", or "scalar"
+
+        Raises:
+            CypherParseError: If variable is rebound to a different type
+        """
+        if not variable:
+            return
+        if variable in self.variable_types:
+            existing_type = self.variable_types[variable]
+            if existing_type != var_type:
+                raise CypherParseError(
+                    f"VariableTypeConflict: variable '{variable}' is bound as "
+                    f"{existing_type!r}, cannot rebind as {var_type!r}"
+                )
+        else:
+            self.variable_types[variable] = var_type
 
     def add_select_param(self, value: Any) -> str:
         self.select_params.append(value)
@@ -323,8 +373,20 @@ class TranslationContext:
         if expanded_joins:
             parts.extend(expanded_joins)
         if self.where_conditions:
-            ordered = sorted(self.where_conditions, key=self._predicate_cost)
-            parts.append(f"WHERE {' AND '.join(ordered)}")
+            # Pair each condition with its param slice so sorting keeps params aligned.
+            wp = list(self.where_params)
+            offset = 0
+            paired = []
+            for cond in self.where_conditions:
+                n = cond.count("?")
+                paired.append((cond, wp[offset : offset + n]))
+                offset += n
+            paired.sort(key=lambda x: self._predicate_cost(x[0]))
+            ordered_conds = [p[0] for p in paired]
+            ordered_where_params = [v for p in paired for v in p[1]]
+            parts.append(f"WHERE {' AND '.join(ordered_conds)}")
+        else:
+            ordered_where_params = list(self.where_params)
         if self.group_by_items:
             parts.append(f"GROUP BY {', '.join(self.group_by_items)}")
         if self.having_conditions:
@@ -333,12 +395,34 @@ class TranslationContext:
         params = (
             (self.select_params if not select_override else [])
             + self.join_params
-            + self.where_params
+            + ordered_where_params
         )
         return sql, params
 
     def add_dml(self, sql: str, params: List[Any]):
         self.dml_statements.append((sql, params))
+
+    def build_dml_subquery(self, select_override: str) -> tuple[str, str, List[Any]]:
+        """Build a SELECT subquery for use in DML, returning (cte_prefix, select_sql, params).
+
+        When variable_aliases reference StageN CTEs (set after a WITH clause),
+        cte_prefix is a 'WITH ...' string that must precede the DML verb.
+        Callers assemble as: f"{cte_prefix}{dml_verb} {target} {select_sql}"
+        For DELETE WHERE IN, use: f"{cte_prefix}DELETE FROM t WHERE c IN ({select_sql})"
+        When no stages exist, cte_prefix is empty string.
+        """
+        sql, params = self.build_stage_sql(select_override=select_override)
+        all_ctes = [
+            c
+            for c in getattr(self, "cte_clauses", [])
+            if not any(td in c for td in self.temporal_derived)
+        ] + self.stages
+        if all_ctes:
+            cte_prefix = "WITH " + ",\n".join(all_ctes) + "\n"
+            params = list(self.all_stage_params) + list(params)
+        else:
+            cte_prefix = ""
+        return cte_prefix, sql, params
 
 
 def translate_procedure_call(
@@ -1148,9 +1232,144 @@ def _to_sql_handle_foreach(clause, context: TranslationContext, metadata) -> boo
     return True
 
 
-def _to_sql_handle_with(part, context: TranslationContext, i: int) -> None:
+def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=None) -> None:
     translate_with_clause(part.with_clause, context)
+
+    # Preprocess ORDER BY items for the WITH clause (before build_stage_sql so joins are included).
+    # For alias-based ORDER BY (e.g. WITH n.name AS prop ORDER BY prop), the alias is not yet
+    # resolvable as a variable — emit it as a bare column name for the subquery wrapper to resolve.
+    order_by_items = []
+    with_aliases = {
+        (item.alias or (item.expression.name if isinstance(item.expression, ast.Variable) else None))
+        for item in part.with_clause.items
+    } - {None}
+    # Map (variable, property_name) -> alias for PropertyReference WITH projections.
+    # ORDER BY a.name after WITH DISTINCT a.name AS name should use alias 'name', not add a new JOIN.
+    prop_alias_map: dict = {}
+    for wi in part.with_clause.items:
+        if wi.alias and isinstance(wi.expression, ast.PropertyReference):
+            prop_alias_map[(wi.expression.variable, wi.expression.property_name)] = wi.alias
+    # sort_projections: list of (alias, sql_expr) for complex ORDER BY expressions that
+    # need to be projected into the inner SELECT so the outer ORDER BY can reference them.
+    sort_projections: list = []
+    if part.with_clause.order_by_clause:
+        for item in part.with_clause.order_by_clause.items:
+            direction = "ASC" if item.ascending else "DESC"
+            # If ORDER BY expression is a PropertyReference projected as a WITH alias, use the alias.
+            # This avoids adding a second JOIN that would break DISTINCT semantics.
+            if isinstance(item.expression, ast.PropertyReference):
+                _pk = (item.expression.variable, item.expression.property_name)
+                if _pk in prop_alias_map:
+                    col = _safe_alias(prop_alias_map[_pk])
+                    order_by_items.append(
+                        f"CASE WHEN ISNUMERIC({col}) = 1 THEN CAST({col} AS DOUBLE) END {direction}, {col} {direction}"
+                    )
+                    continue
+            # If the expression is a variable that matches a WITH alias, emit as bare column name
+            # (but quote it if it's a SQL reserved word, same as the SELECT alias)
+            if isinstance(item.expression, ast.Variable) and item.expression.name in with_aliases:
+                col = _safe_alias(item.expression.name)
+                # Emit numeric-aware sort: numeric values sort by DOUBLE, strings by VARCHAR.
+                # CASE WHEN ISNUMERIC(x)=1 THEN CAST(x AS DOUBLE) END returns NULL for strings
+                # (NULLs sort last in ASC, first in DESC — both correct for mixed-type data).
+                order_by_items.append(
+                    f"CASE WHEN ISNUMERIC({col}) = 1 THEN CAST({col} AS DOUBLE) END {direction}, {col} {direction}"
+                )
+            else:
+                try:
+                    # Use segment="inline" so numeric literals become inline constants.
+                    # Property references add JOINs to context (join_params) as needed.
+                    expr = translate_expression(item.expression, context, segment="inline")
+                    # If the expression references JOIN aliases (p\d+.val), it cannot be used
+                    # directly in ORDER BY on the outer subquery — project it as a sort column.
+                    import re as _re_ob
+                    if _re_ob.search(r'\bp\d+\.val\b', expr):
+                        sort_alias = f"__sort{len(sort_projections)}"
+                        sort_projections.append((sort_alias, expr))
+                        order_by_items.append(f"{sort_alias} {direction}")
+                    else:
+                        order_by_items.append(f"{expr} {direction}")
+                except Exception:
+                    pass
+
     sql, stage_params = context.build_stage_sql(part.with_clause.distinct)
+
+    # Inject sort projection columns into the inner SELECT if any complex ORDER BY expressions exist.
+    if sort_projections:
+        # The sql is "SELECT col1, col2, ... FROM ..." — inject sort columns after SELECT list.
+        # Find the first FROM (not inside a subquery) to insert sort columns before it.
+        for sort_alias, sort_expr in sort_projections:
+            # Inject into SELECT: "SELECT ..., (sort_expr) AS sort_alias\nFROM ..."
+            # Match the first \nFROM or " FROM " at the top level
+            _from_pat = _re_ob.search(r'\nFROM ', sql)
+            if _from_pat:
+                insert_at = _from_pat.start()
+                sql = sql[:insert_at] + f", ({sort_expr}) AS {sort_alias}" + sql[insert_at:]
+            else:
+                # Fallback: append to SELECT line
+                sql = sql + f", ({sort_expr}) AS {sort_alias}"
+
+    # Apply ORDER BY, SKIP, LIMIT from the WITH clause (if present).
+    # IRIS does not allow ORDER BY directly in a CTE body — it must be inside a subquery wrapper.
+    limit = _resolve_pagination_value(part.with_clause.limit, context)
+    skip = _resolve_pagination_value(part.with_clause.skip, context)
+
+    if order_by_items or limit is not None or skip is not None:
+        has_join = "\nJOIN " in sql or " JOIN " in sql
+
+        if limit is not None and skip is not None:
+            # SKIP+LIMIT: ROW_NUMBER subquery (no FETCH FIRST, no ORDER BY in CTE body)
+            if order_by_items:
+                inner = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
+            else:
+                inner = sql
+            sql = (
+                f"SELECT * FROM (\n"
+                f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({inner}) __q\n"
+                f") __paged WHERE __rn > {skip} AND __rn <= {skip + limit}"
+            )
+        elif limit is not None:
+            if order_by_items:
+                # Need subquery to hold ORDER BY + TOP together
+                inner = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
+                head, sep, rest = inner.partition("SELECT ")
+                if rest[:9].upper().startswith("DISTINCT "):
+                    rest = "DISTINCT " + f"TOP {limit} " + rest[9:]
+                else:
+                    rest = f"TOP {limit} " + rest
+                sql = head + sep + rest
+            elif has_join:
+                # JOIN CTE: inject TOP to avoid qaqpre FETCH FIRST crash
+                head, sep, rest = sql.partition("SELECT ")
+                if rest[:9].upper().startswith("DISTINCT "):
+                    rest = "DISTINCT " + f"TOP {limit} " + rest[9:]
+                else:
+                    rest = f"TOP {limit} " + rest
+                sql = head + sep + rest
+            else:
+                sql += f"\nFETCH FIRST {limit} ROWS ONLY"
+        elif skip is not None:
+            # SKIP only
+            if order_by_items:
+                inner = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
+                sql = (
+                    f"SELECT * FROM (\n"
+                    f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({inner}) __q\n"
+                    f") __paged WHERE __rn > {skip}"
+                )
+            elif has_join:
+                # ROW_NUMBER on JOIN query to avoid OFFSET in CTE
+                sql = (
+                    f"SELECT * FROM (\n"
+                    f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({sql}) __q\n"
+                    f") __paged WHERE __rn > {skip}"
+                )
+            else:
+                sql += f"\nOFFSET {skip} ROWS"
+        elif order_by_items:
+            # ORDER BY only (no LIMIT/SKIP): wrap to keep ORDER BY out of CTE body
+            sql = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
+
     context.all_stage_params.extend(stage_params)
     context.stages.append(f"Stage{i + 1} AS (\n{sql}\n)")
     context.having_conditions = []
@@ -1168,6 +1387,21 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int) -> None:
             )
             if alias:
                 new_aliases[alias] = new_stage
+                # Track the type of the variable in WITH clause.
+                # If it's a reference to an existing variable, preserve its type.
+                # Otherwise, it's a scalar (function result, literal, etc.)
+                if isinstance(item.expression, ast.Variable):
+                    # Passthrough: preserve the bound variable's type
+                    # (from MATCH, previous WITH, etc.)
+                    existing_type = context.variable_types.get(item.expression.name)
+                    if existing_type:
+                        context.bind_variable_type(alias, existing_type)
+                    else:
+                        # If not yet typed, assume node (safest for graph ops)
+                        context.bind_variable_type(alias, "node")
+                else:
+                    # Everything else is scalar: aggregation, function call, literal, etc.
+                    context.bind_variable_type(alias, "scalar")
             if isinstance(item.expression, ast.AggregationFunction) and alias:
                 context.scalar_variables.add(alias)
             elif alias and not isinstance(item.expression, ast.Variable):
@@ -1243,25 +1477,158 @@ def _tts_process_parts(cypher_query, context, metadata):
             if isinstance(clause, ast.WhereClause):
                 context.pending_where = clause.expression
                 break
-        for clause in part.clauses:
-            if isinstance(clause, ast.MatchClause):
-                translate_match_clause(clause, context, metadata)
-            elif isinstance(clause, ast.UnwindClause):
-                translate_unwind_clause(clause, context)
-            elif isinstance(clause, ast.SubqueryCall):
-                translate_subquery_call(clause, context, metadata)
-            elif isinstance(clause, ast.ForeachClause):
-                is_transactional = _to_sql_handle_foreach(clause, context, metadata) or is_transactional
-            elif isinstance(clause, ast.UpdatingClause):
-                is_transactional = True
-                translate_updating_clause(clause, context, metadata)
-            elif isinstance(clause, ast.WhereClause):
-                translate_where_clause(clause, context)
+        # Check for UNWIND+UPDATE pattern: when a literal-list UNWIND feeds updating clauses,
+        # expand Python-side (like FOREACH) so each list element gets its own DML set.
+        unwind_clause = next(
+            (c for c in part.clauses if isinstance(c, ast.UnwindClause)), None
+        )
+        has_updating = any(isinstance(c, ast.UpdatingClause) for c in part.clauses)
+        unwind_literals = None
+        if (
+            unwind_clause is not None
+            and has_updating
+            and isinstance(unwind_clause.expression, ast.Literal)
+            and isinstance(unwind_clause.expression.value, list)
+        ):
+            unwind_literals = unwind_clause.expression.value
+        elif (
+            unwind_clause is not None
+            and has_updating
+            and isinstance(unwind_clause.expression, ast.Variable)
+            and unwind_clause.expression.name in context.input_params
+            and isinstance(context.input_params[unwind_clause.expression.name], list)
+        ):
+            unwind_literals = [
+                ast.Literal(v) if not isinstance(v, ast.Literal) else v
+                for v in context.input_params[unwind_clause.expression.name]
+            ]
+
+        if unwind_literals is not None:
+            # UNWIND literal list + updating clauses → expand Python-side, one DML set per element
+            is_transactional = True
+            aliases_before = dict(context.variable_aliases)
+            last_iter_aliases = dict(context.variable_aliases)
+            # Accumulate created node IDs per variable for use in RETURN
+            if not hasattr(context, "_unwind_create_node_ids"):
+                context._unwind_create_node_ids = {}  # var_name → [uuid, ...]
+            for item in unwind_literals:
+                item_val = item.value if isinstance(item, ast.Literal) else item
+                # Start each iteration from the pre-loop state so new vars don't accumulate
+                context.variable_aliases = dict(aliases_before)
+                context.variable_aliases[unwind_clause.alias] = "__foreach_literal__"
+                context.foreach_literals = getattr(context, "foreach_literals", {})
+                context.foreach_literals[unwind_clause.alias] = item_val
+                for clause in part.clauses:
+                    if isinstance(clause, ast.UnwindClause):
+                        continue  # handled by foreach expansion above
+                    elif isinstance(clause, ast.UpdatingClause):
+                        translate_updating_clause(clause, context, metadata)
+                    elif isinstance(clause, ast.WhereClause):
+                        translate_where_clause(clause, context)
+                # Collect node IDs created in this iteration
+                for var_name in set(context.variable_aliases) - set(aliases_before):
+                    nid = context.input_params.get(f"__create_id_{var_name}")
+                    if nid:
+                        context._unwind_create_node_ids.setdefault(var_name, []).append(nid)
+                # Collect relationship identities created in this iteration
+                if not hasattr(context, "_unwind_create_rel_ids"):
+                    context._unwind_create_rel_ids = {}  # var_name → [(s,p,o), ...]
+                for var_name in set(context.variable_aliases) - set(aliases_before):
+                    edge_key = context.input_params.get(f"__create_edge_{var_name}")
+                    if edge_key:
+                        context._unwind_create_rel_ids.setdefault(var_name, []).append(edge_key)
+                last_iter_aliases = dict(context.variable_aliases)
+            if hasattr(context, "foreach_literals"):
+                context.foreach_literals.pop(unwind_clause.alias, None)
+            # After loop: keep vars created by updating clauses (from last iteration)
+            context.variable_aliases = last_iter_aliases
+            context.variable_aliases.pop(unwind_clause.alias, None)
+            # Still need to add the UNWIND to context for RETURN clause access
+            translate_unwind_clause(unwind_clause, context)
+        else:
+            for clause in part.clauses:
+                if isinstance(clause, ast.MatchClause):
+                    translate_match_clause(clause, context, metadata)
+                elif isinstance(clause, ast.UnwindClause):
+                    translate_unwind_clause(clause, context)
+                elif isinstance(clause, ast.SubqueryCall):
+                    translate_subquery_call(clause, context, metadata)
+                elif isinstance(clause, ast.ForeachClause):
+                    is_transactional = _to_sql_handle_foreach(clause, context, metadata) or is_transactional
+                elif isinstance(clause, ast.UpdatingClause):
+                    is_transactional = True
+                    translate_updating_clause(clause, context, metadata)
+                elif isinstance(clause, ast.WhereClause):
+                    translate_where_clause(clause, context)
         if part.procedure_call is not None:
             translate_procedure_call(part.procedure_call, context)
         if part.with_clause:
+            # If UNWIND+CREATE relationship expansion ran, reset context to correct single-table
+            # structure before building the WITH stage (avoids 5-JOIN spurious structure).
+            _apply_unwind_create_context_reset(context)
             _to_sql_handle_with(part, context, i)
     return is_transactional
+
+
+def _apply_unwind_create_context_reset(context):
+    """Reset FROM/JOIN/WHERE to correct single-table structure after UNWIND+CREATE expansion.
+
+    Called before translating a WITH clause or RETURN that follows UNWIND+CREATE.
+    Prevents the accumulated per-iteration JOIN structure from leaking into CTEs.
+    """
+    unwind_node_ids = getattr(context, "_unwind_create_node_ids", {})
+    if unwind_node_ids:
+        context.select_items, context.select_params = [], []
+        context.join_clauses, context.join_params = [], []
+        context.where_conditions, context.where_params = [], []
+        first_node_alias = None
+        for var_name, ids in unwind_node_ids.items():
+            if not ids:
+                continue
+            node_alias = context.next_alias("n")
+            if first_node_alias is None:
+                first_node_alias = node_alias
+            context.variable_aliases[var_name] = node_alias
+            placeholders = ",".join(["?"] * len(ids))
+            context.where_conditions.append(f"{node_alias}.node_id IN ({placeholders})")
+            context.where_params.extend(ids)
+        if first_node_alias is not None:
+            context.from_clauses = [f"{_table('nodes')} {first_node_alias}"]
+            for var_name, ids in list(unwind_node_ids.items())[1:]:
+                if not ids:
+                    continue
+                na = context.variable_aliases[var_name]
+                context.from_clauses.append(f"{_table('nodes')} {na}")
+        return
+
+    unwind_rel_ids = getattr(context, "_unwind_create_rel_ids", {})
+    if unwind_rel_ids:
+        context.select_items, context.select_params = [], []
+        context.join_clauses, context.join_params = [], []
+        context.where_conditions, context.where_params = [], []
+        first_edge_alias = None
+        for var_name, triples in unwind_rel_ids.items():
+            if not triples:
+                continue
+            e_alias = context.next_alias("e")
+            if first_edge_alias is None:
+                first_edge_alias = e_alias
+            context.variable_aliases[var_name] = e_alias
+            conds = []
+            for s_id, p_val, o_id in triples:
+                conds.append(
+                    f"({e_alias}.s = {context.add_where_param(s_id)}"
+                    f" AND {e_alias}.p = {context.add_where_param(p_val)}"
+                    f" AND {e_alias}.o_id = {context.add_where_param(o_id)})"
+                )
+            context.where_conditions.append("(" + " OR ".join(conds) + ")")
+        if first_edge_alias is not None:
+            context.from_clauses = [f"{_table('rdf_edges')} {first_edge_alias}"]
+            for var_name in list(unwind_rel_ids.keys())[1:]:
+                if not unwind_rel_ids[var_name]:
+                    continue
+                ea = context.variable_aliases[var_name]
+                context.from_clauses.append(f"{_table('rdf_edges')} {ea}")
 
 
 def _tts_finalize_context(cypher_query, context):
@@ -1274,14 +1641,30 @@ def _tts_finalize_context(cypher_query, context):
         if cypher_query.query_parts
         else False
     )
-    if context.stages and last_part_had_with:
+    # A WITH clause in any query part (not just the last) may have produced stages.
+    any_part_had_with = any(
+        qp.with_clause is not None for qp in cypher_query.query_parts
+    ) if cypher_query.query_parts else False
+    if context.stages and (last_part_had_with or any_part_had_with):
+        # Preserve UNWIND CROSS JOIN JSON_TABLE clauses before reset — they were
+        # added by translate_unwind_clause and must survive the stage reset.
+        unwind_joins = [
+            j for j in context.join_clauses
+            if "JSON_TABLE" in j and j.strip().startswith("CROSS JOIN")
+        ]
         context.select_items, context.select_params = [], []
         context.from_clauses, context.join_clauses, context.join_params = (
             [f"Stage{len(context.stages)}"],
-            [],
+            list(unwind_joins),
             [],
         )
         context.where_conditions, context.where_params = [], []
+
+    # UNWIND+CREATE+RETURN: foreach expansion created nodes/relationships and tracked their IDs.
+    # Reset context to a fresh single-table scan filtered to the collected IDs.
+    # Skip when any query part had a WITH — the Stage CTE already handles scoping.
+    if cypher_query.return_clause and not any_part_had_with:
+        _apply_unwind_create_context_reset(context)
 
     if cypher_query.return_clause:
          translate_return_clause(cypher_query.return_clause, context)
@@ -1322,6 +1705,23 @@ def _tts_transactional_result(cypher_query, context, metadata, order_by_items):
     if cypher_query.return_clause:
         sql, p = context.build_stage_sql(cypher_query.return_clause.distinct)
         sql = apply_pagination(sql, cypher_query, context, order_by_items)
+    # OPTIONAL MATCH null-row fallback for RETURN clause in transactional queries.
+    optional_union_sql = ""
+    optional_extra_params: List[Any] = []
+    if sql is not None and context.optional_null_row_labels and context.optional_null_row_items:
+        null_items = list(context.optional_null_row_items)
+        while len(null_items) < len(context.select_items):
+            null_items.append("NULL")
+        null_select = ", ".join(null_items[:len(context.select_items)])
+        not_exists_parts = []
+        for label in context.optional_null_row_labels:
+            not_exists_parts.append(
+                f"NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE label = ?)"
+            )
+            optional_extra_params.append(label)
+        where_clause = " AND ".join(not_exists_parts)
+        optional_union_sql = f"\nUNION ALL\nSELECT {null_select} WHERE {where_clause}"
+
     all_ctes = [
         c
         for c in getattr(context, "cte_clauses", [])
@@ -1331,9 +1731,13 @@ def _tts_transactional_result(cypher_query, context, metadata, order_by_items):
         sql, all_ctes = _demote_agg_stages_to_subqueries(sql, all_ctes)
         if all_ctes:
             sql = "WITH " + ",\n".join(all_ctes) + "\n" + sql
-        all_params.append(context.all_stage_params + p)
+        if optional_union_sql:
+            sql += optional_union_sql
+        all_params.append(context.all_stage_params + p + optional_extra_params)
     elif sql is not None:
-         all_params.append(p)
+        if optional_union_sql:
+            sql += optional_union_sql
+        all_params.append(p + optional_extra_params)
     if sql is not None:
         stmts.append(sql)
     return SQLQuery(
@@ -1341,6 +1745,7 @@ def _tts_transactional_result(cypher_query, context, metadata, order_by_items):
         parameters=all_params,
         query_metadata=metadata,
         is_transactional=True,
+        column_name_map=dict(context.column_name_map),
     )
 
 
@@ -1432,6 +1837,27 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
 
     _tts_collect_path_funcs(cypher_query, vl)
 
+    # OPTIONAL MATCH null-row fallback: append UNION ALL SELECT <nulls> WHERE NOT EXISTS
+    # This handles the Cypher semantics: if the optional pattern matches 0 rows, yield
+    # one null row instead of 0 rows.
+    optional_union_sql = ""
+    optional_extra_params: List[Any] = []
+    if context.optional_null_row_labels and context.optional_null_row_items:
+        null_items = context.optional_null_row_items
+        # Build the null-row SELECT: pad with NULLs if fewer items than select columns
+        while len(null_items) < len(context.select_items):
+            null_items.append("NULL")
+        null_select = ", ".join(null_items[:len(context.select_items)])
+        # NOT EXISTS check: all label constraints must have 0 matching nodes
+        not_exists_parts = []
+        for label in context.optional_null_row_labels:
+            not_exists_parts.append(
+                f"NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE label = ?)"
+            )
+            optional_extra_params.append(label)
+        where_clause = " AND ".join(not_exists_parts)
+        optional_union_sql = f"\nUNION ALL\nSELECT {null_select} WHERE {where_clause}"
+
     all_ctes = [
         c
         for c in getattr(context, "cte_clauses", [])
@@ -1441,19 +1867,26 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
         sql, all_ctes = _demote_agg_stages_to_subqueries(sql, all_ctes)
         if all_ctes:
             sql = "WITH " + ",\n".join(all_ctes) + "\n" + sql
+        if optional_union_sql:
+            sql += optional_union_sql
         return SQLQuery(
             sql=sql,
-            parameters=[context.all_stage_params + p],
+            parameters=[context.all_stage_params + p + optional_extra_params],
             query_metadata=metadata,
             var_length_paths=vl,
             bolt_column_types=_build_bolt_column_types(cypher_query, context),
+            column_name_map=dict(context.column_name_map),
         )
 
     sql = _maybe_split_deep_joins(sql, p, context)
+    if optional_union_sql:
+        sql += optional_union_sql
 
     return SQLQuery(
-        sql=sql, parameters=[p], query_metadata=metadata, var_length_paths=vl,
+        sql=sql, parameters=[p + optional_extra_params], query_metadata=metadata,
+        var_length_paths=vl,
         bolt_column_types=_build_bolt_column_types(cypher_query, context),
+        column_name_map=dict(context.column_name_map),
     )
 
 
@@ -1550,27 +1983,46 @@ def apply_pagination(
             sql = sql.rstrip() + "\nFROM (SELECT 1) __dual"
     # Build-106 workaround: IRIS 2026.3.0AI build 106 SIGSEGVs in %qaqpre when a
     # multi-table JOIN is combined with `FETCH FIRST n ROWS ONLY` on VARCHAR-keyed
-    # tables (the ivg schema). `SELECT TOP n` does NOT crash. When the engine has
-    # detected the bug (engine._fetch_first_unsafe, set by a connect-time probe) and
-    # there is a LIMIT with NO SKIP (TOP cannot express OFFSET), emit TOP instead.
+    # tables (the ivg schema). `SELECT TOP n` does NOT crash for LIMIT-only queries.
+    # For SKIP+LIMIT, wrap in a ROW_NUMBER subquery (also avoids FETCH FIRST).
     engine = getattr(context, "_engine", None)
     fetch_first_unsafe = bool(getattr(engine, "_fetch_first_unsafe", False))
-    if (
-        limit is not None
-        and skip is None
-        and fetch_first_unsafe
-        and sql.lstrip().upper().startswith("SELECT ")
-        and " TOP " not in sql.split("\n", 1)[0].upper()
-    ):
-        # Inject `TOP n` right after the leading SELECT (and after DISTINCT if present).
-        head, sep, rest = sql.partition("SELECT ")
-        if rest[:9].upper().startswith("DISTINCT "):
-            rest = "DISTINCT " + f"TOP {limit} " + rest[9:]
-        else:
-            rest = f"TOP {limit} " + rest
-        return head + sep + rest
+    if fetch_first_unsafe and sql.lstrip().upper().startswith("SELECT "):
+        if limit is not None and skip is not None:
+            # ROW_NUMBER subquery handles SKIP+LIMIT without FETCH FIRST/OFFSET
+            sql = (
+                f"SELECT * FROM (\n"
+                f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({sql}) __q\n"
+                f") __paged WHERE __rn > {skip} AND __rn <= {skip + limit}"
+            )
+            return sql
+        if limit is not None and " TOP " not in sql.split("\n", 1)[0].upper():
+            # LIMIT only: inject TOP (no OFFSET needed)
+            head, sep, rest = sql.partition("SELECT ")
+            if rest[:9].upper().startswith("DISTINCT "):
+                rest = "DISTINCT " + f"TOP {limit} " + rest[9:]
+            else:
+                rest = f"TOP {limit} " + rest
+            return head + sep + rest
+        if skip is not None:
+            # SKIP only with unsafe FETCH FIRST: use ROW_NUMBER
+            sql = (
+                f"SELECT * FROM (\n"
+                f"SELECT ROW_NUMBER() OVER() AS __rn, __q.* FROM ({sql}) __q\n"
+                f") __paged WHERE __rn > {skip}"
+            )
+            return sql
     if limit is not None:
-        sql += f"\nFETCH FIRST {limit} ROWS ONLY"
+        if limit == 0 and sql.lstrip().upper().startswith("SELECT "):
+            # FETCH FIRST 0 ROWS ONLY hangs on IRIS 2026.x builds; use TOP 0 instead
+            head, sep, rest = sql.partition("SELECT ")
+            if rest[:9].upper().startswith("DISTINCT "):
+                rest = "DISTINCT TOP 0 " + rest[9:]
+            else:
+                rest = "TOP 0 " + rest
+            sql = head + sep + rest
+        else:
+            sql += f"\nFETCH FIRST {limit} ROWS ONLY"
     if skip is not None:
         sql += f"\nOFFSET {skip}"
     return sql
@@ -1600,6 +2052,8 @@ def translate_unwind_clause(unwind, context):
             context.join_params[-1] = json.dumps(val)
     alias = context.register_variable(unwind.alias, prefix="u")
     context.scalar_variables.add(unwind.alias)
+    # UNWIND binds a scalar variable (array element)
+    context.bind_variable_type(unwind.alias, "scalar")
     json_table_sql = f"JSON_TABLE({expr}, '$[*]' COLUMNS ({unwind.alias} VARCHAR(1000) PATH '$')) {alias}"
     if context.from_clauses:
         context.join_clauses.append(f"CROSS JOIN {json_table_sql}")
@@ -1607,14 +2061,56 @@ def translate_unwind_clause(unwind, context):
         context.from_clauses.append(json_table_sql)
 
 
+def _extract_literal_value(v):
+    """Recursively extract Python values from Literal/list/dict structures.
+
+    Handles nested Literals within lists and dicts.
+    """
+    if isinstance(v, ast.Literal):
+        return _extract_literal_value(v.value)
+    elif isinstance(v, list):
+        return [_extract_literal_value(item) for item in v]
+    elif isinstance(v, dict):
+        return {k: _extract_literal_value(val) for k, val in v.items()}
+    else:
+        return v
+
+
+_TEMPORAL_CREATE_FNS = frozenset({"date", "time", "localtime", "localdatetime", "datetime", "duration"})
+
+
 def _create_resolve_prop_value(v, context):
     if isinstance(v, ast.Literal):
-        return v.value
+        val = _extract_literal_value(v)
+        # JSON-encode lists and dicts for storage in rdf_props
+        if isinstance(val, (list, dict)):
+            return json.dumps(val)
+        return val
     if isinstance(v, ast.Variable) and v.name in context.input_params:
-        return context.input_params[v.name]
+        val = context.input_params[v.name]
+        # JSON-encode lists and dicts for storage in rdf_props
+        if isinstance(val, (list, dict)):
+            return json.dumps(val)
+        return val
     if isinstance(v, ast.Variable) and getattr(context, "foreach_literals", {}).get(v.name) is not None:
         raw = context.foreach_literals[v.name]
-        return raw.value if isinstance(raw, ast.Literal) else raw
+        val = _extract_literal_value(raw)
+        # JSON-encode lists and dicts for storage in rdf_props
+        if isinstance(val, (list, dict)):
+            return json.dumps(val)
+        return val
+    if isinstance(v, ast.Variable) and v.name not in context.variable_aliases:
+        raise SyntaxError(f"Undefined variable: {v.name}")
+    # Temporal constructors (date(), time(), datetime(), etc.) in property expressions:
+    # translate to their ISO string value for storage in rdf_props.
+    if isinstance(v, ast.FunctionCall) and v.function_name.lower() in _TEMPORAL_CREATE_FNS:
+        try:
+            sql_val = translate_expression(v, context, segment="select")
+            # sql_val is a SQL string literal like '1910-05-06' — strip the quotes
+            if isinstance(sql_val, str) and sql_val.startswith("'") and sql_val.endswith("'"):
+                return sql_val[1:-1]
+        except Exception:
+            pass
     return v
 
 
@@ -1631,23 +2127,35 @@ def _create_node_literal(node, node_id_expr, context):
         )
     for k, v in node.properties.items():
         val = _create_resolve_prop_value(v, context)
-        context.add_dml(
-            f'INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = ? AND "key" = ?)',
-            [node_id, k, val, node_id, k],
-        )
+        if isinstance(val, ast.Variable):
+            # Property value is a bound stage variable — use SELECT-based INSERT
+            var_alias = context.variable_aliases[val.name]
+            col_expr = f"{var_alias}.{val.name}"
+            cte, sql, p = context.build_dml_subquery(
+                select_override=f"SELECT ?, ?, CAST({col_expr} AS VARCHAR)"
+            )
+            context.add_dml(
+                f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) {sql} WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = ? AND "key" = ?)',
+                [node_id, k] + p + [node_id, k],
+            )
+        else:
+            context.add_dml(
+                f'INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = ? AND "key" = ?)',
+                [node_id, k, val, node_id, k],
+            )
 
 
 def _create_node_from_alias(node, node_id_expr, var_alias, context):
-    sql, p = context.build_stage_sql(
+    cte, sql, p = context.build_dml_subquery(
         select_override=f"SELECT {var_alias}.{node_id_expr.name} AS node_id"
     )
     context.add_dml(
-        f"INSERT INTO {_table('nodes')} (node_id) SELECT t.node_id FROM ({sql}) AS t WHERE NOT EXISTS (SELECT 1 FROM {_table('nodes')} WHERE node_id = t.node_id)",
+        f"{cte}INSERT INTO {_table('nodes')} (node_id) SELECT t.node_id FROM ({sql}) AS t WHERE NOT EXISTS (SELECT 1 FROM {_table('nodes')} WHERE node_id = t.node_id)",
         p,
     )
     for label in node.labels:
         context.add_dml(
-            f"INSERT INTO {_table('rdf_labels')} (s, label) SELECT t.node_id, ? FROM ({sql}) AS t WHERE NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE s = t.node_id AND label = ?)",
+            f"{cte}INSERT INTO {_table('rdf_labels')} (s, label) SELECT t.node_id, ? FROM ({sql}) AS t WHERE NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE s = t.node_id AND label = ?)",
             [label] + p + [label],
         )
 
@@ -1655,7 +2163,19 @@ def _create_node_from_alias(node, node_id_expr, var_alias, context):
 def _create_clause_node_entry(node, context):
     if node.variable and node.variable in context.variable_aliases:
         return
-    node_id_expr = node.properties.get("id") or node.properties.get("node_id")
+    _raw_id = node.properties.get("id") or node.properties.get("node_id")
+    # Only use the id/node_id property as the node identifier when it resolves to a string.
+    # Integer literals are user-defined property values, not IVG node identifiers.
+    node_id_expr = None
+    _id_is_user_property = False
+    if _raw_id is not None:
+        if isinstance(_raw_id, ast.Literal) and isinstance(_raw_id.value, str):
+            node_id_expr = _raw_id
+        elif isinstance(_raw_id, ast.Variable):
+            node_id_expr = _raw_id
+        else:
+            # Integer or other non-string literal: treat as a regular user property
+            _id_is_user_property = True
     if node_id_expr is None:
         import uuid as _uuid
         generated_id = str(_uuid.uuid4())
@@ -1672,7 +2192,7 @@ def _create_clause_node_entry(node, context):
         if not var_alias and node_id_expr.name in context.input_params:
             node_id_expr = ast.Literal(context.input_params[node_id_expr.name])
         elif not var_alias:
-            raise ValueError(f"Undefined: {node_id_expr.name}")
+            raise SyntaxError(f"Undefined variable: {node_id_expr.name}")
 
     if isinstance(node_id_expr, ast.Variable) and var_alias:
         _create_node_from_alias(node, node_id_expr, var_alias, context)
@@ -1680,6 +2200,11 @@ def _create_clause_node_entry(node, context):
         _create_node_literal(node, node_id_expr, context)
     if node.variable:
         context.register_variable(node.variable)
+        if _id_is_user_property:
+            # Track that this variable uses 'id' as a regular rdf_props entry, not node_id
+            if not hasattr(context, '_id_as_property_vars'):
+                context._id_as_property_vars = set()
+            context._id_as_property_vars.add(node.variable)
         if not context.from_clauses and isinstance(node_id_expr, ast.Literal):
             node_id_val = node_id_expr.value
             alias = context.variable_aliases[node.variable]
@@ -1709,18 +2234,47 @@ def _create_clause_resolve_node_id(id_expr, node, context):
 
 
 def _create_clause_relationship_entry(rel, i, pat, context):
-    source_node, target_node = pat.nodes[i], pat.nodes[i + 1]
+    left_node, right_node = pat.nodes[i], pat.nodes[i + 1]
+    # For INCOMING direction ((:A)<-[:R]-(:B)), the right node is the edge source.
+    if rel.direction == ast.Direction.INCOMING:
+        source_node, target_node = right_node, left_node
+    else:
+        source_node, target_node = left_node, right_node
+
     s_id_expr = source_node.properties.get("id") or source_node.properties.get("node_id")
     t_id_expr = target_node.properties.get("id") or target_node.properties.get("node_id")
+    if s_id_expr is not None and isinstance(s_id_expr, ast.Literal) and not isinstance(s_id_expr.value, str):
+        s_id_expr = None
+    if t_id_expr is not None and isinstance(t_id_expr, ast.Literal) and not isinstance(t_id_expr.value, str):
+        t_id_expr = None
 
     s_id = _create_clause_resolve_node_id(s_id_expr, source_node, context)
     t_id = _create_clause_resolve_node_id(t_id_expr, target_node, context)
     if s_id and t_id:
         for rt in rel.types:
-            context.add_dml(
-                f"INSERT INTO {_table('rdf_edges')} (s, p, o_id) VALUES (?, ?, ?)",
-                [s_id, rt, t_id],
-            )
+            rel_props_raw = {
+                k: (v.value if isinstance(v, ast.Literal) else
+                    context.foreach_literals.get(v.name)
+                    if isinstance(v, ast.Variable) and hasattr(context, "foreach_literals")
+                    else None)
+                for k, v in rel.properties.items()
+            }
+            # Exclude null values (null props are not stored per openCypher semantics)
+            rel_props = {k: v for k, v in rel_props_raw.items() if v is not None}
+            if rel_props:
+                import json as _json
+                # Store all values as strings — JSON_VALUE returns VARCHAR; ints stored
+                # as JSON numbers are returned as NULL by IRIS SQLUser.JSON_VALUE.
+                qualifiers_json = _json.dumps({k: str(v) for k, v in rel_props.items()})
+                context.add_dml(
+                    f"INSERT INTO {_table('rdf_edges')} (s, p, o_id, qualifiers) VALUES (?, ?, ?, ?)",
+                    [s_id, rt, t_id, qualifiers_json],
+                )
+            else:
+                context.add_dml(
+                    f"INSERT INTO {_table('rdf_edges')} (s, p, o_id) VALUES (?, ?, ?)",
+                    [s_id, rt, t_id],
+                )
     else:
         s_alias = (
             context.variable_aliases.get(source_node.variable)
@@ -1753,63 +2307,181 @@ def _create_clause_relationship_entry(rel, i, pat, context):
             )
         )
         for rt in rel.types:
-            sql, p = context.build_stage_sql(
+            cte, sql, p = context.build_dml_subquery(
                 select_override=f"SELECT {s_expr}, ?, {t_expr}"
             )
             context.add_dml(
-                f"INSERT INTO {_table('rdf_edges')} (s, p, o_id) {sql}",
+                f"{cte}INSERT INTO {_table('rdf_edges')} (s, p, o_id) {sql}",
                 s_p + [rt] + t_p + p,
             )
 
 
 def translate_create_clause(create, context, metadata):
     for pat in create.patterns:
+        # Validate before any DML: VariableAlreadyBound, syntax errors
+        is_relationship_pattern = bool(pat.relationships)
+        for node in pat.nodes:
+            if node.variable and node.variable in context.variable_aliases:
+                # VariableAlreadyBound: re-binding a known variable in CREATE is an error
+                # if it adds new labels/props, or if it appears as a standalone CREATE (no rel).
+                if node.labels or node.properties or not is_relationship_pattern:
+                    raise SyntaxError(
+                        f"VariableAlreadyBound: variable '{node.variable}' already bound"
+                    )
+        for rel in pat.relationships:
+            if rel.variable and rel.variable in context.variable_aliases:
+                raise SyntaxError(
+                    f"VariableAlreadyBound: variable '{rel.variable}' already bound"
+                )
+            if not rel.types:
+                raise SyntaxError("NoSingleRelationshipType: CREATE relationship must have exactly one type")
+            if len(rel.types) > 1:
+                raise SyntaxError("NoSingleRelationshipType: CREATE relationship must have exactly one type")
+            if rel.direction == ast.Direction.BOTH:
+                raise SyntaxError("RequiresDirectedRelationship: CREATE relationship must be directed")
+            if rel.variable_length is not None:
+                raise SyntaxError("CreatingVarLength: variable-length relationships cannot be used in CREATE")
         for node in pat.nodes:
             _create_clause_node_entry(node, context)
         for i, rel in enumerate(pat.relationships):
             _create_clause_relationship_entry(rel, i, pat, context)
+            if rel.variable:
+                _register_created_relationship(rel, i, pat, context)
+
+
+def _register_created_relationship(rel, i, pat, context):
+    """Register a named relationship created by CREATE so RETURN r works."""
+    left_node, right_node = pat.nodes[i], pat.nodes[i + 1]
+    if rel.direction == ast.Direction.INCOMING:
+        source_node, target_node = right_node, left_node
+    else:
+        source_node, target_node = left_node, right_node
+
+    def _node_id(node):
+        if node.variable:
+            nid = context.input_params.get(f"__create_id_{node.variable}")
+            if nid:
+                return nid
+            return context.input_params.get(node.variable)
+        return context.input_params.get(f"__create_id_anon_{id(node)}")
+
+    s_id = _node_id(source_node)
+    t_id = _node_id(target_node)
+    rel_type = rel.types[0] if rel.types else None
+    e_alias = context.register_variable(rel.variable, prefix="e")
+    if s_id and t_id and rel_type:
+        # Store identity for UNWIND+CREATE relationship tracking in _tts_finalize_context
+        if rel.variable:
+            context.input_params[f"__create_edge_{rel.variable}"] = (s_id, rel_type, t_id)
+        if not context.from_clauses:
+            context.from_clauses.append(f"{_table('rdf_edges')} {e_alias}")
+        else:
+            context.join_clauses.append(
+                f"JOIN {_table('rdf_edges')} {e_alias} ON "
+                f"{e_alias}.s = {context.add_join_param(s_id)}"
+                f" AND {e_alias}.p = {context.add_join_param(rel_type)}"
+                f" AND {e_alias}.o_id = {context.add_join_param(t_id)}"
+            )
+            return
+        context.where_conditions.append(
+            f"{e_alias}.s = {context.add_where_param(s_id)}"
+            f" AND {e_alias}.p = {context.add_where_param(rel_type)}"
+            f" AND {e_alias}.o_id = {context.add_where_param(t_id)}"
+        )
 
 
 def translate_delete_clause(delete, context, metadata):
     for var in delete.expressions:
         alias = context.variable_aliases.get(var.name)
         if not alias:
-            raise ValueError(f"Undefined: {var.name}")
-        subquery, subparams = context.build_stage_sql(
-            select_override=f"SELECT {alias}.node_id"
+            raise SyntaxError(f"Undefined variable: {var.name}")
+
+        # Detect whether the variable is a relationship (edge), taking into account
+        # variables promoted to a CTE stage via WITH.
+        is_edge_var = (
+            alias.startswith("e")
+            or var.name in getattr(context, "edge_stage_variables", set())
         )
+        # When alias is a CTE stage (e.g. "Stage1"), the node_id column is named
+        # after the variable (e.g. "n"), not "node_id".
+        stage_names = {s.split(" AS ")[0].strip() for s in getattr(context, "stages", [])}
+        is_stage_alias = alias in stage_names
+
+        if is_edge_var and is_stage_alias:
+            # Relationship variable promoted through WITH into a CTE stage.
+            # The Stage SELECT now includes __edge_<var>_s/p/o identity columns;
+            # use them to reconstruct the edge identity for deletion.
+            s_col = f"__edge_{var.name}_s"
+            p_col = f"__edge_{var.name}_p"
+            o_col = f"__edge_{var.name}_o"
+            cte_s, subquery_s, subparams_s = context.build_dml_subquery(
+                select_override=f"SELECT {alias}.{s_col}"
+            )
+            _, subquery_p, _ = context.build_dml_subquery(
+                select_override=f"SELECT {alias}.{p_col}"
+            )
+            _, subquery_o, _ = context.build_dml_subquery(
+                select_override=f"SELECT {alias}.{o_col}"
+            )
+            # All three calls return the same CTE and params (same Stage1 binding).
+            # The CTE appears once in the SQL; params are bound once.
+            context.add_dml(
+                f"{cte_s}DELETE FROM {_table('rdf_edges')} WHERE "
+                f"s IN ({subquery_s}) AND p IN ({subquery_p}) AND o_id IN ({subquery_o})",
+                subparams_s,
+            )
+            return
+
+        node_col = var.name if is_stage_alias else "node_id"
+        cte, subquery, subparams = context.build_dml_subquery(
+            select_override=f"SELECT {alias}.{node_col}"
+        )
+        # When a CTE is present, the subquery is a bare reference (no ?); params are CTE-only
+        # and used once. When no CTE, the subquery has its own ? for each IN clause.
+        dual_params = subparams if cte else subparams + subparams
         if delete.detach:
             context.add_dml(
-                f"DELETE FROM {_table('rdf_edges')} WHERE s IN ({subquery}) OR o_id IN ({subquery})",
-                subparams + subparams,
+                f"{cte}DELETE FROM {_table('rdf_edges')} WHERE s IN ({subquery}) OR o_id IN ({subquery})",
+                dual_params,
             )
-        if not alias.startswith("e"):
+        elif not is_edge_var:
+            # Non-DETACH DELETE: guard against connected nodes (Cypher constraint).
+            # Stored as a sentinel SQL so execute_transaction can raise the right error.
             context.add_dml(
-                f"DELETE FROM {_table('rdf_labels')} WHERE s IN ({subquery})", subparams
+                f"__constraint_check_delete_connected__ {cte}SELECT COUNT(*) FROM {_table('rdf_edges')} WHERE s IN ({subquery}) OR o_id IN ({subquery})",
+                dual_params,
+            )
+        if not is_edge_var:
+            context.add_dml(
+                f"{cte}DELETE FROM {_table('rdf_labels')} WHERE s IN ({subquery})", subparams
             )
             context.add_dml(
-                f"DELETE FROM {_table('rdf_props')} WHERE s IN ({subquery})", subparams
+                f"{cte}DELETE FROM {_table('rdf_props')} WHERE s IN ({subquery})", subparams
             )
             context.add_dml(
-                f"DELETE FROM {_table('kg_NodeEmbeddings')} WHERE id IN ({subquery})",
+                f"{cte}DELETE FROM {_table('kg_NodeEmbeddings')} WHERE id IN ({subquery})",
                 subparams,
             )
             context.add_dml(
-                f"DELETE FROM {_table('nodes')} WHERE node_id IN ({subquery})",
+                f"{cte}DELETE FROM {_table('nodes')} WHERE node_id IN ({subquery})",
                 subparams,
             )
         else:
-            subquery_s, subparams_s = context.build_stage_sql(
-                select_override=f"SELECT {alias}.s"
+            is_undirected = alias in getattr(context, "_undirected_aliases", set())
+            s_col = "_src" if is_undirected else "s"
+            p_col = "_p" if is_undirected else "p"
+            o_col = "_dst" if is_undirected else "o_id"
+            cte_s, subquery_s, subparams_s = context.build_dml_subquery(
+                select_override=f"SELECT {alias}.{s_col}"
             )
-            subquery_p, subparams_p = context.build_stage_sql(
-                select_override=f"SELECT {alias}.p"
+            cte_p, subquery_p, subparams_p = context.build_dml_subquery(
+                select_override=f"SELECT {alias}.{p_col}"
             )
-            subquery_o, subparams_o = context.build_stage_sql(
-                select_override=f"SELECT {alias}.o_id"
+            cte_o, subquery_o, subparams_o = context.build_dml_subquery(
+                select_override=f"SELECT {alias}.{o_col}"
             )
             context.add_dml(
-                f"DELETE FROM {_table('rdf_edges')} WHERE "
+                f"{cte_s}DELETE FROM {_table('rdf_edges')} WHERE "
                 f"s IN ({subquery_s}) AND p IN ({subquery_p}) AND o_id IN ({subquery_o})",
                 subparams_s + subparams_p + subparams_o,
             )
@@ -1860,7 +2532,7 @@ def translate_set_clause(set_cl, context, metadata):
     for item in set_cl.items:
         if isinstance(item.expression, ast.Variable) and getattr(item, "merge", False):
             alias = context.variable_aliases.get(item.expression.name)
-            subquery, subparams = context.build_stage_sql(
+            cte, subquery, subparams = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.node_id"
             )
             val_expr = item.value
@@ -1869,22 +2541,22 @@ def translate_set_clause(set_cl, context, metadata):
                 if isinstance(map_val, dict):
                     for k, v in map_val.items():
                         context.add_dml(
-                            f'UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
+                            f'{cte}UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
                             [v] + subparams + [k],
                         )
                         context.add_dml(
-                            f'INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
+                            f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
                             [k, v] + subparams + [k],
                         )
             elif isinstance(val_expr, ast.MapLiteral):
                 for k, v in val_expr.entries.items():
                     val = v.value if isinstance(v, ast.Literal) else context.input_params.get(v.name) if isinstance(v, ast.Variable) else v
                     context.add_dml(
-                        f'UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
+                        f'{cte}UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
                         [val] + subparams + [k],
                     )
                     context.add_dml(
-                        f'INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
+                        f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
                         [k, val] + subparams + [k],
                     )
         elif isinstance(item.expression, ast.PropertyReference):
@@ -1894,15 +2566,15 @@ def translate_set_clause(set_cl, context, metadata):
                 item.value,
             )
             val = v.value if isinstance(v, ast.Literal) else v
-            subquery, subparams = context.build_stage_sql(
+            cte, subquery, subparams = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.node_id"
             )
             context.add_dml(
-                f'UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
+                f'{cte}UPDATE {_table("rdf_props")} SET val = ? WHERE s IN ({subquery}) AND "key" = ?',
                 [val] + subparams + [k],
             )
             context.add_dml(
-                f'INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
+                f'{cte}INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = {_table("nodes")}.node_id AND "key" = ?)',
                 [k, val] + subparams + [k],
             )
         elif isinstance(item.expression, ast.Variable):
@@ -1914,11 +2586,11 @@ def translate_set_clause(set_cl, context, metadata):
                     else item.value
                 ),
             )
-            subquery, subparams = context.build_stage_sql(
+            cte, subquery, subparams = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.node_id"
             )
             context.add_dml(
-                f"INSERT INTO {_table('rdf_labels')} (s, label) SELECT node_id, ? FROM {_table('nodes')} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE s = {_table('nodes')}.node_id AND label = ?)",
+                f"{cte}INSERT INTO {_table('rdf_labels')} (s, label) SELECT node_id, ? FROM {_table('nodes')} WHERE node_id IN ({subquery}) AND NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE s = {_table('nodes')}.node_id AND label = ?)",
                 [label] + subparams + [label],
             )
 
@@ -1927,11 +2599,11 @@ def translate_remove_clause(remove, context, metadata):
     for item in remove.items:
         if isinstance(item.expression, ast.Variable) and item.label:
             alias = context.variable_aliases.get(item.expression.name)
-            subquery, subparams = context.build_stage_sql(
+            cte, subquery, subparams = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.node_id"
             )
             context.add_dml(
-                f"DELETE FROM {_table('rdf_labels')} WHERE s IN ({subquery}) AND label = ?",
+                f"{cte}DELETE FROM {_table('rdf_labels')} WHERE s IN ({subquery}) AND label = ?",
                 subparams + [item.label],
             )
         elif isinstance(item.expression, ast.PropertyReference):
@@ -1939,26 +2611,91 @@ def translate_remove_clause(remove, context, metadata):
                 context.variable_aliases.get(item.expression.variable),
                 item.expression.property_name,
             )
-            subquery, subparams = context.build_stage_sql(
+            cte, subquery, subparams = context.build_dml_subquery(
                 select_override=f"SELECT {alias}.node_id"
             )
             context.add_dml(
-                f'DELETE FROM {_table("rdf_props")} WHERE s IN ({subquery}) AND "key" = ?',
+                f'{cte}DELETE FROM {_table("rdf_props")} WHERE s IN ({subquery}) AND "key" = ?',
                 subparams + [k],
             )
 
 
 def translate_match_clause(match_clause, context, metadata):
+    # Validate no duplicate variables within the same MATCH clause (across all patterns)
+    vars_in_match = set()
     for pattern in match_clause.patterns:
         if not pattern.nodes:
             continue
+        # Check within pattern
+        vars_in_pattern = set()
+        for node in pattern.nodes:
+            if node.variable:
+                if node.variable in vars_in_pattern:
+                    raise CypherParseError(
+                        f"VariableAlreadyBound: variable '{node.variable}' appears twice "
+                        f"in the same pattern"
+                    )
+                vars_in_pattern.add(node.variable)
+                # Also check if this variable was already seen in this MATCH clause
+                if node.variable in vars_in_match:
+                    raise CypherParseError(
+                        f"VariableAlreadyBound: variable '{node.variable}' is already bound "
+                        f"in this MATCH clause"
+                    )
+                vars_in_match.add(node.variable)
+        for rel in pattern.relationships:
+            if rel.variable:
+                if rel.variable in vars_in_pattern:
+                    raise CypherParseError(
+                        f"VariableAlreadyBound: variable '{rel.variable}' appears twice "
+                        f"in the same pattern"
+                    )
+                vars_in_pattern.add(rel.variable)
+                # Also check if this variable was already seen in this MATCH clause
+                if rel.variable in vars_in_match:
+                    raise CypherParseError(
+                        f"VariableAlreadyBound: variable '{rel.variable}' is already bound "
+                        f"in this MATCH clause"
+                    )
+                vars_in_match.add(rel.variable)
         first_node = pattern.nodes[0]
-        if first_node.variable or first_node.labels or first_node.properties:
-            translate_node_pattern(
-                first_node, context, metadata, optional=match_clause.optional
-            )
-        else:
-            _ = context.next_alias("n")
+        # Skip upfront node join when the first node is unbound but the pattern's
+        # last node IS already bound.  translate_relationship_pattern will anchor
+        # the edge on the bound target and join this node from the edge (direction-
+        # symmetry fix).  Without this guard, translate_node_pattern emits a CROSS
+        # JOIN that produces wrong results for (t)-[:R]->(f_bound).
+        first_is_unbound = (
+            first_node.variable is not None
+            and first_node.variable not in context.variable_aliases
+        )
+        last_node_bound = (
+            pattern.nodes
+            and pattern.nodes[-1].variable
+            and pattern.nodes[-1].variable in context.variable_aliases
+        )
+        skip_first_node_join = (
+            first_is_unbound
+            and last_node_bound
+            and bool(pattern.relationships)
+        )
+        has_rels = bool(pattern.relationships)
+        if not skip_first_node_join:
+            if first_node.variable:
+                translate_node_pattern(
+                    first_node, context, metadata, optional=match_clause.optional
+                )
+            elif first_node.labels or first_node.properties:
+                if not has_rels:
+                    # Standalone anonymous labeled/propertied node — translate normally.
+                    translate_node_pattern(
+                        first_node, context, metadata, optional=match_clause.optional
+                    )
+                else:
+                    # Anonymous labeled source in a relationship — edge join handles it.
+                    # Adding a standalone nodes JOIN here would create a Cartesian product.
+                    _ = context.next_alias("n")
+            else:
+                _ = context.next_alias("n")
         for i, rel in enumerate(pattern.relationships):
             translate_relationship_pattern(
                 rel,
@@ -1969,21 +2706,33 @@ def translate_match_clause(match_clause, context, metadata):
                 optional=match_clause.optional,
             )
             last_node = pattern.nodes[i + 1]
-            if last_node.variable or last_node.labels or last_node.properties:
+            if last_node.variable:
                 translate_node_pattern(
                     last_node, context, metadata, optional=match_clause.optional
                 )
+            elif not (last_node.labels or last_node.properties):
+                pass  # truly anonymous target — edge join covers it
+            # else: anonymous labeled/propertied target — _trp_directed_edge already
+            # added label JOINs against the edge-joined alias; no standalone JOIN needed.
 
     for np in match_clause.named_paths:
         context.named_paths[np.variable] = np
+        # Track path variable type for semantic validation
+        context.bind_variable_type(np.variable, "path")
         node_aliases = [
             context.variable_aliases.get(n.variable, f"n{i}")
             for i, n in enumerate(np.pattern.nodes)
         ]
-        edge_aliases = [
-            context.variable_aliases.get(r.variable, f"e{i}")
-            for i, r in enumerate(np.pattern.relationships)
-        ]
+        # For relationships: first try the variable alias, then look up by object id
+        edge_aliases = []
+        for i, r in enumerate(np.pattern.relationships):
+            if r.variable:
+                # Named relationship: use its registered alias
+                alias = context.variable_aliases.get(r.variable, f"e{i}")
+            else:
+                # Anonymous relationship: look up by object id from _trp_setup_aliases tracking
+                alias = context.rel_obj_aliases.get(id(r), f"e{i}")
+            edge_aliases.append(alias)
         context.path_node_aliases[np.variable] = node_aliases
         context.path_edge_aliases[np.variable] = edge_aliases
 
@@ -2188,12 +2937,50 @@ def translate_subquery_call(
 
 def translate_node_pattern(node, context, metadata, optional=False):
     if node.variable and node.variable in context.variable_aliases:
+        # Validate type consistency: if variable was previously bound to a different type, error
+        context.bind_variable_type(node.variable, "node")
+        # Node already registered (e.g. as far-end of a relationship JOIN), but
+        # labels and properties declared on this node pattern still need to be
+        # applied as filter JOINs against the already-registered alias.
+        if node.labels or node.properties:
+            alias = context.variable_aliases[node.variable]
+            jt = "LEFT OUTER JOIN" if optional else "JOIN"
+            for label in node.labels:
+                l_alias = context.next_alias("l")
+                context.join_clauses.append(
+                    f"{jt} {_table('rdf_labels')} {l_alias} ON {l_alias}.s = {alias}.node_id AND {l_alias}.label = {context.add_join_param(label)}"
+                )
+                if not optional:
+                    context.where_conditions.append(f"{l_alias}.s IS NOT NULL")
+            for k, v in node.properties.items():
+                val_sql = translate_expression(v, context, segment="where")
+                if k in ("node_id", "id"):
+                    context.where_conditions.append(f"{alias}.node_id = {val_sql}")
+                else:
+                    if not optional:
+                        context.where_conditions.append(
+                            TranslationContext._structural_guard_sql(alias, k)
+                        )
+                    p_alias = context.next_alias("p")
+                    context.join_clauses.append(
+                        f"{jt} {_table('rdf_props')} {p_alias} "
+                        f'ON {p_alias}.s = {alias}.node_id AND {p_alias}."key" = {context.add_join_param(k)}'
+                    )
+                    if optional:
+                        context.where_conditions.append(
+                            f"({p_alias}.s IS NULL OR {p_alias}.val = {val_sql})"
+                        )
+                    else:
+                        context.where_conditions.append(f"{p_alias}.val = {val_sql}")
         return
     alias = (
         context.register_variable(node.variable)
         if node.variable
         else context.next_alias("n")
     )
+    # Track node type for semantic validation
+    if node.variable:
+        context.bind_variable_type(node.variable, "node")
     jt = "LEFT OUTER JOIN" if optional else "JOIN"
 
     engine = getattr(context, "_engine", None)
@@ -2215,6 +3002,14 @@ def translate_node_pattern(node, context, metadata, optional=False):
                 return
 
     nodes_tbl = _table("nodes")
+    # For OPTIONAL MATCH, the "optional" semantics mean: if the whole pattern matches
+    # nothing, produce one null row. The label/property constraints on the anchor node
+    # (the first node in the query, when from_clauses is still empty) are still
+    # restrictive — use INNER JOIN so only nodes carrying the label are returned.
+    # LEFT OUTER JOIN is reserved for extending an already-bound variable (e.g. the
+    # target node in MATCH (a) OPTIONAL MATCH (a)-->(b)).
+    is_anchor_optional = optional and not context.from_clauses
+    effective_jt = "JOIN" if is_anchor_optional else jt
     if not context.from_clauses:
         context.from_clauses.append(f"{nodes_tbl} {alias}")
     elif f"{nodes_tbl} {alias}" not in context.from_clauses and not any(
@@ -2226,18 +3021,21 @@ def translate_node_pattern(node, context, metadata, optional=False):
             l_alias = context.next_alias("l")
             labels_inlined = ", ".join(f"'{lab}'" for lab in node.labels)
             context.join_clauses.append(
-                f"{jt} {_table('rdf_labels')} {l_alias} ON {l_alias}.s = {alias}.node_id AND {l_alias}.label IN ({labels_inlined})"
+                f"{effective_jt} {_table('rdf_labels')} {l_alias} ON {l_alias}.s = {alias}.node_id AND {l_alias}.label IN ({labels_inlined})"
             )
-            if not optional:
+            if not optional or is_anchor_optional:
                 context.where_conditions.append(f"{l_alias}.s IS NOT NULL")
         else:
             for label in node.labels:
                 l_alias = context.next_alias("l")
+                label_param = context.add_join_param(label)
                 context.join_clauses.append(
-                    f"{jt} {_table('rdf_labels')} {l_alias} ON {l_alias}.s = {alias}.node_id AND {l_alias}.label = {context.add_join_param(label)}"
+                    f"{effective_jt} {_table('rdf_labels')} {l_alias} ON {l_alias}.s = {alias}.node_id AND {l_alias}.label = {label_param}"
                 )
-                if not optional:
+                if not optional or is_anchor_optional:
                     context.where_conditions.append(f"{l_alias}.s IS NOT NULL")
+                if is_anchor_optional:
+                    context.optional_null_row_labels.append(label)
     for k, v in node.properties.items():
         val_sql = translate_expression(v, context, segment="where")
         if k in ("node_id", "id"):
@@ -2306,6 +3104,8 @@ def _trp_variable_length(rel, source_node, target_node, context, metadata):
                     k: (v.value if isinstance(v, ast.Literal) else v)
                     for k, v in rel.properties.items()
                 } if rel.properties else {},
+                "source_labels": list(source_node.labels) if source_node.labels else [],
+                "target_labels": list(target_node.labels) if target_node.labels else [],
             }
         )
         if not context.from_clauses:
@@ -2316,28 +3116,28 @@ def _trp_variable_length(rel, source_node, target_node, context, metadata):
 
 
 def _trp_setup_aliases(rel, source_node, target_node, context):
-    """Register aliases. Returns (src, tgt, edge, is_anon, is_new)."""
-    is_anon_source = (
-        source_node.variable is None
-        and not source_node.labels
-        and not source_node.properties
-    )
+    """Register aliases. Returns (src, tgt, edge, is_anon, is_new, is_unbound_src).
+
+    is_unbound_src: source has a variable name but was not yet bound when this
+    pattern was entered.  The caller must NOT pre-join it as a CROSS JOIN; instead
+    the edge join must be anchored on the (already-bound) target and the source
+    node joined from the edge.  This fixes the direction-symmetry bug: patterns
+    (t)-[:R]->(f) and (f)<-[:R]-(t) must produce identical SQL when f is bound.
+    """
+    is_anon_source = source_node.variable is None
+    is_unbound_src = False
     if is_anon_source:
         source_alias = context.next_alias("n")
-    elif source_node.variable is None:
-        source_alias = context.next_alias("n")
-        joined = any(
-            source_alias in fc for fc in context.from_clauses + context.join_clauses
-        )
-        if not joined:
-            if not context.from_clauses:
-                context.from_clauses.append(f"{_table('nodes')} {source_alias}")
-            else:
-                context.join_clauses.append(
-                    f"JOIN {_table('nodes')} {source_alias} ON 1=1"
-                )
     else:
-        source_alias = context.variable_aliases.get(source_node.variable)
+        existing = context.variable_aliases.get(source_node.variable)
+        if existing is None:
+            # Source variable exists in the query but has not been bound yet.
+            # Register it now so downstream code has an alias, but flag it so
+            # translate_relationship_pattern anchors the edge on the target side.
+            source_alias = context.register_variable(source_node.variable)
+            is_unbound_src = True
+        else:
+            source_alias = existing
     is_new_target = target_node.variable not in context.variable_aliases
     target_alias = context.register_variable(target_node.variable)
     edge_alias = (
@@ -2345,7 +3145,9 @@ def _trp_setup_aliases(rel, source_node, target_node, context):
         if rel.variable
         else context.next_alias("e")
     )
-    return source_alias, target_alias, edge_alias, is_anon_source, is_new_target
+    # Track relationship object → SQL alias for named path lookup
+    context.rel_obj_aliases[id(rel)] = edge_alias
+    return source_alias, target_alias, edge_alias, is_anon_source, is_new_target, is_unbound_src
 
 
 def _trp_temporal_rewrite_from_joins(context, source_alias, cte_name):
@@ -2554,7 +3356,7 @@ def _trp_apply_inline_props(source_node, source_alias, target_node, target_alias
         (source_node, source_alias),
         (target_node, target_alias),
     ):
-        if not prop_node.properties:
+        if prop_node is None or not prop_node.properties:
             continue
         for k, v in prop_node.properties.items():
             val_sql = translate_expression(v, context, segment="where")
@@ -2612,6 +3414,14 @@ def _trp_directed_edge_join(
             if not context.from_clauses:
                 context.from_clauses.append(f"{_table('rdf_edges')} {edge_alias}")
                 if actual_cond:
+                    # Edge predicate goes into WHERE — params for rel.types were added as
+                    # join_params but appear AFTER join-clause params in the SQL.  Move
+                    # them to where_params so positional ? order matches SQL order.
+                    n_type_params = actual_cond.count("?")
+                    if n_type_params > 0:
+                        moved = context.join_params[-n_type_params:]
+                        del context.join_params[-n_type_params:]
+                        context.where_params.extend(moved)
                     context.where_conditions.append(actual_cond)
             else:
                 full_cond = actual_cond if actual_cond else "1=1"
@@ -2622,6 +3432,32 @@ def _trp_directed_edge_join(
             context.join_clauses.append(
                 f"{jt} {_table('rdf_edges')} {edge_alias} ON {edge_cond}"
             )
+
+
+def _trp_apply_anon_source_constraints(source_node, edge_alias, src_col, context, jt):
+    """Apply label/property constraints for an anonymous source node via the edge column.
+
+    When source has no variable there is no nodes JOIN for it — the edge table
+    provides the source id via edge_alias.<src_col> ('s' for OUTGOING, 'o_id' for INCOMING).
+    """
+    src_ref = f"{edge_alias}.{src_col}"
+    for label in (source_node.labels or []):
+        l_alias = context.next_alias("l")
+        context.join_clauses.append(
+            f"{jt} {_table('rdf_labels')} {l_alias} "
+            f"ON {l_alias}.s = {src_ref} AND {l_alias}.label = {context.add_join_param(label)}"
+        )
+    for k, v in (source_node.properties or {}).items():
+        val_sql = translate_expression(v, context, segment="where")
+        if k in ("node_id", "id"):
+            context.where_conditions.append(f"{src_ref} = {val_sql}")
+        else:
+            p_alias = context.next_alias("p")
+            context.join_clauses.append(
+                f"{jt} {_table('rdf_props')} {p_alias} "
+                f'ON {p_alias}.s = {src_ref} AND {p_alias}."key" = {context.add_join_param(k)}'
+            )
+            context.where_conditions.append(f"{p_alias}.val = {val_sql}")
 
 
 def _trp_directed_edge(
@@ -2646,7 +3482,24 @@ def _trp_directed_edge(
     else:
         context.where_conditions.append(target_on)
 
-    _trp_apply_inline_props(source_node, source_alias, target_node, target_alias, context, jt)
+    if is_anon_source and (source_node.labels or source_node.properties):
+        # Source node has constraints but no variable — filter via edge column.
+        # OUTGOING: target is on edge.o_id → source is edge.s
+        # INCOMING: target is on edge.s → source is edge.o_id
+        anon_src_col = "s" if target_on.endswith(f"{edge_alias}.o_id") else "o_id"
+        _trp_apply_anon_source_constraints(source_node, edge_alias, anon_src_col, context, jt)
+        _trp_apply_inline_props(None, None, target_node, target_alias, context, jt)
+    else:
+        _trp_apply_inline_props(source_node, source_alias, target_node, target_alias, context, jt)
+
+    # Apply label constraints for anonymous target nodes inline.
+    if target_node.variable is None and target_node.labels and not target_alias.startswith("Stage"):
+        for label in target_node.labels:
+            l_alias = context.next_alias("l")
+            context.join_clauses.append(
+                f"{jt} {_table('rdf_labels')} {l_alias} "
+                f"ON {l_alias}.s = {target_alias}.node_id AND {l_alias}.label = {context.add_join_param(label)}"
+            )
 
 
 def translate_relationship_pattern(
@@ -2655,12 +3508,14 @@ def translate_relationship_pattern(
     if rel.variable_length is not None:
         _trp_variable_length(rel, source_node, target_node, context, metadata)
         return
-    source_alias, target_alias, edge_alias, is_anon_source, is_new_target = (
+    source_alias, target_alias, edge_alias, is_anon_source, is_new_target, is_unbound_src = (
         _trp_setup_aliases(rel, source_node, target_node, context)
     )
     # Track named relationship variables for Bolt column-type tagging.
     if rel.variable:
         context.rel_variables.add(rel.variable)
+        # Track relationship type for semantic validation
+        context.bind_variable_type(rel.variable, "relationship")
     def _node_col(variable, alias):
         if alias.startswith("Stage") or alias == "VecSearch":
             return variable
@@ -2677,6 +3532,29 @@ def translate_relationship_pattern(
         _trp_undirected_edge(rel, source_node, target_node, context,
                               source_alias, target_alias, edge_alias, s_col, t_col, jt, is_new_target)
         return
+
+    # Direction-symmetry fix: when source is unbound but target is already bound,
+    # anchor the edge join on the target and join the source node from the edge.
+    # This makes (t)-[:R]->(f) and (f)<-[:R]-(t) with f pre-bound produce identical SQL.
+    if is_unbound_src and not is_new_target:
+        if rel.direction == ast.Direction.OUTGOING:
+            # (t)-[:R]->(f_bound): anchor edge on f, join t from edge.s
+            edge_cond = f"{edge_alias}.o_id = {target_alias}.{t_col}"
+            src_on = f"{source_alias}.{s_col} = {edge_alias}.s"
+        else:
+            # (t)<-[:R]-(f_bound): anchor edge on f, join t from edge.o_id
+            edge_cond = f"{edge_alias}.s = {target_alias}.{t_col}"
+            src_on = f"{source_alias}.{s_col} = {edge_alias}.o_id"
+        if rel.types:
+            if len(rel.types) == 1:
+                edge_cond += f" AND {edge_alias}.p = {context.add_join_param(rel.types[0])}"
+            else:
+                edge_cond += f" AND {edge_alias}.p IN ({', '.join([context.add_join_param(t) for t in rel.types])})"
+        context.join_clauses.append(f"{jt} {_table('rdf_edges')} {edge_alias} ON {edge_cond}")
+        context.join_clauses.append(f"{jt} {_table('nodes')} {source_alias} ON {src_on}")
+        _trp_apply_inline_props(source_node, source_alias, target_node, target_alias, context, jt)
+        return
+
     if rel.direction == ast.Direction.OUTGOING:
         if is_anon_source:
             edge_cond = "1=1"
@@ -2685,8 +3563,12 @@ def translate_relationship_pattern(
             edge_cond = f"{edge_alias}.s = {source_alias}.{s_col}"
             target_on = f"{target_alias}.{t_col} = {edge_alias}.o_id"
     else:
-        edge_cond = f"{edge_alias}.o_id = {source_alias}.{s_col}"
-        target_on = f"{target_alias}.{t_col} = {edge_alias}.s"
+        if is_anon_source:
+            edge_cond = "1=1"
+            target_on = f"{target_alias}.{t_col} = {edge_alias}.s"
+        else:
+            edge_cond = f"{edge_alias}.o_id = {source_alias}.{s_col}"
+            target_on = f"{target_alias}.{t_col} = {edge_alias}.s"
     _trp_directed_edge(rel, source_node, target_node, context,
                        source_alias, target_alias, edge_alias, s_col, t_col,
                        edge_cond, target_on, jt, is_anon_source, is_new_target)
@@ -2793,45 +3675,231 @@ def _boolean_expr_comparison_ops(op, left, left_expr, right, right_expr) -> Opti
     return None
 
 
+def _get_non_boolean_operand(expr):
+    """Check if expression has non-boolean literal operands and return it."""
+    for operand in expr.operands:
+        if isinstance(operand, ast.Literal):
+            v = operand.value
+            # Boolean and None (null) are valid for AND/OR/XOR/NOT
+            if not (isinstance(v, bool) or v is None):
+                return operand
+        elif isinstance(operand, (ast.MapLiteral, ast.Literal)):
+            # Map literals are not boolean
+            if isinstance(operand, ast.MapLiteral):
+                return operand
+    return None
+
+def _format_invalid_type(operand):
+    """Format error message for invalid operand type."""
+    if isinstance(operand, ast.Literal):
+        v = operand.value
+        type_name = type(v).__name__
+        return f"{type_name}: {v!r}"
+    elif isinstance(operand, ast.MapLiteral):
+        return "map"
+    elif isinstance(operand, (ast.Literal, ast.Variable)):
+        if isinstance(operand.value, list):
+            return f"list: {operand.value!r}"
+    # Fallback
+    return str(operand)
+
+
+
+def _coerce_varchar_boolean_if_needed(operand, translated_sql, context) -> str:
+    if isinstance(operand, ast.Variable) and operand.name in context.scalar_variables:
+        return f"(({translated_sql} = '1' OR {translated_sql} = 'true'))"
+    return translated_sql
+
+
 def _boolean_expr_logical(op, expr, context):
     if op == ast.BooleanOperator.AND:
+        # Type validation: AND requires boolean operands
+        bad_operand = _get_non_boolean_operand(expr)
+        if bad_operand is not None:
+            raise CypherParseError(
+                f"InvalidArgumentType: AND requires boolean operands, "
+                f"got {_format_invalid_type(bad_operand)}"
+            )
         parts = []
+        has_null = False
+        _sp0 = len(context.select_params)
+        _wp0 = len(context.where_params)
+        _jp0 = len(context.join_params)
         for o in expr.operands:
             if _is_temporal_ts_condition(o, context):
                 continue
-            parts.append(translate_boolean_expression(o, context))
-        return "(" + " AND ".join(parts) + ")" if parts else "1=1"
+            p = translate_boolean_expression(o, context)
+            p = _coerce_varchar_boolean_if_needed(o, p, context)
+            if p == "NULL":
+                has_null = True
+            else:
+                parts.append(p)
+        if not parts:
+            # All operands were null or temporal
+            return "NULL" if has_null else "1=1"
+        # Three-value AND: if any operand is definitively false, result is false.
+        # Roll back any params added by discarded operands.
+        if "(1=0)" in parts:
+            del context.select_params[_sp0:]
+            del context.where_params[_wp0:]
+            del context.join_params[_jp0:]
+            return "(1=0)"
+        # Unwrap nested nullable CASE WHEN parts (produced by inner 3VL AND/OR):
+        # "CASE WHEN NOT (cond) THEN (1=0) ELSE NULL END" means: false if NOT cond, else NULL.
+        # For AND, we need cond to hold (it's already nullable → mark has_null).
+        # "CASE WHEN (cond) THEN (1=1) ELSE NULL END" means: true if cond, else NULL.
+        import re as _re_and
+        unwrapped = []
+        for p in parts:
+            m_not = _re_and.match(r'^CASE WHEN NOT \((.+)\) THEN \(1=0\) ELSE NULL END$', p)
+            if m_not:
+                has_null = True
+                unwrapped.append(m_not.group(1))
+            else:
+                unwrapped.append(p)
+        parts = unwrapped
+        # Simplify: filter out always-true sentinels (they don't affect AND result)
+        non_trivial = [p for p in parts if p != "(1=1)"]
+        if not non_trivial:
+            # All parts are literal true
+            if has_null:
+                return "NULL"
+            return "(1=1)"
+        combined = "(" + " AND ".join(non_trivial) + ")"
+        if has_null:
+            return f"CASE WHEN NOT ({combined}) THEN (1=0) ELSE NULL END"
+        return combined
     if op == ast.BooleanOperator.OR:
-        return (
-            "("
-            + " OR ".join(
-                translate_boolean_expression(o, context) for o in expr.operands
+        # Type validation: OR requires boolean operands
+        bad_operand = _get_non_boolean_operand(expr)
+        if bad_operand is not None:
+            raise CypherParseError(
+                f"InvalidArgumentType: OR requires boolean operands, "
+                f"got {_format_invalid_type(bad_operand)}"
             )
-            + ")"
-        )
+        parts_or = []
+        has_null_or = False
+        _sp0_or = len(context.select_params)
+        _wp0_or = len(context.where_params)
+        _jp0_or = len(context.join_params)
+        for o in expr.operands:
+            p = translate_boolean_expression(o, context)
+            p = _coerce_varchar_boolean_if_needed(o, p, context)
+            if p == "NULL":
+                has_null_or = True
+            else:
+                parts_or.append(p)
+        if not parts_or:
+            return "NULL" if has_null_or else "(1=0)"
+        # Three-value OR: if any operand is definitively true, result is true.
+        # Roll back params added by discarded operands.
+        if "(1=1)" in parts_or:
+            del context.select_params[_sp0_or:]
+            del context.where_params[_wp0_or:]
+            del context.join_params[_jp0_or:]
+            return "(1=1)"
+        # Unwrap nested nullable CASE WHEN parts from inner 3VL AND/OR:
+        import re as _re_or
+        unwrapped_or = []
+        for p in parts_or:
+            m_or = _re_or.match(r'^CASE WHEN \((.+)\) THEN \(1=1\) ELSE NULL END$', p)
+            if m_or:
+                has_null_or = True
+                unwrapped_or.append(m_or.group(1))
+            else:
+                unwrapped_or.append(p)
+        parts_or = unwrapped_or
+        # Simplify: filter out always-false sentinels (they don't affect OR result)
+        non_trivial_or = [p for p in parts_or if p != "(1=0)"]
+        if not non_trivial_or:
+            # All parts are literal false
+            if has_null_or:
+                return "NULL"
+            return "(1=0)"
+        combined_or = "(" + " OR ".join(non_trivial_or) + ")"
+        if has_null_or:
+            return f"CASE WHEN ({combined_or}) THEN (1=1) ELSE NULL END"
+        return combined_or
     if op == ast.BooleanOperator.XOR:
+        # Type validation: XOR requires boolean operands
+        bad_operand = _get_non_boolean_operand(expr)
+        if bad_operand is not None:
+            raise CypherParseError(
+                f"InvalidArgumentType: XOR requires boolean operands, "
+                f"got {_format_invalid_type(bad_operand)}"
+            )
         a, b = expr.operands[0], expr.operands[1]
         sa = translate_boolean_expression(a, context)
+        sa = _coerce_varchar_boolean_if_needed(a, sa, context)
         sb = translate_boolean_expression(b, context)
+        sb = _coerce_varchar_boolean_if_needed(b, sb, context)
+        if sa == "NULL" or sb == "NULL":
+            return "NULL"
         return f"(({sa} AND NOT ({sb})) OR (NOT ({sa}) AND {sb}))"
     if op == ast.BooleanOperator.NOT:
-        return f"NOT ({translate_boolean_expression(expr.operands[0], context)})"
+        # Type validation: NOT requires boolean operand
+        bad_operand = _get_non_boolean_operand(expr)
+        if bad_operand is not None:
+            raise CypherParseError(
+                f"InvalidArgumentType: NOT requires boolean operand, "
+                f"got {_format_invalid_type(bad_operand)}"
+            )
+        operand = expr.operands[0]
+        # NOT null = null (three-valued logic)
+        if isinstance(operand, ast.Literal) and operand.value is None:
+            return "NULL"
+        # Fold NOT NOT: double negation cancels (IRIS SQL rejects NOT NOT syntax)
+        if (isinstance(operand, ast.BooleanExpression)
+                and operand.operator == ast.BooleanOperator.NOT
+                and len(operand.operands) == 1):
+            return translate_boolean_expression(operand.operands[0], context)
+        # NOT (x IS NULL) → x IS NOT NULL (IRIS parses NOT x IS NULL as (NOT x) IS NULL)
+        if (isinstance(operand, ast.BooleanExpression)
+                and operand.operator == ast.BooleanOperator.IS_NULL):
+            left = translate_expression(operand.operands[0], context, segment="where")
+            return f"{left} IS NOT NULL"
+        # NOT (x IS NOT NULL) → x IS NULL
+        if (isinstance(operand, ast.BooleanExpression)
+                and operand.operator == ast.BooleanOperator.IS_NOT_NULL):
+            left = translate_expression(operand.operands[0], context, segment="where")
+            return f"{left} IS NULL"
+        operand_sql = translate_boolean_expression(operand, context)
+        operand_sql = _coerce_varchar_boolean_if_needed(operand, operand_sql, context)
+        return f"NOT ({operand_sql})"
     return None
 
 
 def _boolean_expr_in(left, right_expr, context):
     if isinstance(right_expr, ast.Literal) and isinstance(right_expr.value, list):
         items = right_expr.value
+        # Separate null items from non-null items for 3VL: x IN [a, null, b]
+        # = x IN (a, b) OR NULL (unknown if no exact match but list has nulls)
+        null_items = [i for i in items if isinstance(i, ast.Literal) and i.value is None]
+        non_null_items = [i for i in items if not (isinstance(i, ast.Literal) and i.value is None)]
+        if not non_null_items:
+            # All null: x IN [null] = null (handled by caller null check for left=null, else null)
+            return "NULL"
         placeholders = ", ".join(
             context.add_where_param(item.value if isinstance(item, ast.Literal) else item)
-            for item in items
+            for item in non_null_items
         )
-        return f"{left} IN ({placeholders})"
+        in_expr = f"{left} IN ({placeholders})"
+        if null_items:
+            # 3VL: if x matches → true; if x doesn't match and list has null → null
+            return f"CASE WHEN {in_expr} THEN 1 ELSE NULL END"
+        return in_expr
     if isinstance(right_expr, ast.Variable) and right_expr.name in context.input_params:
         val = context.input_params[right_expr.name]
         if isinstance(val, list):
-            placeholders = ", ".join(context.add_where_param(v) for v in val)
-            return f"{left} IN ({placeholders})"
+            null_vals = [v for v in val if v is None]
+            non_null_vals = [v for v in val if v is not None]
+            if not non_null_vals:
+                return "NULL"
+            placeholders = ", ".join(context.add_where_param(v) for v in non_null_vals)
+            in_expr = f"{left} IN ({placeholders})"
+            if null_vals:
+                return f"CASE WHEN {in_expr} THEN 1 ELSE NULL END"
+            return in_expr
     return None
 
 
@@ -2856,6 +3924,12 @@ def translate_boolean_expression(expr, context) -> str:
                 return "(1=1)"
             if expr.value is False:
                 return "(1=0)"
+        # When a PropertyReference is used directly in a boolean context,
+        # convert it to a proper boolean comparison. IVG stores booleans as '1'/'0'.
+        if isinstance(expr, ast.PropertyReference):
+            prop_expr = translate_expression(expr, context, segment="where")
+            # Convert VARCHAR '1'/'0' to boolean: property = '1'
+            return f"({prop_expr} = '1')"
         return translate_expression(expr, context, segment="where")
     op = expr.operator
     logical = _boolean_expr_logical(op, expr, context)
@@ -2863,16 +3937,49 @@ def translate_boolean_expression(expr, context) -> str:
         return logical
     left_expr = expr.operands[0]
     right_expr = expr.operands[1] if len(expr.operands) > 1 else None
-    left = translate_expression(left_expr, context, segment="where")
-    if op == ast.BooleanOperator.IS_NULL:
-        return f"{left} IS NULL"
-    if op == ast.BooleanOperator.IS_NOT_NULL:
+    if op in (ast.BooleanOperator.IS_NULL, ast.BooleanOperator.IS_NOT_NULL):
+        # Use segment="select" to avoid the structural-guard EXISTS clause —
+        # IS NULL explicitly handles the missing-property case via LEFT JOIN.
+        left = translate_expression(left_expr, context, segment="select")
+        if op == ast.BooleanOperator.IS_NULL:
+            return f"{left} IS NULL"
         return f"{left} IS NOT NULL"
+    # Cypher three-valued logic: any comparison involving NULL yields NULL (unknown).
+    # This includes null = null, null <> null, null < x, x IN [null], null IN [...], etc.
+    _left_is_null = isinstance(left_expr, ast.Literal) and left_expr.value is None
+    _right_is_null = right_expr is not None and isinstance(right_expr, ast.Literal) and right_expr.value is None
+    # Also check parameter variables whose resolved value is null
+    if not _left_is_null and isinstance(left_expr, ast.Variable):
+        _left_val = context.input_params.get(left_expr.name)
+        _left_is_null = _left_val is None and left_expr.name in context.input_params
+    if not _right_is_null and right_expr is not None and isinstance(right_expr, ast.Variable):
+        _right_val = context.input_params.get(right_expr.name)
+        _right_is_null = _right_val is None and right_expr.name in context.input_params
+    if (_left_is_null or _right_is_null) and op not in (
+        ast.BooleanOperator.IS_NULL, ast.BooleanOperator.IS_NOT_NULL
+    ):
+        # Special case: null IN [] = false (empty list, no unknowns possible)
+        if op == ast.BooleanOperator.IN and _left_is_null:
+            if isinstance(right_expr, ast.Literal) and right_expr.value == []:
+                return "(1=0)"  # false
+            if isinstance(right_expr, ast.Variable):
+                _rcoll = context.input_params.get(right_expr.name)
+                if isinstance(_rcoll, list) and len(_rcoll) == 0:
+                    return "(1=0)"  # false
+        return "NULL"
+    left_inlined = _inline_literal(left_expr)
+    left = left_inlined if left_inlined is not None else translate_expression(left_expr, context, segment="where")
+    # Wrap CASE WHEN expressions in parens — IRIS SQLCODE -25 if bare CASE ends before =
+    if left.startswith("CASE WHEN ") and " END" in left:
+        left = f"({left})"
     if op == ast.BooleanOperator.IN:
         in_sql = _boolean_expr_in(left, right_expr, context)
         if in_sql is not None:
             return in_sql
-    right = translate_expression(right_expr, context, segment="where")
+    right_inlined = _inline_literal(right_expr)
+    right = right_inlined if right_inlined is not None else translate_expression(right_expr, context, segment="where")
+    if right.startswith("CASE WHEN ") and " END" in right:
+        right = f"({right})"
     if op in (
         ast.BooleanOperator.LESS_THAN,
         ast.BooleanOperator.LESS_THAN_OR_EQUAL,
@@ -3006,32 +4113,69 @@ def _expr_list_predicate(expr, context, segment):
     source_sql = translate_expression(expr.source, context, segment=segment)
     var = sanitize_identifier(expr.variable)
     alias = context.next_alias("lp")
+    # Always use VARCHAR(1000) — IRIS JSON_TABLE BIGINT/DOUBLE columns fail to
+    # match bind-param floats/ints due to IRIS internal type precision.
+    # VARCHAR comparisons work when params are stringified (done below).
+    col_type = "VARCHAR(1000)"
     context.variable_aliases[expr.variable] = f"{alias}"
-    pred_sql = translate_expression(expr.predicate, context, segment=segment)
+    context.scalar_variables.add(expr.variable)
+    # Snapshot param lists so we can stringify newly added numeric params.
+    _sp_len = len(context.select_params)
+    _wp_len = len(context.where_params)
+    # Use translate_boolean_expression for proper SQL predicates — IRIS requires
+    # comparison predicates in WHERE, not CASE WHEN boolean expressions.
+    if isinstance(expr.predicate, ast.BooleanExpression):
+        pred_sql = translate_boolean_expression(expr.predicate, context)
+    else:
+        pred_sql = translate_expression(expr.predicate, context, segment="where")
+    # Convert newly added int/float params to str so VARCHAR column comparison works.
+    for _lst in (context.select_params, context.where_params):
+        _snap = _sp_len if _lst is context.select_params else _wp_len
+        for _i in range(_snap, len(_lst)):
+            if isinstance(_lst[_i], float):
+                _lst[_i] = str(_lst[_i])
+            elif isinstance(_lst[_i], int) and not isinstance(_lst[_i], bool):
+                _lst[_i] = str(_lst[_i])
+    # Also replace inline CAST('...' AS DOUBLE) with string literal for VARCHAR column comparison.
+    import re as _re_qp
+    def _cast_double_to_str(m):
+        return f"'{m.group(1)}'"
+    pred_sql = _re_qp.sub(r"CAST\('([^']+)' AS DOUBLE\)", _cast_double_to_str, pred_sql)
     del context.variable_aliases[expr.variable]
-    pred_with_alias = pred_sql.replace(
-        f"{alias}.node_id", f"{alias}.{var}"
-    ).replace(f"{alias}.", f"{alias}.")
+    context.scalar_variables.discard(expr.variable)
     pred_with_alias = pred_sql
     for col in ("node_id", "p", "val", "label"):
         pred_with_alias = pred_with_alias.replace(
             f"{alias}.{col}", f"{alias}.{var}"
         )
+    # IRIS WHERE clause needs a comparison predicate, not a bare boolean expression.
+    # Coerce bare 1/0 and bare column references to proper predicates.
+    where_pred = pred_with_alias
+    if where_pred in ("1", "1=1", "TRUE"):
+        where_pred = "1 = 1"
+    elif where_pred in ("0", "1=0", "FALSE"):
+        where_pred = "1 = 0"
+    elif where_pred and not any(op in where_pred for op in ("=", "<", ">", " IN ", " IS ", " LIKE ", " NOT ")):
+        # Bare column reference (e.g. lp0.x) — treat as truth test
+        where_pred = f"{where_pred} = 1"
     count_alias = context.next_alias("lpc")
     inner = (
-        f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} VARCHAR(1000) PATH '$')) {alias}"
-        f" WHERE {pred_with_alias}"
+        f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {alias}"
+        f" WHERE {where_pred}"
     )
-    all_count = f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} VARCHAR(1000) PATH '$')) {count_alias}"
+    all_count = f"SELECT COUNT(*) FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {count_alias}"
     if expr.quantifier == "all":
-        return f"(({inner}) = ({all_count}))"
-    if expr.quantifier == "any":
-        return f"(({inner}) > 0)"
-    if expr.quantifier == "none":
-        return f"(({inner}) = 0)"
-    if expr.quantifier == "single":
-        return f"(({inner}) = 1)"
-    return f"(({inner}) > 0)"
+        pred = f"(({inner}) = ({all_count}))"
+    elif expr.quantifier == "none":
+        pred = f"(({inner}) = 0)"
+    elif expr.quantifier == "single":
+        pred = f"(({inner}) = 1)"
+    else:  # any
+        pred = f"(({inner}) > 0)"
+    # In SELECT/scalar context IRIS needs a value, not a predicate — wrap in CASE WHEN
+    if segment in ("select", "inline", None):
+        return f"CASE WHEN {pred} THEN 1 ELSE 0 END"
+    return pred
 
 
 def _expr_list_comprehension(expr, context, segment):
@@ -3161,13 +4305,13 @@ def _expr_propref_edge_alias(expr, context, alias):
         return f"{alias}.{'_dst' if is_undirected else 'o_id'}"
     if is_undirected or is_edgescan:
         return "NULL"
-    return f"SQLUser.JSON_VALUE({alias}.qualifiers, '$.{expr.property_name}')"
+    return f"CASE WHEN {alias}.qualifiers IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({alias}.qualifiers, '$.{expr.property_name}') END"
 
 
 def _expr_property_reference(expr, context, segment):
     alias = context.variable_aliases.get(expr.variable)
     if not alias:
-        raise ValueError(f"Undefined: {expr.variable}")
+        raise SyntaxError(f"Undefined variable: {expr.variable}")
     temporal = _expr_propref_temporal(expr, context, alias)
     if temporal is not None:
         return temporal
@@ -3178,11 +4322,33 @@ def _expr_property_reference(expr, context, segment):
         return f"{alias}.{sanitize_identifier(expr.property_name)}"
     if alias.startswith("Stage"):
         if expr.property_name in ("node_id", "id"):
-            return expr.variable
-        return f"SQLUser.JSON_VALUE({expr.variable}, '$.{expr.property_name}')"
+            return _safe_alias(expr.variable)
+        # Edge-qualifiers variables: use JSON_VALUE on the column value (Stage column = qualifiers JSON)
+        edge_stage_vars = getattr(context, "edge_stage_variables", set())
+        if expr.variable in context.scalar_variables or expr.variable in edge_stage_vars:
+            return f"CASE WHEN {_safe_alias(expr.variable)} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({_safe_alias(expr.variable)}, '$.{expr.property_name}') END"
+        # Node variables from Stage: JOIN rdf_props to get the property value
+        # The Stage column contains the node ID, so use it directly
+        p_alias = context.next_alias("p")
+        stage_col = _safe_alias(expr.variable)
+        context.join_clauses.append(
+            f'LEFT JOIN {_table("rdf_props")} {p_alias} ON {p_alias}.s = {stage_col} AND {p_alias}."key" = {context.add_join_param(expr.property_name)}'
+        )
+        return f"{p_alias}.val"
     if alias.startswith("e") and not alias.startswith("ES_"):
         return _expr_propref_edge_alias(expr, context, alias)
-    if expr.property_name in ("node_id", "id"):
+    # Scalar variable from JSON_TABLE (list predicate / list comprehension): use JSON_VALUE
+    # not rdf_props join.  The column holds a JSON-serialised value, not a graph node id.
+    # Guard: only call JSON_VALUE when the value is a JSON object (starts with '{').
+    # JSON_VALUE raises SQLCODE=-400 on non-JSON or non-matching path.
+    if expr.variable in context.scalar_variables:
+        col_ref = f"{alias}.{sanitize_identifier(expr.variable)}"
+        prop = expr.property_name.replace("'", "''")
+        return (
+            f"CASE WHEN ({col_ref}) IS NULL OR SUBSTRING({col_ref}, 1, 1) <> '{{' "
+            f"THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{prop}') END"
+        )
+    if expr.property_name == "node_id":
         return f"{alias}.node_id"
     if segment == "where":
         context.where_conditions.append(
@@ -3228,6 +4394,14 @@ def _expr_map_literal(expr, context, segment):
         elif isinstance(v, ast.Literal) and isinstance(v.value, str):
             safe_v = v.value.replace("\\", "\\\\").replace('"', '\\"').replace("'", "''")
             parts.append(f"'\"'||'{safe_k}'||'\":\"'||'{safe_v}'||'\"'")
+        elif isinstance(v, ast.MapLiteral):
+            # Nested map: the value is already a JSON object — no extra quotes
+            val_sql = translate_expression(v, context, segment=segment)
+            parts.append(f"'\"'||'{safe_k}'||'\":'||CAST({val_sql} AS VARCHAR)")
+        elif isinstance(v, ast.Literal) and isinstance(v.value, list):
+            # Nested list literal: already a JSON array — no extra quotes
+            val_sql = translate_expression(v, context, segment=segment)
+            parts.append(f"'\"'||'{safe_k}'||'\":'||CAST({val_sql} AS VARCHAR)")
         else:
             val_sql = translate_expression(v, context, segment=segment)
             parts.append(f"'\"'||'{safe_k}'||'\":\"'||CAST({val_sql} AS VARCHAR)||'\"'")
@@ -3239,7 +4413,14 @@ def _expr_subscript(expr, context, segment):
     base = expr.expression
     idx = expr.index
     if isinstance(base, ast.Variable) and isinstance(idx, ast.Variable):
-        node_alias = context.variable_aliases.get(base.name, "")
+        base_alias = context.variable_aliases.get(base.name, "")
+        idx_alias = context.variable_aliases.get(idx.name, "")
+        # If base is a stage scalar (list from WITH), use JSON_VALUE with dynamic path
+        if base_alias.startswith("Stage") or base.name in context.scalar_variables:
+            base_sql = translate_expression(base, context, segment=segment)
+            idx_sql = translate_expression(idx, context, segment=segment)
+            return f"SQLUser.JSON_VALUE({base_sql}, '$[' || CAST(({idx_sql}) AS VARCHAR) || ']')"
+        node_alias = base_alias
         key_val = context.input_params.get(idx.name, idx.name)
         p_alias = context.next_alias("dp")
         node_ref = f"{node_alias}.node_id" if node_alias else "NULL"
@@ -3255,10 +4436,7 @@ def _expr_subscript(expr, context, segment):
             f"'$[{i}]' COLUMNS (elem VARCHAR(1000) PATH '$')) __jt)"
         )
     idx_sql = translate_expression(idx, context, segment=segment)
-    return (
-        f"JSON_TABLE({base_sql}, '$[*]' COLUMNS "
-        f"(idx FOR ORDINALITY, elem VARCHAR(1000) PATH '$'))[{idx_sql}].elem"
-    )
+    return f"SQLUser.JSON_VALUE({base_sql}, '$[' || CAST(({idx_sql}) AS VARCHAR) || ']')"
 
 
 def _expr_slice(expr, context, segment):
@@ -3275,7 +4453,7 @@ def _expr_slice(expr, context, segment):
 def _expr_property_access(expr, context, segment):
     base_sql = translate_expression(expr.expression, context, segment=segment)
     prop = expr.property_name.replace("'", "''")
-    return f"SQLUser.JSON_VALUE({base_sql}, '$.{prop}')"
+    return f"CASE WHEN ({base_sql}) IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({base_sql}, '$.{prop}') END"
 
 
 def _expr_variable(expr, context, segment):
@@ -3297,9 +4475,9 @@ def _expr_variable(expr, context, segment):
             if segment == "join":
                 return context.add_join_param(v)
             return context.add_where_param(v)
-        raise ValueError(f"Undefined: {expr.name}")
+        raise SyntaxError(f"Undefined variable: {expr.name}")
     if alias.startswith("Stage"):
-        return expr.name
+        return _safe_alias(expr.name)
     if alias.startswith("e"):
         is_undirected = alias in getattr(context, "_undirected_aliases", set())
         return f"{alias}.{'_p' if is_undirected else 'p'}"
@@ -3329,7 +4507,10 @@ def _expr_literal(expr, context, segment):
         )
         if all_simple:
             items = [item.value for item in v]
-            return f"'{_json.dumps(items)}'"
+            json_str = _json.dumps(items)
+            str_len = max(len(json_str) + 1, 256)
+            escaped = json_str.replace("'", "''")
+            return f"CAST('{escaped}' AS VARCHAR({str_len}))"
         sql_items = []
         for item in v:
             if isinstance(item, ast.Literal):
@@ -3338,10 +4519,29 @@ def _expr_literal(expr, context, segment):
                 elif iv is False: sql_items.append("0")
                 elif iv is None: sql_items.append("NULL")
                 elif isinstance(iv, str): sql_items.append(f"'{iv.replace(chr(39), chr(39)+chr(39))}'")
+                elif isinstance(iv, list):
+                    # Nested list literal — recursively translate via the list branch
+                    sql_items.append(translate_expression(item, context, segment=segment))
                 else: sql_items.append(str(iv))
             else:
                 sql_items.append(translate_expression(item, context, segment=segment))
         return f"JSON_ARRAY({', '.join(sql_items)})"
+    if isinstance(v, float):
+        import math as _math
+        if _math.isinf(v) or _math.isnan(v):
+            if segment == "select":
+                return context.add_select_param(v)
+            if segment == "join":
+                return context.add_join_param(v)
+            if segment == "inline":
+                return repr(v)
+            return context.add_where_param(v)
+        float_str = repr(v)
+        return f"CAST({float_str!r} AS DOUBLE)"
+    if isinstance(v, str):
+        escaped = v.replace("'", "''")
+        str_len = max(len(v) + 1, 256)
+        return f"CAST('{escaped}' AS VARCHAR({str_len}))"
     if segment == "select":
         return context.add_select_param(v)
     if segment == "join":
@@ -3392,9 +4592,9 @@ def _scalar_coalesce(fn, args, args_exprs):
 
 def _scalar_string(fn, args, args_exprs):
     if fn == "tointeger":
-        return f"CAST({args[0]} AS INTEGER)"
+        return f"CASE WHEN ISNUMERIC({args[0]}) = 1 THEN CAST({args[0]} AS INTEGER) ELSE NULL END"
     if fn == "tofloat":
-        return f"CAST({args[0]} AS DOUBLE)"
+        return f"CASE WHEN ISNUMERIC({args[0]}) = 1 THEN CAST({args[0]} AS DOUBLE) ELSE NULL END"
     if fn == "tostring":
         if args_exprs and isinstance(args_exprs[0], ast.Literal) and isinstance(args_exprs[0].value, bool):
             return f"'{'true' if args_exprs[0].value else 'false'}'"
@@ -3421,6 +4621,500 @@ def _scalar_string(fn, args, args_exprs):
     return None
 
 
+def _extract_int_from_map_entry(map_literal, key, default=0):
+    if key not in map_literal.entries:
+        return default
+    val_expr = map_literal.entries[key]
+    if isinstance(val_expr, ast.Literal) and isinstance(val_expr.value, int):
+        return val_expr.value
+    return default
+
+
+def _extract_num_from_map_entry(map_literal, key, default=0):
+    """Like _extract_int_from_map_entry but also returns floats."""
+    if key not in map_literal.entries:
+        return default
+    val_expr = map_literal.entries[key]
+    if isinstance(val_expr, ast.Literal) and isinstance(val_expr.value, (int, float)):
+        return val_expr.value
+    return default
+
+
+def _has_map_key(map_literal, key):
+    return key in map_literal.entries
+
+
+def _date_from_iso_week(year, week, dow=1):
+    """Compute date for ISO week date (year, week, day-of-week where Mon=1)."""
+    import datetime as _dt
+    # ISO week 1 is the week containing the first Thursday of the year.
+    # Jan 4 is always in ISO week 1.
+    jan4 = _dt.date(year, 1, 4)
+    # Monday of ISO week 1
+    week1_monday = jan4 - _dt.timedelta(days=jan4.isoweekday() - 1)
+    return week1_monday + _dt.timedelta(weeks=week - 1, days=dow - 1)
+
+
+def _date_from_ordinal_day(year, ordinal):
+    """Convert year + ordinal day (1-based) to date."""
+    import datetime as _dt
+    return _dt.date(year, 1, 1) + _dt.timedelta(days=ordinal - 1)
+
+
+def _date_from_quarter(year, quarter, day_of_quarter=1):
+    """Convert year + quarter + day-of-quarter to date."""
+    import datetime as _dt
+    first_month = (quarter - 1) * 3 + 1
+    start = _dt.date(year, first_month, 1)
+    return start + _dt.timedelta(days=day_of_quarter - 1)
+
+
+def _normalize_tz_str(tz):
+    """Normalize a timezone suffix: compact +0100 → +01:00, -00:00 → Z, etc."""
+    import re as _re
+    if not tz:
+        return ""
+    if tz in ("Z", "z"):
+        return "Z"
+    # +HHMM or -HHMM (no colon, 4 digits) → +HH:MM
+    m = _re.match(r'^([+-])(\d{2})(\d{2})$', tz)
+    if m:
+        sign, hh, mm = m.group(1), m.group(2), m.group(3)
+        if (sign == "-" or sign == "+") and hh == "00" and mm == "00":
+            return "Z"
+        return f"{sign}{hh}:{mm}"
+    # +HH:MM or -HH:MM (with colon)
+    m = _re.match(r'^([+-])(\d{2}):(\d{2})$', tz)
+    if m:
+        sign, hh, mm = m.group(1), m.group(2), m.group(3)
+        if hh == "00" and mm == "00":
+            return "Z"
+        return f"{sign}{hh}:{mm}"
+    # +HH or -HH (hours only, 2 digits) → +HH:00
+    m = _re.match(r'^([+-])(\d{2})$', tz)
+    if m:
+        sign, hh = m.group(1), m.group(2)
+        return f"{sign}{hh}:00"
+    # -HH:MM:SS → keep as-is, but strip :00 seconds
+    return _normalize_tz_offset(tz)
+
+
+def _iana_tz_offset(iana_name, ref_year=2015, ref_month=7, ref_day=21):
+    """Return '+HH:MM' or '+HH:MM:SS' offset for IANA timezone at reference date."""
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        import datetime as _dt2
+        _zi = _ZI(iana_name)
+        _aware = _dt2.datetime(ref_year, ref_month, ref_day, tzinfo=_zi)
+        _off = _aware.utcoffset()
+        _total_s = int(_off.total_seconds())
+        _sign = "+" if _total_s >= 0 else "-"
+        _abs_s = abs(_total_s)
+        _hh = _abs_s // 3600
+        _mm = (_abs_s % 3600) // 60
+        _ss = _abs_s % 60
+        if _ss:
+            return f"{_sign}{_hh:02d}:{_mm:02d}:{_ss:02d}"
+        return f"{_sign}{_hh:02d}:{_mm:02d}"
+    except Exception:
+        return ""
+
+
+def _parse_time_string(s, ref_year=2015, ref_month=7, ref_day=21):
+    """
+    Parse ISO 8601 time string to normalized form 'HH:MM[:SS[.frac]][tz]'.
+    Returns normalized string or None.
+    """
+    import re as _re
+    s = s.strip()
+    # Split off IANA bracket zone [Name]
+    iana_suffix = ""
+    iana_name = ""
+    m_iana = _re.match(r'^(.*?)(\[([^\]]+)\])$', s)
+    if m_iana:
+        s = m_iana.group(1)
+        iana_name = m_iana.group(3)
+        iana_suffix = f"[{iana_name}]"
+
+    # Split off timezone
+    tz = ""
+    m = _re.match(r'^(.*?)([Zz]|[+-]\d{2}(?::?\d{2}(?::?\d{2})?)?)$', s)
+    if m:
+        time_part = m.group(1)
+        tz_raw = m.group(2)
+        tz = _normalize_tz_str(tz_raw)
+        # If no explicit offset but IANA zone given, compute the offset
+        if iana_name and not tz:
+            tz = _iana_tz_offset(iana_name, ref_year, ref_month, ref_day)
+    else:
+        time_part = s
+        if iana_name:
+            tz = _iana_tz_offset(iana_name, ref_year, ref_month, ref_day)
+
+    # Extended: HH:MM[:SS[.frac]]
+    m = _re.match(r'^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?$', time_part)
+    if m:
+        h, mi, s_str, frac = m.group(1), m.group(2), m.group(3), m.group(4)
+        if s_str:
+            if frac:
+                return f"{h}:{mi}:{s_str}.{frac}{tz}{iana_suffix}"
+            return f"{h}:{mi}:{s_str}{tz}{iana_suffix}"
+        return f"{h}:{mi}{tz}{iana_suffix}"
+
+    # Compact: HHMMSS.frac or HHMMSS or HHMM or HH
+    m = _re.match(r'^(\d{2})(?:(\d{2})(?:(\d{2})(?:\.(\d+))?)?)?$', time_part)
+    if m:
+        h = m.group(1)
+        mi = m.group(2) or "00"
+        s_str = m.group(3)
+        frac = m.group(4)
+        if s_str:
+            if frac:
+                return f"{h}:{mi}:{s_str}.{frac}{tz}{iana_suffix}"
+            return f"{h}:{mi}:{s_str}{tz}{iana_suffix}"
+        if m.group(2):
+            return f"{h}:{mi}{tz}{iana_suffix}"
+        return f"{h}:00{tz}{iana_suffix}"
+
+    return None
+
+
+def _parse_datetime_string(s):
+    """
+    Parse ISO 8601 datetime string (with T separator) to normalized form.
+    Returns normalized string or None.
+    """
+    s = s.strip()
+    # Split at T
+    if "T" not in s and "t" not in s:
+        return None
+    sep_idx = s.upper().index("T")
+    date_str = s[:sep_idx]
+    rest = s[sep_idx + 1:]
+
+    parsed_date = _parse_date_string(date_str)
+    if not parsed_date:
+        return None
+    y_out, mo_out, d_out = parsed_date
+
+    parsed_time = _parse_time_string(rest, ref_year=y_out, ref_month=mo_out, ref_day=d_out)
+    if not parsed_time:
+        return None
+
+    return f"{y_out:04d}-{mo_out:02d}-{d_out:02d}T{parsed_time}"
+
+
+def _parse_duration_string(s):
+    """
+    Parse ISO 8601 duration string into (years, months, days, hours, minutes, seconds_ns_total).
+    Handles fractional components. Returns normalized ISO 8601 string or None.
+    """
+    import re as _re
+
+    s = s.strip()
+    # Calendar notation: P2012-02-02T14:37:21.545 → Pyyyy-mm-ddThh:mm:ss.frac
+    m = _re.match(r'^P(-?\d+)-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$', s)
+    if m:
+        yr, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        h, mi, sec = int(m.group(4)), int(m.group(5)), int(m.group(6))
+        frac_str = m.group(7) or ""
+        rem_ns = int(frac_str.ljust(9, '0')[:9]) if frac_str else 0
+        return _format_duration(yr, mo, d, h, mi, sec, rem_ns)
+
+    # Standard: PnYnMnWnDTnHnMnS with possible fractions on last component
+    m = _re.match(
+        r'^P'
+        r'(?:(-?[\d.]+)Y)?'
+        r'(?:(-?[\d.]+)M)?'
+        r'(?:(-?[\d.]+)W)?'
+        r'(?:(-?[\d.]+)D)?'
+        r'(?:T'
+        r'(?:(-?[\d.]+)H)?'
+        r'(?:(-?[\d.]+)M)?'
+        r'(?:(-?[\d.]+)S)?'
+        r')?$',
+        s
+    )
+    if not m or not any(m.groups()):
+        return None
+
+    years = float(m.group(1) or 0)
+    months = float(m.group(2) or 0)
+    weeks = float(m.group(3) or 0)
+    days = float(m.group(4) or 0)
+    hours = float(m.group(5) or 0)
+    minutes = float(m.group(6) or 0)
+    seconds = float(m.group(7) or 0)
+
+    # Normalize fractional components
+    mo_int = int(months)
+    mo_frac = months - mo_int
+    days = days + mo_frac * 30.436875
+    days = days + weeks * 7
+
+    d_int = int(days)
+    d_frac = days - d_int
+    hours = hours + d_frac * 24
+
+    h_int = int(hours)
+    h_frac = hours - h_int
+    minutes = minutes + h_frac * 60
+
+    m_int = int(minutes)
+    m_frac = minutes - m_int
+    seconds = seconds + m_frac * 60
+
+    s_int = int(seconds)
+    s_frac = seconds - s_int
+    rem_ns = round(s_frac * 1_000_000_000)
+
+    # Normalize seconds → minutes → hours → days
+    extra_s = rem_ns // 1_000_000_000
+    rem_ns = rem_ns % 1_000_000_000
+    s_int += extra_s
+    extra_m = s_int // 60
+    s_int = s_int % 60
+    m_int += extra_m
+    extra_h = m_int // 60
+    m_int = m_int % 60
+    h_int += extra_h
+    extra_d = h_int // 24
+    h_int = h_int % 24
+    d_int += extra_d
+
+    return _format_duration(int(years), mo_int, d_int, h_int, m_int, s_int, rem_ns)
+
+
+def _format_duration(yr_int, mo_int, d_int, h_int, m_int, s_int, rem_ns):
+    date_part = ""
+    if yr_int:
+        date_part += f"{yr_int}Y"
+    if mo_int:
+        date_part += f"{mo_int}M"
+    if d_int:
+        date_part += f"{d_int}D"
+    time_part = ""
+    if h_int:
+        time_part += f"{h_int}H"
+    if m_int:
+        time_part += f"{m_int}M"
+    if rem_ns > 0:
+        ns_str = f"{rem_ns:09d}".rstrip('0')
+        time_part += f"{s_int}.{ns_str}S"
+    elif s_int:
+        time_part += f"{s_int}S"
+    if not date_part and not time_part:
+        return "PT0S"
+    if time_part:
+        return f"P{date_part}T{time_part}"
+    return f"P{date_part}"
+
+
+def _normalize_tz_offset(tz):
+    """Normalize timezone offset string: strip trailing :00 seconds component."""
+    import re as _re
+    # +HH:MM:00 → +HH:MM, but keep +HH:MM:SS if SS != 00
+    m = _re.match(r'^([+-]\d{2}:\d{2}):00$', tz)
+    if m:
+        return m.group(1)
+    return tz
+
+
+def _subsecond_frac(ns, us, ms):
+    """Combine nanosecond/microsecond/millisecond into 9-digit nanosecond fraction string, strip trailing zeros."""
+    total_ns = 0
+    if ms >= 0:
+        total_ns += ms * 1_000_000
+    if us >= 0:
+        total_ns += us * 1_000
+    if ns >= 0:
+        total_ns += ns
+    if ms < 0 and us < 0 and ns < 0:
+        return None
+    if total_ns == 0:
+        return None
+    raw = f"{total_ns:09d}"
+    return raw.rstrip('0')
+
+
+def _parse_date_string(s):
+    """Parse ISO 8601 date string to (year, month, day). Returns None on failure."""
+    import datetime as _dt
+    import re as _re
+    s = s.strip()
+    # YYYY-MM-DD or YYYYMMDD
+    m = _re.match(r'^(\d{4})-(\d{2})-(\d{2})$', s)
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    m = _re.match(r'^(\d{4})(\d{2})(\d{2})$', s)
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    # YYYY-MM or YYYYMM → first day of month
+    m = _re.match(r'^(\d{4})-(\d{2})$', s)
+    if m:
+        return int(m.group(1)), int(m.group(2)), 1
+    m = _re.match(r'^(\d{4})(\d{2})$', s)
+    if m:
+        return int(m.group(1)), int(m.group(2)), 1
+    # YYYY → Jan 1
+    m = _re.match(r'^(\d{4})$', s)
+    if m:
+        return int(m.group(1)), 1, 1
+    # YYYY-Www-D or YYYYWwwD
+    m = _re.match(r'^(\d{4})-W(\d{2})-(\d)$', s)
+    if m:
+        d = _date_from_iso_week(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return d.year, d.month, d.day
+    m = _re.match(r'^(\d{4})W(\d{2})(\d)$', s)
+    if m:
+        d = _date_from_iso_week(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return d.year, d.month, d.day
+    # YYYY-Www or YYYYWww → Monday of that week
+    m = _re.match(r'^(\d{4})-W(\d{2})$', s)
+    if m:
+        d = _date_from_iso_week(int(m.group(1)), int(m.group(2)), 1)
+        return d.year, d.month, d.day
+    m = _re.match(r'^(\d{4})W(\d{2})$', s)
+    if m:
+        d = _date_from_iso_week(int(m.group(1)), int(m.group(2)), 1)
+        return d.year, d.month, d.day
+    # YYYY-DDD or YYYYDDD (ordinal)
+    m = _re.match(r'^(\d{4})-(\d{3})$', s)
+    if m:
+        d = _date_from_ordinal_day(int(m.group(1)), int(m.group(2)))
+        return d.year, d.month, d.day
+    m = _re.match(r'^(\d{4})(\d{3})$', s)
+    if m:
+        d = _date_from_ordinal_day(int(m.group(1)), int(m.group(2)))
+        return d.year, d.month, d.day
+    return None
+
+
+def _build_date_from_map(m, with_time=False, with_tz=False):
+    """
+    Build a date/datetime string from a MapLiteral.
+    Returns None if map contains non-literal (dynamic) expressions.
+    """
+    import datetime as _dt
+
+    # Resolve 'date' base key (string override)
+    base_year, base_month, base_day = None, None, None
+    base_iso_year = None  # ISO week-year may differ from calendar year
+    base_iso_week_day = None  # ISO weekday (Mon=1) of the base date
+    if _has_map_key(m, "date"):
+        base_expr = m.entries["date"]
+        # date('YYYY-MM-DD') nested call
+        if (isinstance(base_expr, ast.FunctionCall) and
+                base_expr.function_name.lower() == "date" and
+                base_expr.arguments and
+                isinstance(base_expr.arguments[0], ast.Literal) and
+                isinstance(base_expr.arguments[0].value, str)):
+            parsed = _parse_date_string(base_expr.arguments[0].value)
+            if parsed:
+                base_year, base_month, base_day = parsed
+                base_dt = _dt.date(base_year, base_month, base_day)
+                iso_cal = base_dt.isocalendar()
+                base_iso_year = iso_cal[0]
+                base_iso_week_day = iso_cal[2]
+        if base_year is None:
+            return None  # dynamic base date — can't resolve at compile time
+
+    # year (for week calculations, use ISO week-year from base date if year not explicit)
+    if _has_map_key(m, "year"):
+        year = _extract_int_from_map_entry(m, "year", 1970)
+        iso_year = year
+    elif base_year is not None:
+        year = base_year
+        iso_year = base_iso_year if base_iso_year is not None else base_year
+    else:
+        year = 1970
+        iso_year = 1970
+
+    # Determine date component based on which keys are present
+    if _has_map_key(m, "week"):
+        week = _extract_int_from_map_entry(m, "week", 1)
+        # Default dayOfWeek: from explicit key, or base date's weekday, or 1 (Monday)
+        if _has_map_key(m, "dayOfWeek"):
+            dow = _extract_int_from_map_entry(m, "dayOfWeek", 1)
+        elif base_iso_week_day is not None:
+            dow = base_iso_week_day
+        else:
+            dow = 1
+        try:
+            d = _date_from_iso_week(iso_year, week, dow)
+            y_out, mo_out, d_out = d.year, d.month, d.day
+        except Exception:
+            return None
+    elif _has_map_key(m, "ordinalDay"):
+        ordinal = _extract_int_from_map_entry(m, "ordinalDay", 1)
+        try:
+            d = _date_from_ordinal_day(year, ordinal)
+            y_out, mo_out, d_out = d.year, d.month, d.day
+        except Exception:
+            return None
+    elif _has_map_key(m, "quarter"):
+        quarter = _extract_int_from_map_entry(m, "quarter", 1)
+        doq = _extract_int_from_map_entry(m, "dayOfQuarter", 1)
+        try:
+            d = _date_from_quarter(year, quarter, doq)
+            y_out, mo_out, d_out = d.year, d.month, d.day
+        except Exception:
+            return None
+    else:
+        mo_out = _extract_int_from_map_entry(m, "month", base_month if base_month else 1)
+        d_out = _extract_int_from_map_entry(m, "day", base_day if base_day else 1)
+        y_out = year
+
+    if not with_time:
+        return f"'{y_out:04d}-{mo_out:02d}-{d_out:02d}'"
+
+    h = _extract_int_from_map_entry(m, "hour", 0)
+    mi = _extract_int_from_map_entry(m, "minute", 0)
+    s = _extract_int_from_map_entry(m, "second", 0)
+    # sub-second precision — combine ms/us/ns per openCypher spec
+    ns = _extract_int_from_map_entry(m, "nanosecond", -1)
+    us = _extract_int_from_map_entry(m, "microsecond", -1)
+    ms = _extract_int_from_map_entry(m, "millisecond", -1)
+    frac = _subsecond_frac(ns, us, ms)
+
+    if frac is not None or ns >= 0 or us >= 0 or ms >= 0:
+        if frac:
+            time_str = f"{h:02d}:{mi:02d}:{s:02d}.{frac}"
+        else:
+            time_str = f"{h:02d}:{mi:02d}:{s:02d}"
+    else:
+        time_str = f"{h:02d}:{mi:02d}"
+        if s != 0:
+            time_str = f"{h:02d}:{mi:02d}:{s:02d}"
+
+    if with_tz:
+        tz_str = "Z"
+        if "timezone" in m.entries:
+            tz_expr = m.entries["timezone"]
+            if isinstance(tz_expr, ast.Literal) and isinstance(tz_expr.value, str):
+                tz_name = tz_expr.value
+                # Named IANA timezone: compute offset and format as +HH:MM[Name]
+                if "/" in tz_name or tz_name in ("UTC", "GMT"):
+                    try:
+                        from zoneinfo import ZoneInfo as _ZoneInfo
+                        _zi = _ZoneInfo(tz_name)
+                        _aware = _dt.datetime(y_out, mo_out, d_out, tzinfo=_zi)
+                        _off = _aware.utcoffset()
+                        _total_s = int(_off.total_seconds())
+                        _sign = "+" if _total_s >= 0 else "-"
+                        _abs_s = abs(_total_s)
+                        _hh = _abs_s // 3600
+                        _mm = (_abs_s % 3600) // 60
+                        tz_str = f"{_sign}{_hh:02d}:{_mm:02d}[{tz_name}]"
+                    except Exception:
+                        tz_str = tz_name
+                else:
+                    tz_str = _normalize_tz_offset(tz_name)
+    else:
+        tz_str = ""
+    return f"'{y_out:04d}-{mo_out:02d}-{d_out:02d}T{time_str}{tz_str}'"
+
+
 def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
     if fn == "haversin":
         return f"(1 - COS({args[0]})) / 2" if args else "NULL"
@@ -3432,12 +5126,148 @@ def _scalar_numeric_and_datetime(fn, args, args_exprs, context):
         return "CAST(DATEDIFF('ms', '1970-01-01', GETDATE()) AS BIGINT)"
     if fn == "randomuuid":
         return "SQLUser.NEWID()"
-    if fn in ("datetime", "localdatetime"):
-        return f"CAST(GETDATE() AS TIMESTAMP)" if not args else f"CAST({args[0]} AS TIMESTAMP)"
+    if fn == "date":
+        if not args:
+            return "NULL"
+        if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
+            result = _build_date_from_map(args_exprs[0], with_time=False)
+            if result is not None:
+                return result
+        # String arg: parse ISO 8601 formats
+        if args_exprs and isinstance(args_exprs[0], ast.Literal) and isinstance(args_exprs[0].value, str):
+            parsed = _parse_date_string(args_exprs[0].value)
+            if parsed:
+                return f"'{parsed[0]:04d}-{parsed[1]:02d}-{parsed[2]:02d}'"
+        return args[0]
+    if fn in ("localdatetime",):
+        if not args:
+            return "NULL"
+        if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
+            result = _build_date_from_map(args_exprs[0], with_time=True, with_tz=False)
+            if result is not None:
+                return result
+        if args_exprs and isinstance(args_exprs[0], ast.Literal) and isinstance(args_exprs[0].value, str):
+            parsed = _parse_datetime_string(args_exprs[0].value)
+            if parsed:
+                return f"'{parsed}'"
+        return args[0]
+    if fn in ("datetime",):
+        if not args:
+            return "NULL"
+        if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
+            result = _build_date_from_map(args_exprs[0], with_time=True, with_tz=True)
+            if result is not None:
+                return result
+        if args_exprs and isinstance(args_exprs[0], ast.Literal) and isinstance(args_exprs[0].value, str):
+            parsed = _parse_datetime_string(args_exprs[0].value)
+            if parsed:
+                return f"'{parsed}'"
+        return args[0]
     if fn in ("localtime", "time"):
-        return f"CAST(GETDATE() AS TIME)"
+        if not args:
+            return "NULL"
+        if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
+            m = args_exprs[0]
+            h = _extract_int_from_map_entry(m, "hour", 0)
+            mi = _extract_int_from_map_entry(m, "minute", 0)
+            s = _extract_int_from_map_entry(m, "second", 0)
+            ns = _extract_int_from_map_entry(m, "nanosecond", -1)
+            us = _extract_int_from_map_entry(m, "microsecond", -1)
+            ms_val = _extract_int_from_map_entry(m, "millisecond", -1)
+            frac = _subsecond_frac(ns, us, ms_val)
+            if frac:
+                time_part = f"{h:02d}:{mi:02d}:{s:02d}.{frac}"
+            elif ns >= 0 or us >= 0 or ms_val >= 0 or s != 0:
+                time_part = f"{h:02d}:{mi:02d}:{s:02d}"
+            else:
+                time_part = f"{h:02d}:{mi:02d}"
+            if fn == "time":
+                tz_val = None
+                if "timezone" in m.entries:
+                    tz_expr = m.entries["timezone"]
+                    if isinstance(tz_expr, ast.Literal) and isinstance(tz_expr.value, str):
+                        tz_val = _normalize_tz_offset(tz_expr.value)
+                tz_str = tz_val if tz_val else "Z"
+                return f"'{time_part}{tz_str}'"
+            return f"'{time_part}'"
+        if args_exprs and isinstance(args_exprs[0], ast.Literal) and isinstance(args_exprs[0].value, str):
+            parsed = _parse_time_string(args_exprs[0].value)
+            if parsed:
+                if fn == "time" and not any(c in parsed for c in "Z+-"):
+                    parsed = parsed + "Z"
+                return f"'{parsed}'"
+        return args[0]
     if fn == "duration":
-        return f"CAST({args[0]} AS VARCHAR(256))" if args else "NULL"
+        if not args:
+            return "NULL"
+        if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
+            m = args_exprs[0]
+            # Collect all components (allow float for fractional values)
+            years = _extract_num_from_map_entry(m, "years", 0)
+            months = _extract_num_from_map_entry(m, "months", 0)
+            weeks = _extract_num_from_map_entry(m, "weeks", 0)
+            days = _extract_num_from_map_entry(m, "days", 0)
+            hours = _extract_num_from_map_entry(m, "hours", 0)
+            minutes = _extract_num_from_map_entry(m, "minutes", 0)
+            seconds = _extract_num_from_map_entry(m, "seconds", 0)
+            ms_d = _extract_num_from_map_entry(m, "milliseconds", 0)
+            us_d = _extract_num_from_map_entry(m, "microseconds", 0)
+            ns_d = _extract_num_from_map_entry(m, "nanoseconds", 0)
+
+            # Normalize: fractional months → days, fractional weeks → days, etc.
+            # months with fraction → convert fraction to days (avg 30.436875)
+            mo_int = int(months)
+            mo_frac = months - mo_int
+            days = days + mo_frac * 30.436875
+
+            # weeks → days
+            days = days + weeks * 7
+
+            # fractional days → hours
+            d_int = int(days)
+            d_frac = days - d_int
+            hours = hours + d_frac * 24
+
+            # fractional hours → minutes
+            h_int = int(hours)
+            h_frac = hours - h_int
+            minutes = minutes + h_frac * 60
+
+            # fractional minutes → seconds
+            m_int = int(minutes)
+            m_frac = minutes - m_int
+            seconds = seconds + m_frac * 60
+
+            # sub-second to nanoseconds
+            total_ns = round(ms_d * 1_000_000 + us_d * 1_000 + ns_d)
+            # Convert fractional seconds to nanoseconds
+            s_int = int(seconds)
+            s_frac = seconds - s_int
+            total_ns += round(s_frac * 1_000_000_000)
+            # Normalize nanoseconds → seconds
+            extra_s = total_ns // 1_000_000_000
+            rem_ns = total_ns % 1_000_000_000
+            s_int += extra_s
+            # Normalize seconds → minutes
+            extra_m = s_int // 60
+            s_int = s_int % 60
+            m_int += extra_m
+            # Normalize minutes → hours
+            extra_h = m_int // 60
+            m_int = m_int % 60
+            h_int += extra_h
+            # Normalize hours → days
+            extra_d = h_int // 24
+            h_int = h_int % 24
+            d_int += extra_d
+
+            result_str = _format_duration(int(years), mo_int, d_int, h_int, m_int, s_int, rem_ns)
+            return f"'{result_str}'"
+        if args_exprs and isinstance(args_exprs[0], ast.Literal) and isinstance(args_exprs[0].value, str):
+            parsed = _parse_duration_string(args_exprs[0].value)
+            if parsed:
+                return f"'{parsed}'"
+        return args[0]
     return None
 
 
@@ -3463,7 +5293,7 @@ def _scalar_statistical(fn, args, args_exprs, context):
 
 def _scalar_type_conversion(fn, args, args_exprs):
     if fn == "toboolean":
-        return f"CASE WHEN LOWER(CAST({args[0]} AS VARCHAR)) IN ('true','1','yes','y') THEN 1 ELSE 0 END"
+        return f"CASE WHEN LOWER(CAST({args[0]} AS VARCHAR)) IN ('true','1','yes','y') THEN 1 WHEN LOWER(CAST({args[0]} AS VARCHAR)) IN ('false','0','no','n') THEN 0 ELSE NULL END"
     return None
 
 
@@ -3528,7 +5358,13 @@ def _expr_fn_path_funcs(fn, expr, context):
         return f"JSON_ARRAY({', '.join(f'{a}.node_id' for a in aliases)})"
     else:
         aliases = context.path_edge_aliases[path_var]
-        return f"JSON_ARRAY({', '.join(f'{a}.p' for a in aliases)})"
+        undirected_aliases = getattr(context, "_undirected_aliases", set())
+        rel_refs = []
+        for a in aliases:
+            # Use _p for bidirectional (undirected) edges, p for directed edges
+            col = "_p" if a in undirected_aliases else "p"
+            rel_refs.append(f"{a}.{col}")
+        return f"JSON_ARRAY({', '.join(rel_refs)})"
 
 
 def _expr_fn_vector_ops(fn, args_exprs, args, context):
@@ -3622,6 +5458,10 @@ def _expr_fn_range(args_exprs):
 
 def _expr_fn_list_ops(fn, args, args_exprs):
     if fn == "keys":
+        # For literal maps, extract keys at compile time
+        if args_exprs and isinstance(args_exprs[0], ast.MapLiteral):
+            keys = list(args_exprs[0].entries.keys())
+            return f"JSON_ARRAY({', '.join(repr(k) for k in keys)})"
         return _expr_fn_keys(args)
     if fn == "range":
         return _expr_fn_range(args_exprs)
@@ -3671,7 +5511,13 @@ def _expr_function_call(expr, context, segment):
         v = expr.arguments[0].value
         if not isinstance(v, str):
             return "1" if v else "0"
-    
+    # toString(bool_expr): must be checked BEFORE args translation to avoid double-parameter issue
+    if fn == "tostring" and expr.arguments:
+        arg0 = expr.arguments[0]
+        if isinstance(arg0, ast.BooleanExpression):
+            cond = translate_boolean_expression(arg0, context)
+            return f"CASE WHEN ({cond}) THEN 'true' ELSE 'false' END"
+
     def _translate_arg(a):
         if isinstance(a, ast.Literal) and not isinstance(a.value, list):
             inlined = _inline_literal(a)
@@ -3693,6 +5539,18 @@ def _expr_function_call(expr, context, segment):
         return labels_subquery(args[0] if args else "NULL")
     if fn == "properties":
         return properties_subquery(args[0] if args else "NULL")
+
+    # size(x) where x is a scalar list-predicate variable (VARCHAR holding either a
+    # plain string or a JSON-encoded list/map): dispatch at runtime by first character.
+    if fn == "size" and args and expr.arguments:
+        arg0 = expr.arguments[0]
+        if isinstance(arg0, ast.Variable) and arg0.name in context.scalar_variables:
+            col = args[0]
+            return (
+                f"CASE WHEN SUBSTRING({col}, 1, 1) IN ('[', '{{') "
+                f"THEN SQLUser.JSON_ARRAYLENGTH({col}) "
+                f"ELSE LENGTH({col}) END"
+            )
 
     result = _expr_fn_list_ops(fn, args, expr.arguments)
     if result is not None:
@@ -3735,6 +5593,26 @@ def _expr_function_call(expr, context, segment):
 
 def _expr_boolean(expr, context, segment):
     cond = translate_boolean_expression(expr, context)
+    # If the condition evaluates to SQL NULL (e.g. NOT null, null = null),
+    # the result must also be NULL (Cypher three-valued logic).
+    if cond == "NULL":
+        return "NULL"
+    # Sentinel booleans from 3VL logic — return as integer literals
+    if cond == "(1=1)":
+        return "1"
+    if cond == "(1=0)":
+        return "0"
+    # If translate_boolean_expression already returned a 1/0/NULL CASE expression
+    # (e.g. for IN with null list elements, or 3VL AND/OR), don't wrap it again.
+    # Also handle 3VL CASE WHEN patterns with (1=0)/(1=1) that need integer normalization.
+    # IMPORTANT: only skip re-wrapping when the CASE is the entire expression (ends with END).
+    # e.g. "CASE WHEN (0=1) THEN 1 ELSE 0 END IS NULL" must still be wrapped because IRIS
+    # rejects a bare CASE expression followed by IS NULL in a SELECT list.
+    if cond.startswith("CASE WHEN ") and cond.endswith(" END"):
+        # Replace (1=0) and (1=1) sentinels with integers in the CASE WHEN body
+        cond = cond.replace("THEN (1=0)", "THEN 0").replace("THEN (1=1)", "THEN 1")
+        if " THEN 1 ELSE NULL END" in cond or " THEN 0 ELSE NULL END" in cond or " THEN 1 ELSE 0 END" in cond:
+            return cond
     return f"CASE WHEN ({cond}) THEN 1 ELSE 0 END"
 
 
@@ -3776,7 +5654,23 @@ def translate_expression(expr, context, segment="select") -> str:
         return _expr_function_call(expr, context, segment)
     if isinstance(expr, ast.BooleanExpression):
         return _expr_boolean(expr, context, segment)
-    
+    if isinstance(expr, ast.LabelPredicate):
+        alias = context.variable_aliases.get(expr.variable)
+        node_col = f"{alias}.node_id" if alias else "node_id"
+        labels_tbl = _table("rdf_labels")
+        if segment in ("select", "inline", None):
+            safe_label = context.add_select_param(expr.label)
+            cond = (
+                f"EXISTS (SELECT 1 FROM {labels_tbl} _lp"
+                f" WHERE _lp.s = {node_col} AND _lp.label = {safe_label})"
+            )
+            return f"CASE WHEN ({cond}) THEN 1 ELSE 0 END"
+        safe_label = context.add_where_param(expr.label)
+        return (
+            f"EXISTS (SELECT 1 FROM {labels_tbl} _lp"
+            f" WHERE _lp.s = {node_col} AND _lp.label = {safe_label})"
+        )
+
     return "NULL"
 
 
@@ -3786,6 +5680,7 @@ _IRIS_RESERVED = frozenset({
     "order","group","index","select","from","where","join","having",
     "union","insert","update","delete","create","drop","alter","set",
     "table","schema","column","row","data","id","user","date","time",
+    "result","results","null","true","false","top","exists","not","and","or",
 })
 
 
@@ -3793,7 +5688,66 @@ def _safe_alias(a: str) -> str:
     return f'"{a}"' if a and a.lower() in _IRIS_RESERVED else a
 
 
+def _expr_to_cypher_text(expr) -> str:
+    """Return a Cypher-text representation of an expression for use as a column alias."""
+    if isinstance(expr, ast.LabelPredicate):
+        return f"({expr.variable}:{expr.label})"
+    if isinstance(expr, ast.PropertyReference):
+        return f"{expr.variable}.{expr.property_name}"
+    if isinstance(expr, ast.PropertyAccessExpression):
+        base = _expr_to_cypher_text(expr.expression)
+        return f"{base}.{expr.property_name}" if base else f".{expr.property_name}"
+    if isinstance(expr, ast.Variable):
+        return expr.name
+    if isinstance(expr, ast.Literal):
+        return repr(expr.value)
+    if isinstance(expr, ast.BooleanExpression):
+        op = expr.operator
+        if op in (ast.BooleanOperator.IS_NULL, ast.BooleanOperator.IS_NOT_NULL):
+            left = _expr_to_cypher_text(expr.operands[0])
+            suffix = "IS NULL" if op == ast.BooleanOperator.IS_NULL else "IS NOT NULL"
+            return f"{left} {suffix}"
+        if op == ast.BooleanOperator.NOT and len(expr.operands) == 1:
+            return f"NOT {_expr_to_cypher_text(expr.operands[0])}"
+        op_str = {
+            ast.BooleanOperator.AND: "AND",
+            ast.BooleanOperator.OR: "OR",
+            ast.BooleanOperator.EQUALS: "=",
+            ast.BooleanOperator.NOT_EQUALS: "<>",
+            ast.BooleanOperator.LESS_THAN: "<",
+            ast.BooleanOperator.LESS_THAN_OR_EQUAL: "<=",
+            ast.BooleanOperator.GREATER_THAN: ">",
+            ast.BooleanOperator.GREATER_THAN_OR_EQUAL: ">=",
+            ast.BooleanOperator.IN: "IN",
+            ast.BooleanOperator.CONTAINS: "CONTAINS",
+            ast.BooleanOperator.STARTS_WITH: "STARTS WITH",
+            ast.BooleanOperator.ENDS_WITH: "ENDS WITH",
+        }.get(op, str(op))
+        parts = [_expr_to_cypher_text(o) for o in expr.operands]
+        return f" {op_str} ".join(parts)
+    if isinstance(expr, ast.AggregationFunction):
+        if expr.argument is None and expr.function_name == "count":
+            return "count(*)"
+        distinct = "DISTINCT " if expr.distinct else ""
+        arg_text = _expr_to_cypher_text(expr.argument) if expr.argument is not None else "*"
+        return f"{expr.function_name}({distinct}{arg_text})"
+    if isinstance(expr, ast.FunctionCall):
+        args = ", ".join(_expr_to_cypher_text(a) for a in expr.arguments)
+        return f"{expr.function_name}({args})"
+    return ""
+
+
 def translate_return_clause(ret, context):
+    # RETURN * after a WITH stage: the star is parsed as Literal('*').
+    # When we're selecting from a stage CTE, don't add any select_items — the
+    # _tts_select_result fallback (line ~1814) will emit "SELECT *" instead.
+    if (
+        len(ret.items) == 1
+        and isinstance(ret.items[0].expression, ast.Literal)
+        and ret.items[0].expression.value == "*"
+        and context.stages
+    ):
+        return
     for item in ret.items:
         if isinstance(item.expression, ast.Variable):
             var_name = item.expression.name
@@ -3802,7 +5756,13 @@ def translate_return_clause(ret, context):
                 node_aliases = context.path_node_aliases[var_name]
                 edge_aliases = context.path_edge_aliases[var_name]
                 nodes_arr = ", ".join(f"{a}.node_id" for a in node_aliases)
-                rels_arr = ", ".join(f"{a}.p" for a in edge_aliases)
+                # Use _p for bidirectional (undirected) edges, p for directed edges
+                undirected_aliases = getattr(context, "_undirected_aliases", set())
+                rels_parts = []
+                for a in edge_aliases:
+                    col = "_p" if a in undirected_aliases else "p"
+                    rels_parts.append(f"{a}.{col}")
+                rels_arr = ", ".join(rels_parts)
                 json_expr = f"'{{\"nodes\":' || JSON_ARRAY({nodes_arr}) || ',\"rels\":' || JSON_ARRAY({rels_arr}) || '}}'"
                 context.select_items.append(f"{json_expr} AS {_safe_alias(alias)}")
                 continue
@@ -3825,22 +5785,54 @@ def translate_return_clause(ret, context):
                 context.select_items.append(
                     f"{properties_subquery(node_expr)} AS {prefix}_props"
                 )
+                # Null-row for OPTIONAL MATCH: node is null → 3 NULLs
+                context.optional_null_row_items.extend(["NULL", "NULL", "NULL"])
                 continue
         sql = translate_expression(item.expression, context, segment="select")
         alias = item.alias
+        cypher_col = None  # Cypher-text column name for post-execution remapping
         if alias is None:
             if isinstance(item.expression, ast.PropertyReference):
                 alias = f"{item.expression.variable}_{item.expression.property_name}"
+                cypher_col = f"{item.expression.variable}.{item.expression.property_name}"
+                context.column_name_map[alias] = cypher_col
             elif isinstance(item.expression, ast.Variable):
                 alias = item.expression.name
             elif isinstance(
                 item.expression, (ast.AggregationFunction, ast.FunctionCall)
             ):
+                # For function calls (e.g., labels(a), count(*)), use cypher_text as the actual column name
+                cypher_text = _expr_to_cypher_text(item.expression)
                 alias = f"{item.expression.function_name}_res"
+                if cypher_text and cypher_text != alias:
+                    context.column_name_map[alias] = cypher_text
+            else:
+                cypher_text = _expr_to_cypher_text(item.expression)
+                if cypher_text:
+                    import re as _re_alias
+                    # Build a SQL-safe alias (replace non-identifier chars with underscores)
+                    alias = _re_alias.sub(r'[^A-Za-z0-9_]', '_', cypher_text)
+                    if alias and alias[0].isdigit():
+                        alias = f"_{alias}"
+                    # Register the mapping so the engine can rename after execution
+                    if alias and cypher_text != alias:
+                        context.column_name_map[alias] = cypher_text
         if alias:
             context.select_items.append(f"{sql} AS {_safe_alias(alias).replace('.', '_')}")
         else:
             context.select_items.append(sql)
+        # Build null-row value for OPTIONAL MATCH fallback:
+        # IS NULL → 1 (null IS NULL = true), IS NOT NULL → 0, else NULL
+        if isinstance(item.expression, ast.BooleanExpression):
+            op = item.expression.operator
+            if op == ast.BooleanOperator.IS_NULL:
+                context.optional_null_row_items.append("1")
+            elif op == ast.BooleanOperator.IS_NOT_NULL:
+                context.optional_null_row_items.append("0")
+            else:
+                context.optional_null_row_items.append("NULL")
+        else:
+            context.optional_null_row_items.append("NULL")
 
 
 def translate_with_clause(with_clause, context):
@@ -3875,6 +5867,27 @@ def translate_with_clause(with_clause, context):
                 alias = f"{item.expression.function_name}"
         if alias is None:
             alias = context.next_alias("v")
+        # Edge variables: expose qualifiers JSON so downstream r.prop works via JSON_VALUE(r, '$.prop')
+        if (isinstance(item.expression, ast.Variable)
+                and context.variable_aliases.get(item.expression.name, "").startswith("e")
+                and not context.variable_aliases.get(item.expression.name, "").startswith("Stage")):
+            e_alias = context.variable_aliases[item.expression.name]
+            sql = f"{e_alias}.qualifiers"
+            if not hasattr(context, "edge_stage_variables"):
+                context.edge_stage_variables = set()
+            context.edge_stage_variables.add(item.expression.name)
+            # Preserve edge identity columns so DELETE can find the original edge row
+            # even after the relationship variable is promoted to a CTE stage.
+            var_name = item.expression.name
+            is_undirected = e_alias in getattr(context, "_undirected_aliases", set())
+            if is_undirected:
+                context.select_items.append(f"{e_alias}._src AS __edge_{var_name}_s")
+                context.select_items.append(f"{e_alias}._p AS __edge_{var_name}_p")
+                context.select_items.append(f"{e_alias}._dst AS __edge_{var_name}_o")
+            else:
+                context.select_items.append(f"{e_alias}.s AS __edge_{var_name}_s")
+                context.select_items.append(f"{e_alias}.p AS __edge_{var_name}_p")
+                context.select_items.append(f"{e_alias}.o_id AS __edge_{var_name}_o")
         context.select_items.append(f"{sql} AS {_safe_alias(alias).replace('.', '_')}")
         if has_agg and not isinstance(item.expression, ast.AggregationFunction):
             context.group_by_items.append(sql)

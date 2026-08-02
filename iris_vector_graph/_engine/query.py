@@ -4,7 +4,7 @@ import re
 from typing import Dict, Any, List, Optional, Tuple
 
 from iris_vector_graph.cypher.parser import parse_query
-from iris_vector_graph.cypher.translator import translate_to_sql, _table
+from iris_vector_graph.cypher.translator import translate_to_sql
 from iris_vector_graph.result import IVGResult
 from iris_vector_graph._validate import CypherInput, KHop2Input
 
@@ -218,6 +218,10 @@ class QueryMixin:
         if sql_query.is_transactional:
             result = self._store.execute_transaction(sql_query.sql, sql_query.parameters)
             result.metadata = metadata
+            if sql_query.column_name_map and result.columns:
+                result.columns = [
+                    sql_query.column_name_map.get(col, col) for col in result.columns
+                ]
             return result
         if self._store_capabilities.get("native_sql", True):
             sql_str = sql_query.sql
@@ -226,6 +230,10 @@ class QueryMixin:
             result.metadata = metadata
             if sql_query.bolt_column_types:
                 result.bolt_column_types = sql_query.bolt_column_types
+            if sql_query.column_name_map and result.columns:
+                result.columns = [
+                    sql_query.column_name_map.get(col, col) for col in result.columns
+                ]
             return result
         traversal = self._extract_traversal(parsed, parameters)
         if traversal is not None:
@@ -328,6 +336,32 @@ class QueryMixin:
             return self._execute_weighted_shortest_path(sql_query, parameters)
         if vl0.get("shortest") or vl0.get("all_shortest"):
             return self._execute_shortest_path_cypher(sql_query, parameters)
+
+        # Resolve source_id from explicit id parameter or query parameters
+        source_id = None
+        src_id_param = vl0.get("src_id_param")
+        if src_id_param:
+            if isinstance(src_id_param, str) and src_id_param.startswith("$"):
+                pname = src_id_param[1:]
+                if parameters and pname in parameters:
+                    source_id = str(parameters[pname])
+            elif src_id_param:
+                source_id = str(src_id_param)
+        if source_id is None and parameters:
+            src_var = vl0.get("source_var")
+            if src_var and src_var in parameters:
+                source_id = str(parameters[src_var])
+
+        # When source is not ID-bound, use labeled multi-source traversal.
+        # This covers two cases:
+        #   (a) source labeled in this pattern: source_labels is populated
+        #   (b) source bound in a prior MATCH: source_labels=[] but source_alias
+        #       is present in the SQL with label joins we can query.
+        # In both cases src_id_param is None and source_id remains None here.
+        source_labels = vl0.get("source_labels") or []
+        if source_id is None and src_id_param is None:
+            return self._execute_var_length_labeled(sql_query, parameters, vl0)
+
         if vl0.get("min_hops", 1) > 1 or vl0.get("properties") or vl0.get("return_path_funcs"):
             return self._execute_var_length_cypher(sql_query, parameters)
 
@@ -335,18 +369,15 @@ class QueryMixin:
         sql_str = sql_query.sql if isinstance(sql_query.sql, str) else (sql_query.sql[0] if sql_query.sql else "")
         count_match = _re.search(r'SELECT\s+COUNT\s*\(\s*DISTINCT\s+.*?\)\s+AS\s+(\w+)', sql_str, _re.IGNORECASE)
 
-        params = sql_query.parameters[0] if sql_query.parameters else []
-        source_id = None
-        for item in params:
-            if isinstance(item, str) and not item.startswith("Graph_KG"):
-                source_id = item
-                break
+        # Fallback source_id resolution from SQL parameters
+        if source_id is None:
+            params = sql_query.parameters[0] if sql_query.parameters else []
+            for item in params:
+                if isinstance(item, str) and not item.startswith("Graph_KG"):
+                    source_id = item
+                    break
         if source_id is None and parameters:
-            src_var = vl0.get("source_var")
-            if src_var and src_var in parameters:
-                source_id = str(parameters[src_var])
-            else:
-                source_id = next(iter(parameters.values()), None)
+            source_id = next(iter(parameters.values()), None)
 
         if source_id is None:
             return IVGResult(columns=[], rows=[], sql="", params=[], metadata=sql_query.query_metadata)
@@ -399,6 +430,197 @@ class QueryMixin:
                     metadata=result.metadata,
                 )
         return result
+    def _execute_var_length_labeled(self, sql_query, parameters, vl0) -> "IVGResult":
+        """Execute a variable-length path where source is identified by label(s).
+
+        Handles two cases:
+        1. Source labeled in same MATCH: source_labels is populated → use query_nodes
+        2. Source bound in prior MATCH clause: source_labels is empty but the SQL
+           FROM/JOIN clauses correctly filter source nodes → extract source IDs by
+           running a trimmed version of the SQL up to the Cartesian JOIN boundary.
+
+        Steps:
+        1. Collect source node IDs (via label lookup OR SQL-based extraction).
+        2. Run BFS from each source node.
+        3. Deduplicate target node IDs, applying min_hops filter.
+        4. Filter target nodes by target_labels if specified.
+        5. Fetch requested properties and return result shaped to the SQL SELECT.
+        """
+        import re as _re
+
+        source_labels = vl0.get("source_labels") or []
+        target_labels = vl0.get("target_labels") or []
+        predicates = vl0.get("types") or []
+        min_hops = vl0.get("min_hops", 1)
+        max_hops = vl0.get("max_hops", 10)
+        direction = vl0.get("direction", "out")
+        target_var = vl0.get("target_var") or "c"
+        source_alias = vl0.get("source_alias") or ""
+        target_alias = vl0.get("target_alias") or ""
+
+        sql_str = sql_query.sql if isinstance(sql_query.sql, str) else ""
+
+        # Determine result shape from column_name_map
+        col_map = sql_query.column_name_map or {}
+        is_count = any(
+            v.lower().startswith("count(") for v in col_map.values()
+        ) or bool(_re.search(r'SELECT\s+COUNT\s*\(', sql_str, _re.IGNORECASE))
+
+        # Build return_props list: [(cypher_expr, prop_key)] for the target variable
+        # Use cypher_expr (e.g. "c.name") as the output column name, not the SQL alias
+        # (e.g. "c_name"), so that TCK column comparison works correctly.
+        return_props = []
+        for sql_alias, cypher_expr in col_map.items():
+            if "." in cypher_expr:
+                var_name, prop_key = cypher_expr.split(".", 1)
+                if var_name == target_var:
+                    return_props.append((cypher_expr, prop_key))
+
+        out_cols = [col for col, _ in return_props] if return_props else [target_var]
+
+        # Step 1: Collect source node IDs
+        source_ids: list = []
+        if source_labels:
+            # Case 1: Source labeled in this MATCH pattern → use query_nodes per label
+            # Multiple labels use AND semantics: intersect the sets
+            label_sets = []
+            for lbl in source_labels:
+                try:
+                    lbl_result = self._store.query_nodes(label_filter=lbl)
+                    label_sets.append({row[0] for row in lbl_result.rows if row and row[0]})
+                except Exception as exc:
+                    logger.debug("label lookup failed for %s: %s", lbl, exc)
+            if label_sets:
+                common = label_sets[0]
+                for s in label_sets[1:]:
+                    common = common & s
+                source_ids = list(common)
+        elif source_alias and target_alias:
+            # Case 2: Source bound in prior MATCH — extract IDs by running a trimmed
+            # version of the SQL that stops before the Cartesian JOIN on target_alias.
+            # Pattern: "JOIN nodes {target_alias} ON 1=1" marks the boundary.
+            cartesian_pat = _re.compile(
+                r'\bJOIN\s+\S+\s+' + _re.escape(target_alias) + r'\s+ON\s+1\s*=\s*1\b',
+                _re.IGNORECASE,
+            )
+            m = cartesian_pat.search(sql_str)
+            if m:
+                # Build: SELECT DISTINCT {source_alias}.node_id FROM ... (source joins only)
+                # Use the FROM clause up to but not including the Cartesian JOIN
+                from_start = sql_str.find('\nFROM ')
+                if from_start == -1:
+                    from_start = sql_str.lower().find('\nfrom ')
+                src_portion = sql_str[from_start:m.start()].strip()
+                src_query = f"SELECT DISTINCT {source_alias}.node_id {src_portion}"
+                # WHERE clause for source: pick up conditions that reference source_alias
+                where_m = _re.search(r'\nWHERE\s+(.*?)(?:\n(?:ORDER|HAVING|GROUP|$))', sql_str, _re.DOTALL)
+                if where_m:
+                    where_raw = where_m.group(1).strip()
+                    # Keep only conditions that reference source_alias (not target_alias)
+                    src_conds = [
+                        c.strip() for c in _re.split(r'\bAND\b', where_raw, flags=_re.IGNORECASE)
+                        if source_alias in c and target_alias not in c
+                    ]
+                    if src_conds:
+                        src_query += "\nWHERE " + " AND ".join(src_conds)
+                # Use just the source-related params (those before target_alias params)
+                params_list = sql_query.parameters[0] if sql_query.parameters else []
+                # Count '?' in src_portion to determine how many params to use
+                src_param_count = src_query.count("?")
+                src_params = list(params_list[:src_param_count])
+                try:
+                    cursor = self._store.conn.cursor()
+                    cursor.execute(src_query, src_params)
+                    for row in cursor.fetchall():
+                        if row and row[0]:
+                            source_ids.append(row[0])
+                except Exception as exc:
+                    logger.debug("Source ID extraction query failed: %s", exc)
+
+        if not source_ids:
+            if is_count:
+                col_name = next(iter(col_map.keys()), "count")
+                return IVGResult(columns=[col_name], rows=[[0]], metadata=sql_query.query_metadata)
+            return IVGResult(columns=out_cols, rows=[], metadata=sql_query.query_metadata)
+
+        # Step 2: BFS from each source node, collecting unique (node_id, min_hop) pairs
+        # When min_hops == 0, source nodes are included (0-hop = self reachability).
+        min_hop_per_node: dict = {}
+        if min_hops == 0:
+            # Add source nodes themselves at hop 0
+            for src_id in source_ids:
+                min_hop_per_node[src_id] = 0
+
+        for src_id in source_ids:
+            try:
+                bfs_result = self._store.execute_bfs(src_id, predicates, max_hops, direction, 0)
+                if bfs_result and not getattr(bfs_result, "error", False):
+                    for row in bfs_result.rows:
+                        nid = row[0] if row else None
+                        hop = row[1] if len(row) > 1 else 1
+                        if nid:
+                            existing = min_hop_per_node.get(nid)
+                            if existing is None or hop < existing:
+                                min_hop_per_node[nid] = hop
+            except Exception as exc:
+                logger.debug("BFS failed from %s: %s", src_id, exc)
+
+        # Filter by min_hops and collect in-order unique target IDs
+        target_ids = [
+            nid for nid, hop in min_hop_per_node.items()
+            if hop >= min_hops
+        ]
+
+        # Step 3: Filter target nodes by target_labels (AND semantics per label)
+        if target_labels and target_ids:
+            for lbl in target_labels:
+                try:
+                    lbl_result = self._store.query_nodes(label_filter=lbl)
+                    labeled_ids = {row[0] for row in lbl_result.rows if row}
+                    target_ids = [nid for nid in target_ids if nid in labeled_ids]
+                except Exception as exc:
+                    logger.debug("target label lookup failed for %s: %s", lbl, exc)
+
+        if is_count:
+            # Use the Cypher expression (value of col_map) as column name for count too
+            col_name = next(iter(col_map.values()), "count")
+            return IVGResult(columns=[col_name], rows=[[len(target_ids)]], metadata=sql_query.query_metadata)
+
+        if not target_ids:
+            return IVGResult(columns=out_cols, rows=[], metadata=sql_query.query_metadata)
+
+        if not return_props:
+            # RETURN c (whole node) — return IDs only
+            return IVGResult(
+                columns=out_cols,
+                rows=[[nid] for nid in target_ids],
+                metadata=sql_query.query_metadata,
+            )
+
+        # Step 4: Fetch requested properties for each target node
+        prop_keys = [pk for _, pk in return_props]
+        props_result = self._store.get_nodes(target_ids, prop_keys)
+        # get_nodes returns rows: [node_id, labels_json, prop1, prop2, ...]
+        props_by_id: dict = {}
+        for row in (props_result.rows if props_result else []):
+            if row:
+                nid = row[0]
+                props_by_id[nid] = list(row[2:])  # skip node_id and labels
+
+        rows_out = []
+        for nid in target_ids:
+            prop_vals = list(props_by_id.get(nid, []))
+            # Pad to expected column count
+            while len(prop_vals) < len(prop_keys):
+                prop_vals.append(None)
+            rows_out.append(prop_vals[:len(prop_keys)])
+
+        return IVGResult(
+            columns=out_cols,
+            rows=rows_out,
+            metadata=sql_query.query_metadata,
+        )
+
     def _execute_weighted_shortest_path(
         self, sql_query, parameters=None
     ) -> Dict[str, Any]:

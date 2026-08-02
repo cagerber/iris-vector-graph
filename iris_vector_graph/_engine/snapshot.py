@@ -2,7 +2,6 @@ import json
 import logging
 from typing import Optional, Dict, Any, List
 
-from iris_vector_graph.cypher.translator import _table
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +158,7 @@ class SnapshotMixin:
         def _ensure_node(nid):
             try:
                 cursor.execute(
-                    f"INSERT INTO {_table('nodes')} (node_id) SELECT ? WHERE NOT EXISTS (SELECT 1 FROM {_table('nodes')} WHERE node_id = ?)",
+                    f"INSERT INTO {self._t('nodes')} (node_id) SELECT ? WHERE NOT EXISTS (SELECT 1 FROM {self._t('nodes')} WHERE node_id = ?)",
                     [nid, nid],
                 )
                 return True
@@ -179,12 +178,12 @@ class SnapshotMixin:
                 try:
                     if edge_graph:
                         cursor.execute(
-                            f"INSERT INTO {_table('rdf_edges')} (s, p, o_id, graph_id) SELECT ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM {_table('rdf_edges')} WHERE s = ? AND p = ? AND o_id = ? AND graph_id = ?)",
+                            f"INSERT INTO {self._t('rdf_edges')} (s, p, o_id, graph_id) SELECT ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM {self._t('rdf_edges')} WHERE s = ? AND p = ? AND o_id = ? AND graph_id = ?)",
                             [s, p, o, edge_graph, s, p, o, edge_graph],
                         )
                     else:
                         cursor.execute(
-                            f"INSERT INTO {_table('rdf_edges')} (s, p, o_id) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM {_table('rdf_edges')} WHERE s = ? AND p = ? AND o_id = ? AND graph_id IS NULL)",
+                            f"INSERT INTO {self._t('rdf_edges')} (s, p, o_id) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM {self._t('rdf_edges')} WHERE s = ? AND p = ? AND o_id = ? AND graph_id IS NULL)",
                             [s, p, o, s, p, o],
                         )
                     edges_inserted += 1
@@ -193,7 +192,7 @@ class SnapshotMixin:
             for s, k, v in batch_props:
                 try:
                     cursor.execute(
-                        f'INSERT INTO {_table("rdf_props")} (s, "key", val) VALUES (?, ?, ?)',
+                        f'INSERT INTO {self._t("rdf_props")} (s, "key", val) VALUES (?, ?, ?)',
                         [s, k, v[:64000]],
                     )
                     props_inserted += 1
@@ -873,7 +872,7 @@ class SnapshotMixin:
 
         cursor = self.conn.cursor()
         with open(path, "w") as f:
-            cursor.execute(f"SELECT node_id FROM {_table('nodes')}")
+            cursor.execute(f"SELECT node_id FROM {self._t('nodes')}")
             for (node_id,) in cursor.fetchall():
                 node_data = self.get_node(node_id)
                 if node_data:

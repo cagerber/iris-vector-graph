@@ -1,5 +1,25 @@
 # Changelog
 
+### v2.5.1 (2026-07-29)
+
+**Fix: schema_prefix process-global isolation**
+
+`schema_prefix` was a module-level global in `cypher/translator.py`. Two engines
+instantiated in the same process (e.g. one for a RAG schema, one for `Graph_KG`)
+silently overwrote each other's prefix — every read from the second engine resolved
+to the wrong schema and returned `SQLCODE -30`.
+
+`IRISGraphEngine` now stores `_schema_prefix` as instance state. All SQL generation
+in `_engine/` mixins calls `self._t(name)`, which passes the per-instance prefix to
+`_table(name, prefix=...)` rather than reading the module global. The module global
+is preserved for backward compatibility (the Cypher translator has no `self`).
+
+Adds 17 unit tests (`test_schema_prefix_isolation.py`), including a regression case
+that interleaves two engines with different prefixes across 5 rounds and asserts zero
+bleed-through.
+
+---
+
 ### v2.5.0 (2026-07-29)
 
 **Property-side read primitives — 9 new methods mirroring get_node_ids_by_label**

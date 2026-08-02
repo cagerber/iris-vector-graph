@@ -73,8 +73,8 @@ class VariableLength:
     all_shortest: bool = False
 
     def __post_init__(self):
-        if self.min_hops < 1:
-            raise ValueError("min_hops must be >= 1")
+        if self.min_hops < 0:
+            raise ValueError("min_hops must be >= 0")
         if self.max_hops < self.min_hops:
             raise ValueError("max_hops must be >= min_hops")
         limit = 15 if (self.shortest or self.all_shortest) else 10
@@ -267,6 +267,9 @@ class WithClause:
     distinct: bool = False
     where_clause: Optional[WhereClause] = None
     star: bool = False
+    order_by_clause: Optional['OrderByClause'] = None
+    skip: Optional[Union[int, 'Variable']] = None
+    limit: Optional[Union[int, 'Variable']] = None
 
 
 @dataclass(slots=True)

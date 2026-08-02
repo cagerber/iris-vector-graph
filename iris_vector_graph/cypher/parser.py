@@ -66,6 +66,23 @@ class Parser:
             return True
         return False
 
+    def expect_label(self) -> Token:
+        """Accept an IDENTIFIER or any keyword token as a node/rel label.
+
+        In Cypher, keywords like END, ELSE, NULL, etc. are contextual and valid
+        as label names. Using expect(IDENTIFIER) would reject them.
+        """
+        tok = self.peek()
+        if tok.kind == TokenType.IDENTIFIER or (
+            tok.value and tok.value.replace("_", "").isalnum()
+        ):
+            return self.eat()
+        raise CypherParseError(
+            f"Expected IDENTIFIER, got {tok.kind.value if tok.kind.value else tok.kind}",
+            line=tok.line,
+            column=tok.column,
+        )
+
     def parse_procedure_call(self) -> ast.CypherProcedureCall:
         """Parse CALL ivg.vector.search(args...) YIELD node, score [, ...]"""
         self.expect(TokenType.CALL)
@@ -270,7 +287,13 @@ class Parser:
         if self.peek().kind == TokenType.STAR:
             self.eat()
             where_clause = self.parse_where_clause()
-            return ast.WithClause(items=[], distinct=False, where_clause=where_clause, star=True)
+            order_by = self.parse_order_by_clause()
+            skip = self.parse_skip()
+            limit = self.parse_limit()
+            return ast.WithClause(
+                items=[], distinct=False, where_clause=where_clause, star=True,
+                order_by_clause=order_by, skip=skip, limit=limit
+            )
 
         distinct = self.matches(TokenType.DISTINCT)
         items = []
@@ -287,8 +310,14 @@ class Parser:
                 break
 
         where_clause = self.parse_where_clause()
+        order_by = self.parse_order_by_clause()
+        skip = self.parse_skip()
+        limit = self.parse_limit()
 
-        return ast.WithClause(items=items, distinct=distinct, where_clause=where_clause)
+        return ast.WithClause(
+            items=items, distinct=distinct, where_clause=where_clause,
+            order_by_clause=order_by, skip=skip, limit=limit
+        )
 
     def parse_query_part(self) -> ast.QueryPart:
         """Parse a single stage of a query (MATCH... UNWIND... WHERE... UPDATE...)"""
@@ -666,7 +695,7 @@ class Parser:
                 items.append(ast.SetItem(expression=target, value=value, merge=True))
             elif self.matches(TokenType.COLON):
                 # SET n:Label
-                label_tok = self.expect(TokenType.IDENTIFIER)
+                label_tok = self.expect_label()
                 label = label_tok.value if label_tok.value else ""
                 items.append(ast.SetItem(expression=target, value=label))
             else:
@@ -687,7 +716,7 @@ class Parser:
                 )
             if isinstance(target, ast.Variable) and self.peek().kind == TokenType.COLON:
                 self.eat()
-                label_tok = self.expect(TokenType.IDENTIFIER)
+                label_tok = self.expect_label()
                 items.append(ast.RemoveItem(expression=target, label=label_tok.value or ""))
             else:
                 items.append(ast.RemoveItem(expression=target))
@@ -723,7 +752,7 @@ class Parser:
         labels = []
         labels_or = False
         while self.matches(TokenType.COLON):
-            label_tok = self.expect(TokenType.IDENTIFIER)
+            label_tok = self.expect_label()
             if label_tok.value:
                 labels.append(label_tok.value)
             while self.peek().kind == TokenType.PIPE or (
@@ -732,7 +761,7 @@ class Parser:
             ):
                 self.eat()
                 labels_or = True
-                alt_tok = self.expect(TokenType.IDENTIFIER)
+                alt_tok = self.expect_label()
                 if alt_tok.value:
                     labels.append(alt_tok.value)
 
@@ -745,20 +774,57 @@ class Parser:
         return ast.NodePattern(variable=var, labels=labels, properties=props, labels_or=labels_or)
 
     def parse_relationship_pattern(self) -> ast.RelationshipPattern:
-        """Parse -[r:TYPE]-> or <-[r:TYPE]- or -[r:TYPE]-"""
+        """Parse -[r:TYPE]-> or <-[r:TYPE]- or -[r:TYPE]- or --> or <-- or --
+
+        Supports both explicit brackets -[r:TYPE]-> and anonymous relationships:
+        - --> : outgoing anonymous (equivalent to -[]->)
+        - <-- : incoming anonymous (equivalent to <-[]-)
+        - -- : both anonymous (equivalent to -[]-)
+        """
         direction = ast.Direction.BOTH
 
         if self.matches(TokenType.ARROW_LEFT):
+            # <-[...]-  or <-- (anonymous incoming)
             direction = ast.Direction.INCOMING
-            self.expect(TokenType.LBRACKET)
+            if self.peek().kind == TokenType.MINUS:
+                # Consume the second MINUS
+                self.eat()
+                # Now check if it's <-- (anonymous) or <-[...-
+                if self.peek().kind == TokenType.LBRACKET:
+                    # <-[...] — has brackets, proceed with bracket parsing
+                    pass
+                else:
+                    # <-- anonymous relationship (completed)
+                    return ast.RelationshipPattern(
+                        variable=None,
+                        types=[],
+                        direction=ast.Direction.INCOMING,
+                        properties={},
+                        variable_length=None,
+                    )
+            else:
+                # Expected <-[ for explicit bracket syntax
+                self.expect(TokenType.LBRACKET)
         else:
             self.expect(TokenType.MINUS)
             if self.matches(TokenType.LBRACKET):
-                # -[...]
+                # -[...] pattern (explicit bracket)
                 pass
             else:
-                if self.peek().kind == TokenType.MINUS:
-                    self.eat()
+                # Check what comes after the first MINUS
+                if self.peek().kind == TokenType.ARROW_RIGHT:
+                    # --> outgoing anonymous (MINUS already consumed, see ARROW_RIGHT)
+                    self.eat()  # consume the ARROW_RIGHT
+                    return ast.RelationshipPattern(
+                        variable=None,
+                        types=[],
+                        direction=ast.Direction.OUTGOING,
+                        properties={},
+                        variable_length=None,
+                    )
+                elif self.peek().kind == TokenType.MINUS:
+                    # -- both anonymous
+                    self.eat()  # consume second MINUS
                     return ast.RelationshipPattern(
                         variable=None,
                         types=[],
@@ -766,25 +832,29 @@ class Parser:
                         properties={},
                         variable_length=None,
                     )
-                tok = self.peek()
-                raise CypherParseError("Expected '[' after '-'", tok.line, tok.column)
+                else:
+                    tok = self.peek()
+                    raise CypherParseError("Expected '[' after '-'", tok.line, tok.column)
 
-        # Inside brackets [...]
+        # Inside brackets [...] — parse variable, types, variable_length, properties
         var = None
         if self.peek().kind == TokenType.IDENTIFIER:
             var = self.eat().value
 
         types = []
         if self.matches(TokenType.COLON):
-            type_tok = self.expect(TokenType.IDENTIFIER)
+            type_tok = self.expect_label()
             if type_tok.value:
                 types.append(type_tok.value)
             while self.matches(TokenType.PIPE):
-                next_type_tok = self.expect(TokenType.IDENTIFIER)
+                next_type_tok = self.expect_label()
                 if next_type_tok.value:
                     types.append(next_type_tok.value)
 
         # Optional variable length *1..3
+        # The lexer may tokenize "1..2" as INTEGER_LITERAL(1) DOT FLOAT_LITERAL(.2)
+        # because ".2" looks like a float.  We handle that by extracting the integer
+        # from the FLOAT_LITERAL token when it starts with '.'.
         var_len = None
         if self.matches(TokenType.STAR):
             min_h = 1
@@ -795,18 +865,47 @@ class Parser:
                     min_h = int(min_tok.value)
                 if self.peek().kind == TokenType.DOT:
                     self.eat()
-                    self.expect(TokenType.DOT)
-                    max_tok = self.expect(TokenType.INTEGER_LITERAL)
-                    if max_tok.value:
-                        max_h = int(max_tok.value)
+                    # Next token might be FLOAT_LITERAL '.N' (lexer consumed second dot+digit)
+                    # or DOT followed by INTEGER_LITERAL (or nothing for unbounded *N..).
+                    if self.peek().kind == TokenType.FLOAT_LITERAL and self.peek().value.startswith('.'):
+                        # e.g. *1..3 tokenized as INTEGER(1) DOT FLOAT(.3)
+                        max_tok = self.eat()
+                        max_h = int(float(max_tok.value.lstrip('.')))
+                    elif self.peek().kind == TokenType.DOT:
+                        # Second DOT: *N.. (unbounded upper) or *N..M
+                        self.eat()
+                        if self.peek().kind == TokenType.INTEGER_LITERAL:
+                            max_tok = self.eat()
+                            if max_tok.value:
+                                max_h = int(max_tok.value)
+                        # else: *N.. with no upper bound — keep max_h = default (10)
+                    elif self.peek().kind == TokenType.INTEGER_LITERAL:
+                        # e.g. *1.2 treated as *1..2 where lexer split differently
+                        max_tok = self.eat()
+                        if max_tok.value:
+                            max_h = int(max_tok.value)
+                    # else: single DOT with no second DOT and no integer → treat as exact *N
                 else:
                     max_h = min_h
             elif self.peek().kind == TokenType.DOT:
                 self.eat()
-                self.expect(TokenType.DOT)
-                max_tok = self.expect(TokenType.INTEGER_LITERAL)
-                if max_tok.value:
-                    max_h = int(max_tok.value)
+                if self.peek().kind == TokenType.FLOAT_LITERAL and self.peek().value.startswith('.'):
+                    # e.g. *..3 tokenized as DOT FLOAT(.3) — strip leading '.' before int parse
+                    max_tok = self.eat()
+                    max_h = int(max_tok.value.lstrip('.'))
+                elif self.peek().kind == TokenType.DOT:
+                    # Second DOT: *.. (unbounded) or *..M
+                    self.eat()
+                    if self.peek().kind == TokenType.INTEGER_LITERAL:
+                        max_tok = self.eat()
+                        if max_tok.value:
+                            max_h = int(max_tok.value)
+                    # else: *.. with no upper bound — keep max_h = default (10)
+                elif self.peek().kind == TokenType.INTEGER_LITERAL:
+                    max_tok = self.eat()
+                    if max_tok.value:
+                        max_h = int(max_tok.value)
+                # else: single dot with no number — treat as plain * (unbounded)
             var_len = ast.VariableLength(min_h, max_h)
 
         props = {}
@@ -964,18 +1063,72 @@ class Parser:
                 )
         return base
 
-    def parse_comparison_expression(self) -> Any:
+    def parse_string_list_null_expression(self) -> Any:
+        """Parse additive expression with postfix IS NULL / IS NOT NULL / IN / string predicates.
+
+        In the openCypher grammar, IS NULL, IS NOT NULL, IN, STARTS WITH, ENDS WITH,
+        CONTAINS, and =~ (regex) bind tighter than binary comparison operators (= <> < > <= >=).
+        This method corresponds to oC_StringOrListOrNullOperatorExpression and must be used
+        for both the left and right operands of binary comparisons so that, e.g.,
+        ``false = true IS NULL`` parses as ``false = (true IS NULL)``.
+        """
         left = self.parse_additive_expression()
 
+        # Handle label predicate immediately (n:Label)
         if isinstance(left, ast.Variable) and self.peek().kind == TokenType.COLON:
             self.eat()
-            label_tok = self.expect(TokenType.IDENTIFIER)
+            label_tok = self.expect_label()
             return ast.LabelPredicate(variable=left.name, label=label_tok.value or "")
 
-        # Binary comparisons
+        # Postfix predicates — these bind tighter than binary comparisons.
+        # We loop to allow chaining (though most combinations are semantically odd,
+        # the grammar permits it and tests like ``x IS NOT NULL IN [...]`` can arise).
+        while True:
+            tok = self.peek()
+            match tok.kind:
+                case TokenType.IS:
+                    self.eat()  # IS
+                    if self.matches(TokenType.NOT):
+                        self.expect(TokenType.NULL)
+                        left = ast.BooleanExpression(
+                            ast.BooleanOperator.IS_NOT_NULL, [left]
+                        )
+                    else:
+                        self.expect(TokenType.NULL)
+                        left = ast.BooleanExpression(ast.BooleanOperator.IS_NULL, [left])
+                case TokenType.IN:
+                    self.eat()
+                    right = self.parse_additive_expression()
+                    left = ast.BooleanExpression(ast.BooleanOperator.IN, [left, right])
+                case TokenType.STARTS:
+                    self.eat()
+                    self.expect(TokenType.WITH_KW)
+                    right = self.parse_additive_expression()
+                    left = ast.BooleanExpression(ast.BooleanOperator.STARTS_WITH, [left, right])
+                case TokenType.ENDS:
+                    self.eat()
+                    self.expect(TokenType.WITH_KW)
+                    right = self.parse_additive_expression()
+                    left = ast.BooleanExpression(ast.BooleanOperator.ENDS_WITH, [left, right])
+                case TokenType.CONTAINS:
+                    self.eat()
+                    right = self.parse_additive_expression()
+                    left = ast.BooleanExpression(ast.BooleanOperator.CONTAINS, [left, right])
+                case TokenType.REGEX_MATCH:
+                    self.eat()
+                    right = self.parse_additive_expression()
+                    left = ast.BooleanExpression(ast.BooleanOperator.REGEX_MATCH, [left, right])
+                case _:
+                    break
+
+        return left
+
+    def parse_comparison_expression(self) -> Any:
+        left = self.parse_string_list_null_expression()
+
+        # Binary comparisons (= <> < > <= >=) — these bind LESS tightly than IS NULL / IN.
         tok = self.peek()
         op = None
-        already_consumed = False
         match tok.kind:
             case TokenType.EQUALS:
                 op = ast.BooleanOperator.EQUALS
@@ -989,36 +1142,10 @@ class Parser:
                 op = ast.BooleanOperator.GREATER_THAN
             case TokenType.GREATER_THAN_OR_EQUAL:
                 op = ast.BooleanOperator.GREATER_THAN_OR_EQUAL
-            case TokenType.STARTS:
-                self.eat()  # STARTS
-                self.expect(TokenType.WITH_KW)
-                op = ast.BooleanOperator.STARTS_WITH
-                already_consumed = True
-            case TokenType.ENDS:
-                self.eat()  # ENDS
-                self.expect(TokenType.WITH_KW)
-                op = ast.BooleanOperator.ENDS_WITH
-                already_consumed = True
-            case TokenType.CONTAINS:
-                op = ast.BooleanOperator.CONTAINS
-            case TokenType.REGEX_MATCH:
-                op = ast.BooleanOperator.REGEX_MATCH
-            case TokenType.IN:
-                op = ast.BooleanOperator.IN
-            case TokenType.IS:
-                self.eat()  # IS
-                if self.matches(TokenType.NOT):
-                    self.expect(TokenType.NULL)
-                    return ast.BooleanExpression(
-                        ast.BooleanOperator.IS_NOT_NULL, [left]
-                    )
-                self.expect(TokenType.NULL)
-                return ast.BooleanExpression(ast.BooleanOperator.IS_NULL, [left])
 
         if op:
-            if not already_consumed:
-                self.eat()
-            right = self.parse_primary_expression()
+            self.eat()
+            right = self.parse_string_list_null_expression()
             return ast.BooleanExpression(op, [left, right])
 
         return left
@@ -1243,6 +1370,14 @@ class Parser:
 
         if tok.kind == TokenType.MINUS:
             self.eat()
+            # Special-case: INTEGER_LITERAL token for 2^63 is rejected by the literal
+            # parser (> max), but -2^63 is valid. Handle it here directly.
+            next_tok = self.peek()
+            if next_tok.kind == TokenType.INTEGER_LITERAL:
+                raw = int(next_tok.value) if next_tok.value is not None else 0
+                if raw == 9223372036854775808:
+                    self.eat()
+                    return ast.Literal(-9223372036854775808)
             inner = self.parse_primary_expression()
             if isinstance(inner, ast.Literal) and isinstance(inner.value, (int, float)):
                 return ast.Literal(-inner.value)
@@ -1273,11 +1408,22 @@ class Parser:
 
         if tok.kind == TokenType.INTEGER_LITERAL:
             val = self.eat().value
-            return ast.Literal(int(val) if val is not None else 0)
+            int_val = int(val) if val is not None else 0
+            if int_val > 9223372036854775807:
+                raise CypherParseError(
+                    "SyntaxError: IntegerOverflow: integer literal out of range"
+                )
+            return ast.Literal(int_val)
 
         if tok.kind == TokenType.FLOAT_LITERAL:
             val = self.eat().value
-            return ast.Literal(float(val) if val is not None else 0.0)
+            float_val = float(val) if val is not None else 0.0
+            import math as _math
+            if _math.isinf(float_val) or _math.isnan(float_val):
+                raise CypherParseError(
+                    f"SyntaxError: FloatingPointOverflow: float literal {val} overflows"
+                )
+            return ast.Literal(float_val)
 
         if tok.kind == TokenType.STRING_LITERAL:
             return ast.Literal(self.eat().value)
@@ -1329,8 +1475,13 @@ class Parser:
             asc = True
             if self.matches(TokenType.DESC):
                 asc = False
-            else:
-                self.matches(TokenType.ASC)
+            elif self.peek().kind == TokenType.IDENTIFIER and self.peek().value.upper() == "DESCENDING":
+                self.eat()
+                asc = False
+            elif self.matches(TokenType.ASC):
+                pass
+            elif self.peek().kind == TokenType.IDENTIFIER and self.peek().value.upper() == "ASCENDING":
+                self.eat()
 
             if expr is not None:
                 items.append(ast.OrderByItem(expr, asc))

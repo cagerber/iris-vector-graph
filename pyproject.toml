@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "iris-vector-graph"
-version = "2.5.0"
+version = "2.5.1"
 description = "Native graph database layer for InterSystems IRIS — openCypher, hybrid vector search, temporal property graph, RDF export, SHACL validation"
 readme = "README.md"
 license = "MIT"
@@ -127,6 +127,9 @@ browser = [
     "fastapi>=0.118.0",
     "uvicorn>=0.37.0",
 ]
+tck = [
+    "behave>=1.2.6",
+]
 
 [project.urls]
 Homepage = "https://github.com/intersystems-community/iris-vector-graph"
@@ -226,7 +229,8 @@ markers = [
     "requires_iris: marks tests that require IRIS database connection",
     "requires_database: marks tests that require database connection (alias for requires_iris)",
     "e2e: marks tests as end-to-end system tests (all query engines)",
-    "requires_clean_isolation: marks tests needing an unpolluted database (run in isolation)"
+    "requires_clean_isolation: marks tests needing an unpolluted database (run in isolation)",
+    "tck: marks tests as openCypher TCK conformance tests (requires ivg-iris)"
 ]
 
 [tool.coverage.run]

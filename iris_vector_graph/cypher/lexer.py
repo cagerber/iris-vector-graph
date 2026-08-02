@@ -136,7 +136,11 @@ class Lexer:
                 case ",":
                     self._add_token(TokenType.COMMA, char)
                 case ".":
-                    self._add_token(TokenType.DOT, char)
+                    # Check if this is a float literal like .1 (digit follows)
+                    if self._peek() is not None and self._peek().isdigit():
+                        self._tokenize_number()
+                    else:
+                        self._add_token(TokenType.DOT, char)
                 case ":":
                     self._add_token(TokenType.COLON, char)
                 case "|":
@@ -263,7 +267,22 @@ class Lexer:
                 self.cursor += 1
                 self.column += 1
                 if self.cursor < len(self.source):
-                    value += self.source[self.cursor]
+                    esc = self.source[self.cursor]
+                    if esc in ('u', 'U'):
+                        # Unicode escape \uXXXX or \UXXXXXXXX
+                        hex_len = 4 if esc == 'u' else 8
+                        hex_str = self.source[self.cursor + 1: self.cursor + 1 + hex_len]
+                        if len(hex_str) == hex_len and all(c in '0123456789abcdefABCDEF' for c in hex_str):
+                            value += chr(int(hex_str, 16))
+                            self.cursor += hex_len
+                            self.column += hex_len
+                        else:
+                            value += esc
+                    else:
+                        value += {
+                            'n': '\n', 't': '\t', 'r': '\r', 'b': '\b', 'f': '\f',
+                            '\\': '\\', "'": "'", '"': '"', '`': '`',
+                        }.get(esc, esc)
             else:
                 value += self.source[self.cursor]
             self.cursor += 1
@@ -301,22 +320,108 @@ class Lexer:
         start_col = self.column
         value = ""
         is_float = False
-        while self.cursor < len(self.source) and (
-            self.source[self.cursor].isdigit() or self.source[self.cursor] == "."
-        ):
-            if self.source[self.cursor] == ".":
-                if is_float:
-                    break
-                # Don't consume '.' if it's part of '..' range syntax
-                if (
-                    self.cursor + 1 < len(self.source)
-                    and self.source[self.cursor + 1] == "."
-                ):
-                    break
-                is_float = True
+
+        # Handle leading-dot float literal (.1, .5e2, etc.)
+        if self.cursor < len(self.source) and self.source[self.cursor] == ".":
+            is_float = True
             value += self.source[self.cursor]
             self.cursor += 1
             self.column += 1
+            # Consume remaining digits
+            while self.cursor < len(self.source) and self.source[self.cursor].isdigit():
+                value += self.source[self.cursor]
+                self.cursor += 1
+                self.column += 1
+            # Exponent
+            if (
+                self.cursor < len(self.source)
+                and self.source[self.cursor] in ("e", "E")
+            ):
+                value += self.source[self.cursor]
+                self.cursor += 1
+                self.column += 1
+                if self.cursor < len(self.source) and self.source[self.cursor] in ("+", "-"):
+                    value += self.source[self.cursor]
+                    self.cursor += 1
+                    self.column += 1
+                while self.cursor < len(self.source) and self.source[self.cursor].isdigit():
+                    value += self.source[self.cursor]
+                    self.cursor += 1
+                    self.column += 1
+            self.tokens.append(Token(TokenType.FLOAT_LITERAL, value, start_pos, self.line, start_col))
+            return
+
+        # Consume leading digits
+        while self.cursor < len(self.source) and self.source[self.cursor].isdigit():
+            value += self.source[self.cursor]
+            self.cursor += 1
+            self.column += 1
+
+        # Check for hex (0x...) or octal (0o...) integer prefix
+        if value == "0" and self.cursor < len(self.source):
+            next_ch = self.source[self.cursor]
+            if next_ch in ("x", "X"):
+                # Hex literal: consume hex digits
+                self.cursor += 1
+                self.column += 1
+                hex_digits = ""
+                while self.cursor < len(self.source) and (
+                    self.source[self.cursor] in "0123456789abcdefABCDEF"
+                ):
+                    hex_digits += self.source[self.cursor]
+                    self.cursor += 1
+                    self.column += 1
+                decimal_value = str(int(hex_digits, 16)) if hex_digits else "0"
+                self.tokens.append(Token(TokenType.INTEGER_LITERAL, decimal_value, start_pos, self.line, start_col))
+                return
+            elif next_ch in ("o", "O"):
+                # Octal literal: consume octal digits
+                self.cursor += 1
+                self.column += 1
+                oct_digits = ""
+                while self.cursor < len(self.source) and self.source[self.cursor] in "01234567":
+                    oct_digits += self.source[self.cursor]
+                    self.cursor += 1
+                    self.column += 1
+                decimal_value = str(int(oct_digits, 8)) if oct_digits else "0"
+                self.tokens.append(Token(TokenType.INTEGER_LITERAL, decimal_value, start_pos, self.line, start_col))
+                return
+
+        # Check for fractional part
+        if (
+            self.cursor < len(self.source)
+            and self.source[self.cursor] == "."
+            and not (
+                self.cursor + 1 < len(self.source)
+                and self.source[self.cursor + 1] == "."
+            )
+        ):
+            is_float = True
+            value += self.source[self.cursor]
+            self.cursor += 1
+            self.column += 1
+            while self.cursor < len(self.source) and self.source[self.cursor].isdigit():
+                value += self.source[self.cursor]
+                self.cursor += 1
+                self.column += 1
+
+        # Check for exponent (e/E with optional sign) — applies to both int and float
+        if (
+            self.cursor < len(self.source)
+            and self.source[self.cursor] in ("e", "E")
+        ):
+            is_float = True
+            value += self.source[self.cursor]
+            self.cursor += 1
+            self.column += 1
+            if self.cursor < len(self.source) and self.source[self.cursor] in ("+", "-"):
+                value += self.source[self.cursor]
+                self.cursor += 1
+                self.column += 1
+            while self.cursor < len(self.source) and self.source[self.cursor].isdigit():
+                value += self.source[self.cursor]
+                self.cursor += 1
+                self.column += 1
 
         kind = TokenType.FLOAT_LITERAL if is_float else TokenType.INTEGER_LITERAL
         self.tokens.append(Token(kind, value, start_pos, self.line, start_col))
