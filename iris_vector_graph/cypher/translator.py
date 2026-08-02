@@ -307,6 +307,11 @@ class TranslationContext:
         self.non_map_vars: set = (
             set() if parent is None else parent.non_map_vars.copy()
         )
+        # (alias, prop_name) pairs for properties that appear in IS NULL / IS NOT NULL
+        # checks in the current boolean context.  The structural guard (OPT-3 EXISTS) is
+        # suppressed for these so that nodes lacking the property produce a NULL val that
+        # correctly satisfies "x IS NULL" even when OR'd with other predicates.
+        self._null_guarded_props: set = set()
 
     def next_alias(self, prefix: str = "t") -> str:
         alias = f"{prefix}{self._alias_counter}"
@@ -3248,9 +3253,13 @@ def translate_merge_clause(merge, context, metadata):
                     val = v.value if isinstance(v, ast.Literal) else v
                     if is_create:
                         if actual_id:
+                            # ON CREATE fires only when the node was just created.
+                            # Use FROM nodes WHERE node_id = ? (avoids SELECT ... WHERE EXISTS
+                            # which is not valid IRIS SQL without a FROM clause).
                             context.add_dml(
-                                f'INSERT INTO {_table("rdf_props")} (s, "key", val) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM {_table("rdf_props")} WHERE s = ? AND "key" = ?)',
-                                [actual_id, k, val, actual_id, k],
+                                f'INSERT INTO {_table("rdf_props")} (s, "key", val) '
+                                f'SELECT node_id, ?, ? FROM {_table("nodes")} WHERE node_id = ?',
+                                [k, val, actual_id],
                             )
                         else:
                             context.add_dml(
@@ -3268,6 +3277,35 @@ def translate_merge_clause(merge, context, metadata):
                                 f'UPDATE {_table("rdf_props")} SET val = ? WHERE s IN (SELECT node_id FROM {_table("nodes")} WHERE node_id = ?) AND "key" = ?',
                                 [val, sql_alias, k],
                             )
+                elif isinstance(item.expression, ast.Variable):
+                    # Label assignment: MERGE (...) ON CREATE SET a:SomeLabel
+                    var_name = item.expression.name
+                    # Validate: variable must be defined.
+                    if (var_name not in context.variable_aliases
+                            and context.input_params.get(f"__create_id_{var_name}") is None):
+                        raise SyntaxError(f"Undefined variable: {var_name}")
+                    actual_id = context.input_params.get(f"__create_id_{var_name}")
+                    label = str(
+                        item.value.value if isinstance(item.value, ast.Literal) else item.value
+                    )
+                    if is_create:
+                        # ON CREATE: add label only when node was just created.
+                        # Use FROM nodes WHERE node_id = ? (avoids no-FROM SELECT).
+                        context.add_dml(
+                            f'INSERT INTO {_table("rdf_labels")} (s, label) '
+                            f'SELECT node_id, ? FROM {_table("nodes")} WHERE node_id = ?',
+                            [label, actual_id],
+                        )
+                    else:
+                        # ON MATCH: add label to the pre-existing node.
+                        on_match_alias = context.variable_aliases.get(var_name, "")
+                        context.add_dml(
+                            f'INSERT INTO {_table("rdf_labels")} (s, label) '
+                            f'SELECT node_id, ? FROM {_table("nodes")} WHERE node_id = ? '
+                            f'AND NOT EXISTS (SELECT 1 FROM {_table("rdf_labels")} '
+                            f'WHERE s = ? AND label = ?)',
+                            [label, on_match_alias, on_match_alias, label],
+                        )
 
 
 def _translate_set_value(expr, context, target_prop: str) -> tuple:
@@ -3339,6 +3377,29 @@ def _translate_set_value(expr, context, target_prop: str) -> tuple:
             op = e.function_name[len("__arith_"):]
             op_map = {"+": "+", "-": "-", "*": "*", "/": "/", "%": "%"}
             sql_op = op_map.get(op, op)
+            # For + where either operand is a string literal, use string concatenation (||)
+            # and avoid casting PropertyReference to NUMERIC.
+            if op == "+":
+                def _is_str_arg(a):
+                    return isinstance(a, ast.Literal) and isinstance(a.value, str)
+                left_is_str = _is_str_arg(e.arguments[0])
+                right_is_str = _is_str_arg(e.arguments[1])
+                if left_is_str or right_is_str:
+                    def _str_aware_translate(a):
+                        if isinstance(a, ast.PropertyReference):
+                            prop = a.property_name
+                            safe_prop = prop.replace("'", "''")
+                            if prop == target_prop:
+                                return "val", []
+                            return (
+                                f"(SELECT _upd.val FROM {_table('rdf_props')} _upd "
+                                f"WHERE _upd.s = {_table('rdf_props')}.s "
+                                f"AND _upd.\"key\" = '{safe_prop}')"
+                            ), []
+                        return _translate_expr_for_update(a, node_var)
+                    left_sql, left_params = _str_aware_translate(e.arguments[0])
+                    right_sql, right_params = _str_aware_translate(e.arguments[1])
+                    return f"(CAST({left_sql} AS VARCHAR(4096)) || CAST({right_sql} AS VARCHAR(4096)))", left_params + right_params
             left_sql, left_params = _translate_expr_for_update(e.arguments[0], node_var)
             right_sql, right_params = _translate_expr_for_update(e.arguments[1], node_var)
             return f"({left_sql} {sql_op} {right_sql})", left_params + right_params
@@ -3434,8 +3495,17 @@ def translate_set_clause(set_cl, context, metadata):
                         [k, str(val_for_json)] + subparams,
                     )
             else:
+                # When variable is from UNWIND (scalar_variable), the alias refers to
+                # a JSON_TABLE column (e.g. u3.n) not a nodes table row (u3.node_id).
+                # Extract node_id from the node JSON instead.
+                var_name = item.expression.variable
+                if var_name in context.scalar_variables:
+                    safe_var = sanitize_identifier(var_name)
+                    node_id_select = f"SELECT SQLUser.JSON_VALUE({alias}.{safe_var}, '$._id')"
+                else:
+                    node_id_select = f"SELECT {alias}.node_id"
                 cte, subquery, subparams = context.build_dml_subquery(
-                    select_override=f"SELECT {alias}.node_id"
+                    select_override=node_id_select
                 )
                 val_sql, val_params, is_expr = _translate_set_value(v, context, k)
                 if is_expr:
@@ -5332,44 +5402,53 @@ def _boolean_expr_logical(op, expr, context):
         _sp0_or = len(context.select_params)
         _wp0_or = len(context.where_params)
         _jp0_or = len(context.join_params)
+        # Suppress the structural guard (OPT-3) for properties that appear in IS NULL
+        # checks anywhere in this OR expression.  Without this, a node lacking a property
+        # would be excluded by the EXISTS guard even though `a.x IS NULL` should match it.
+        _prev_null_guarded = context._null_guarded_props.copy()
         for o in expr.operands:
-            p = translate_boolean_expression(o, context)
-            p = _coerce_varchar_boolean_if_needed(o, p, context)
-            if p == "NULL":
-                has_null_or = True
-            else:
-                parts_or.append(p)
-        if not parts_or:
-            return "NULL" if has_null_or else "(1=0)"
-        # Three-value OR: if any operand is definitively true, result is true.
-        # Roll back params added by discarded operands.
-        if "(1=1)" in parts_or:
-            del context.select_params[_sp0_or:]
-            del context.where_params[_wp0_or:]
-            del context.join_params[_jp0_or:]
-            return "(1=1)"
-        # Unwrap nested nullable CASE WHEN parts from inner 3VL AND/OR:
-        import re as _re_or
-        unwrapped_or = []
-        for p in parts_or:
-            m_or = _re_or.match(r'^CASE WHEN \((.+)\) THEN \(1=1\) ELSE NULL END$', p)
-            if m_or:
-                has_null_or = True
-                unwrapped_or.append(m_or.group(1))
-            else:
-                unwrapped_or.append(p)
-        parts_or = unwrapped_or
-        # Simplify: filter out always-false sentinels (they don't affect OR result)
-        non_trivial_or = [p for p in parts_or if p != "(1=0)"]
-        if not non_trivial_or:
-            # All parts are literal false
+            context._null_guarded_props |= _collect_is_null_props(o, context)
+        try:
+            for o in expr.operands:
+                p = translate_boolean_expression(o, context)
+                p = _coerce_varchar_boolean_if_needed(o, p, context)
+                if p == "NULL":
+                    has_null_or = True
+                else:
+                    parts_or.append(p)
+            if not parts_or:
+                return "NULL" if has_null_or else "(1=0)"
+            # Three-value OR: if any operand is definitively true, result is true.
+            # Roll back params added by discarded operands.
+            if "(1=1)" in parts_or:
+                del context.select_params[_sp0_or:]
+                del context.where_params[_wp0_or:]
+                del context.join_params[_jp0_or:]
+                return "(1=1)"
+            # Unwrap nested nullable CASE WHEN parts from inner 3VL AND/OR:
+            import re as _re_or
+            unwrapped_or = []
+            for p in parts_or:
+                m_or = _re_or.match(r'^CASE WHEN \((.+)\) THEN \(1=1\) ELSE NULL END$', p)
+                if m_or:
+                    has_null_or = True
+                    unwrapped_or.append(m_or.group(1))
+                else:
+                    unwrapped_or.append(p)
+            parts_or = unwrapped_or
+            # Simplify: filter out always-false sentinels (they don't affect OR result)
+            non_trivial_or = [p for p in parts_or if p != "(1=0)"]
+            if not non_trivial_or:
+                # All parts are literal false
+                if has_null_or:
+                    return "NULL"
+                return "(1=0)"
+            combined_or = "(" + " OR ".join(non_trivial_or) + ")"
             if has_null_or:
-                return "NULL"
-            return "(1=0)"
-        combined_or = "(" + " OR ".join(non_trivial_or) + ")"
-        if has_null_or:
-            return f"CASE WHEN ({combined_or}) THEN (1=1) ELSE NULL END"
-        return combined_or
+                return f"CASE WHEN ({combined_or}) THEN (1=1) ELSE NULL END"
+            return combined_or
+        finally:
+            context._null_guarded_props = _prev_null_guarded
     if op == ast.BooleanOperator.XOR:
         # Type validation: XOR requires boolean operands
         bad_operand = _get_non_boolean_operand(expr)
@@ -5672,6 +5751,26 @@ def _rel_identity_comparison(op, left_expr, right_expr, context) -> Optional[str
         return "(" + " OR ".join(parts) + ")"
 
 
+
+def _collect_is_null_props(expr, context) -> set:
+    """Return {(alias, prop_name)} for all IS NULL / IS NOT NULL PropertyReference operands
+    found anywhere in expr (recursive).  Used to suppress the structural guard for these
+    properties so that nodes lacking the property get NULL val instead of being excluded."""
+    result = set()
+    if not isinstance(expr, ast.BooleanExpression):
+        return result
+    if expr.operator in (ast.BooleanOperator.IS_NULL, ast.BooleanOperator.IS_NOT_NULL):
+        operand = expr.operands[0]
+        if isinstance(operand, ast.PropertyReference):
+            alias = context.variable_aliases.get(operand.variable)
+            if alias:
+                result.add((alias, operand.property_name))
+        return result
+    for operand in expr.operands:
+        result |= _collect_is_null_props(operand, context)
+    return result
+
+
 def translate_boolean_expression(expr, context) -> str:
     if isinstance(expr, ast.ExistsExpression):
         result = _boolean_expr_exists(expr, context)
@@ -5718,6 +5817,22 @@ def translate_boolean_expression(expr, context) -> str:
     if op in (ast.BooleanOperator.IS_NULL, ast.BooleanOperator.IS_NOT_NULL):
         # Use segment="select" to avoid the structural-guard EXISTS clause —
         # IS NULL explicitly handles the missing-property case via LEFT JOIN.
+        # When the operand is a BooleanExpression (AND/OR/etc.), IRIS SQL does not
+        # support "(compound_bool_expr) IS NULL" in CASE WHEN or SELECT positions.
+        # Instead, detect NULL using the double-CASE pattern:
+        #   CASE WHEN cond THEN 0 WHEN NOT (cond) THEN 0 ELSE 1 END = 1
+        # This correctly returns 1 (true) when cond evaluates to SQL NULL,
+        # preserving Cypher 3VL semantics: (a AND b) IS NULL where a=NULL, b=TRUE → TRUE
+        if isinstance(left_expr, ast.BooleanExpression):
+            inner = translate_boolean_expression(left_expr, context)
+            null_check = (
+                f"CASE WHEN {inner} THEN 0 "
+                f"WHEN NOT ({inner}) THEN 0 "
+                f"ELSE 1 END = 1"
+            )
+            if op == ast.BooleanOperator.IS_NULL:
+                return null_check
+            return f"NOT ({null_check})"
         left = translate_expression(left_expr, context, segment="select")
         if op == ast.BooleanOperator.IS_NULL:
             return f"{left} IS NULL"
@@ -6263,13 +6378,48 @@ def _list_comprehension_type_check(expr):
 
 
 def _expr_list_comprehension(expr, context, segment):
-    # Aggregation in list comprehension is invalid (SyntaxError: InvalidAggregation)
+    # Aggregation functions (count(*), sum(), etc.) are not allowed inside list comprehensions.
+    # openCypher TCK List12[7]: [x IN list | count(*)] → InvalidAggregation SyntaxError.
     if expr.projection and _contains_aggregation(expr.projection):
         raise SyntaxError(
-            "SyntaxError: Aggregation functions are not allowed inside a list comprehension."
+            "InvalidAggregation: Aggregation functions are not allowed inside list comprehensions"
         )
     # Type-check projection against source list elements for conversion functions.
     _list_comprehension_type_check(expr)
+    # When the source is collect(arg), IRIS cannot place JSON_ARRAYAGG inside JSON_TABLE source.
+    # Instead, bind the list comp variable directly to arg's SQL and emit inline aggregate SQL.
+    # [v IN collect(arg) WHERE pred | proj] → JSON_ARRAYAGG(CASE WHEN pred THEN proj ELSE NULL END)
+    if (
+        isinstance(expr.source, ast.AggregationFunction)
+        and expr.source.function_name.lower() == "collect"
+        and expr.source.argument is not None
+    ):
+        arg_sql = translate_expression(expr.source.argument, context, segment=segment)
+        var = sanitize_identifier(expr.variable)
+        context.variable_aliases[expr.variable] = "__lc_collect__"
+        context.scalar_variables.add(expr.variable)
+        # pred and proj use variable as a scalar: bind to a sentinel alias that maps back to arg_sql
+        pred_case = ""
+        if expr.predicate:
+            if isinstance(expr.predicate, ast.BooleanExpression):
+                pred_sql_raw = translate_boolean_expression(expr.predicate, context)
+            else:
+                pred_sql_raw = translate_expression(expr.predicate, context, segment=segment)
+            # Replace the sentinel reference with arg_sql
+            pred_sql = pred_sql_raw.replace(f"__lc_collect__.{var}", arg_sql)
+            # IRIS does not accept CASE WHEN (NULL) — replace with always-false 1=0
+            if pred_sql.strip() == "NULL":
+                pred_sql = "1=0"
+            pred_case = f"CASE WHEN ({pred_sql}) THEN "
+        select_expr = arg_sql
+        if expr.projection:
+            proj_sql_raw = translate_expression(expr.projection, context, segment=segment)
+            select_expr = proj_sql_raw.replace(f"__lc_collect__.{var}", arg_sql)
+        del context.variable_aliases[expr.variable]
+        context.scalar_variables.discard(expr.variable)
+        if pred_case:
+            return f"JSON_ARRAYAGG({pred_case}{select_expr} ELSE NULL END)"
+        return f"JSON_ARRAYAGG({select_expr})"
     source_sql = translate_expression(expr.source, context, segment="inline")
     var = sanitize_identifier(expr.variable)
     alias = context.next_alias("lc")
@@ -6780,9 +6930,14 @@ def _expr_property_reference(expr, context, segment):
     if expr.property_name == "node_id":
         return f"{alias}.node_id"
     if segment == "where":
-        context.where_conditions.append(
-            TranslationContext._structural_guard_sql(alias, expr.property_name)
-        )
+        # Skip the structural guard when this property is also IS NULL / IS NOT NULL
+        # checked in the current boolean context (e.g. `a.x IS NULL OR a.x > 'y'`).
+        # In that case the LEFT JOIN NULL already handles the missing-property case.
+        null_guarded = getattr(context, "_null_guarded_props", set())
+        if (alias, expr.property_name) not in null_guarded:
+            context.where_conditions.append(
+                TranslationContext._structural_guard_sql(alias, expr.property_name)
+            )
     p_alias = context.next_alias("p")
     context.join_clauses.append(
         f'LEFT JOIN {_table("rdf_props")} {p_alias} ON {p_alias}.s = {alias}.node_id AND {p_alias}."key" = {context.add_join_param(expr.property_name)}'

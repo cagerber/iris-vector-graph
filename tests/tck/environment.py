@@ -84,7 +84,7 @@ CREATE (b1)-[:FRIEND]->(b2),
 
 def before_all(context):
     """Session setup: connect to ivg-iris, initialize schema only."""
-    container_name = os.environ.get("IVG_CONTAINER", "ivg-iris")
+    container_name = os.environ.get("IVG_TEST_CONTAINER") or os.environ.get("IVG_CONTAINER", "ivg-iris")
     port = int(os.environ.get("IVG_PORT", "21972"))
 
     conn = _connect(container_name, port)
@@ -95,10 +95,22 @@ def before_all(context):
 
     from iris_vector_graph.engine import IRISGraphEngine
     context.engine = IRISGraphEngine(conn, embedding_dimension=768)
+    schema_ok = True
     try:
         context.engine.initialize_schema(auto_deploy_objectscript=False)
     except Exception as e:
         logger.warning("Schema init: %s", e)
+        schema_ok = False
+
+    # If initialize_schema caused a stale/broken connection, reconnect before proceeding.
+    if not schema_ok:
+        try:
+            conn2 = _connect(container_name, port)
+            context.conn = conn2
+            context.engine = IRISGraphEngine(conn2, embedding_dimension=768)
+            logger.info("Reconnected after schema init failure")
+        except Exception as e2:
+            logger.warning("Reconnect after schema init failure: %s", e2)
 
     # Clean up any leftover data from previous test sessions
     _flush_all_tck_data(context)

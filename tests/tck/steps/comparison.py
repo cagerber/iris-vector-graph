@@ -153,10 +153,26 @@ class TCKResultTable:
             for row in remapped_rows
         ]
 
-        # normalise actual values against expected types
+        # Build a column-level type schema from ALL expected rows.
+        # For each column, take the first non-None expected value so that
+        # normalise_iris_value knows the target type regardless of row order.
+        # This prevents unordered comparisons from using the wrong positional
+        # expected row to type-hint the actual value (e.g. IRIS returns '1'/'0'
+        # for booleans from JSON_TABLE, but if the positionally-aligned expected
+        # row has null for that column we'd miss the bool cast).
+        type_schema: dict[str, Any] = {}
+        for col in self.columns:
+            for exp_row in expected_rows:
+                v = exp_row.get(col)
+                if v is not None:
+                    type_schema[col] = v
+                    break
+
+        # normalise actual values against expected types (use type_schema not
+        # position-matched row so unordered result sets normalise correctly)
         norm_actual = [
-            _normalise_row_with_nodes(row, expected_rows[i] if i < len(expected_rows) else {}, self.columns)
-            for i, row in enumerate(remapped_rows)
+            _normalise_row_with_nodes(row, type_schema, self.columns)
+            for row in remapped_rows
         ]
 
         if len(norm_actual) != len(expected_rows):
