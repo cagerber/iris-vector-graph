@@ -4844,10 +4844,37 @@ def _expr_arith(expr, context, segment):
         def _is_str(arg):
             return (isinstance(arg, ast.Literal) and isinstance(arg.value, str)) or \
                 isinstance(arg, ast.FunctionCall) and arg.function_name.startswith("__arith_+")
+        def _is_list(arg):
+            return (isinstance(arg, ast.Literal) and isinstance(arg.value, list)) or \
+                isinstance(arg, ast.MapLiteral) is False and (
+                    isinstance(arg, ast.FunctionCall) and arg.function_name in (
+                        "collect", "nodes", "relationships", "labels", "keys", "range",
+                    )
+                )
         left_str = _is_str(expr.arguments[0])
         right_str = _is_str(expr.arguments[1])
         if left_str or right_str:
             return f"(CAST({left} AS VARCHAR(4096)) || CAST({right} AS VARCHAR(4096)))"
+        left_list = _is_list(expr.arguments[0])
+        right_list = _is_list(expr.arguments[1])
+        if left_list or right_list:
+            # Constant folding: both fully literal → compute in Python
+            if (_is_fully_literal(expr.arguments[0]) and _is_fully_literal(expr.arguments[1])):
+                import json as _json
+                lv = _literal_to_python(expr.arguments[0])
+                rv = _literal_to_python(expr.arguments[1])
+                if isinstance(lv, list) and isinstance(rv, list):
+                    combined = lv + rv
+                    js = _json.dumps(combined)
+                    return f"CAST('{js.replace(chr(39), chr(39)+chr(39))}' AS VARCHAR({max(len(js)+1, 256)}))"
+            # Runtime: JSON array concat via subquery building
+            return (
+                f"(SELECT JSON_ARRAYAGG(x.v) FROM ("
+                f"SELECT JSON_VALUE({left}, '$[' || rn.n || ']') AS v FROM (SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) rn WHERE rn.n < JSON_ARRAYLENGTH({left})"
+                f" UNION ALL "
+                f"SELECT JSON_VALUE({right}, '$[' || rn.n || ']') AS v FROM (SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) rn WHERE rn.n < JSON_ARRAYLENGTH({right})"
+                f") x)"
+            )
     return f"({left} {op} {right})"
 
 
@@ -5212,6 +5239,10 @@ def _expr_subscript(expr, context, segment):
             return f"{p_alias}.val"
         # Scalar variable — use JSON array index or key lookup
         base_sql = translate_expression(base, context, segment=segment)
+        # For literal integer indices, inline the value directly to avoid ? parameter
+        # placeholders in the JSON path expression (IRIS can't use ? in '$[?]').
+        if isinstance(idx, ast.Literal) and isinstance(idx.value, int) and not isinstance(idx.value, bool):
+            return f"SQLUser.JSON_VALUE({base_sql}, '$[{idx.value}]')"
         idx_sql = translate_expression(idx, context, segment=segment)
         return f"SQLUser.JSON_VALUE({base_sql}, '$[' || CAST(({idx_sql}) AS VARCHAR) || ']')"
     base_sql = translate_expression(base, context, segment=segment)
