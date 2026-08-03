@@ -1692,6 +1692,15 @@ def _inject_row_number(sql: str, rn_over: str) -> str:
 def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=None) -> None:
     translate_with_clause(part.with_clause, context)
 
+    # Build alias → underlying SQL expression map from the projected SELECT items.
+    # e.g. 'p2.val AS property' → {'property': 'p2.val'}
+    # Used to expand WITH-alias references in OVER() where column aliases are not resolvable.
+    _with_alias_sql: dict = {}
+    for _sel in context.select_items:
+        if " AS " in _sel:
+            _expr_part, _, _alias_part = _sel.rpartition(" AS ")
+            _with_alias_sql[_alias_part.strip().strip('"')] = _expr_part.strip()
+
     # Preprocess ORDER BY items for the WITH clause (before build_stage_sql so joins are included).
     # For alias-based ORDER BY (e.g. WITH n.name AS prop ORDER BY prop), the alias is not yet
     # resolvable as a variable — emit it as a bare column name for the subquery wrapper to resolve.
@@ -1739,29 +1748,37 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
             if isinstance(item.expression, ast.PropertyReference):
                 _pk = (item.expression.variable, item.expression.property_name)
                 if _pk in prop_alias_map:
-                    col = _safe_alias(prop_alias_map[_pk])
-                    if col.startswith('"') and col.endswith('"'):
-                        order_by_items.append(f"{col} {direction}")
-                    else:
-                        order_by_items.append(
-                            f"CASE WHEN ISNUMERIC({col}) = 1 THEN CAST({col} AS DOUBLE) END {direction}, {col} {direction}"
-                        )
+                    _alias_name = prop_alias_map[_pk]
+                    col = _safe_alias(_alias_name)
+                    # Route through sort_projections so OVER() gets the real SQL expression.
+                    # IRIS can't resolve CTE column aliases inside OVER() of the same SELECT.
+                    _raw_sql = _with_alias_sql.get(_alias_name, col)
+                    # Always use numeric-aware sort via the underlying SQL expression (not the
+                    # alias), since IRIS can't resolve CTE aliases in OVER() of the same SELECT.
+                    # Safe even for SQL-reserved-word aliases (e.g. "count") since _raw_sql is
+                    # the concrete column (e.g. p2.val), not the quoted alias.
+                    _sort_alias = f"__sort{len(sort_projections)}"
+                    sort_projections.append((_sort_alias,
+                        f"CASE WHEN ISNUMERIC({_raw_sql}) = 1 THEN CAST({_raw_sql} AS DOUBLE) END"))
+                    _sort_alias2 = f"__sort{len(sort_projections)}"
+                    sort_projections.append((_sort_alias2, _raw_sql))
+                    order_by_items.append(f"{_sort_alias} {direction}")
+                    order_by_items.append(f"{_sort_alias2} {direction}")
                     continue
-            # If the expression is a variable that matches a WITH alias, emit as bare column name
-            # (but quote it if it's a SQL reserved word, same as the SELECT alias)
+            # If the expression is a variable that matches a WITH alias, emit as bare column name.
+            # Route through sort_projections so OVER() gets the real SQL expression.
+            # IRIS can't resolve CTE column aliases inside OVER() of the same SELECT.
             if isinstance(item.expression, ast.Variable) and item.expression.name in with_aliases:
-                col = _safe_alias(item.expression.name)
-                # Emit numeric-aware sort: numeric values sort by DOUBLE, strings by VARCHAR.
-                # CASE WHEN ISNUMERIC(x)=1 THEN CAST(x AS DOUBLE) END returns NULL for strings
-                # (NULLs sort last in ASC, first in DESC — both correct for mixed-type data).
-                # IRIS chokes on ISNUMERIC("reserved") and CAST("reserved" AS DOUBLE) when the
-                # quoted identifier matches a CTE column name — emit plain ORDER BY in that case.
-                if col.startswith('"') and col.endswith('"'):
-                    order_by_items.append(f"{col} {direction}")
-                else:
-                    order_by_items.append(
-                        f"CASE WHEN ISNUMERIC({col}) = 1 THEN CAST({col} AS DOUBLE) END {direction}, {col} {direction}"
-                    )
+                _alias_name = item.expression.name
+                col = _safe_alias(_alias_name)
+                _raw_sql = _with_alias_sql.get(_alias_name, col)
+                _sort_alias = f"__sort{len(sort_projections)}"
+                sort_projections.append((_sort_alias,
+                    f"CASE WHEN ISNUMERIC({_raw_sql}) = 1 THEN CAST({_raw_sql} AS DOUBLE) END"))
+                _sort_alias2 = f"__sort{len(sort_projections)}"
+                sort_projections.append((_sort_alias2, _raw_sql))
+                order_by_items.append(f"{_sort_alias} {direction}")
+                order_by_items.append(f"{_sort_alias2} {direction}")
             else:
                 try:
                     # Map WITH-projected aliases to bare column names so ORDER BY arithmetic
@@ -1773,14 +1790,19 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
                     }
                     if prev_ob_map:
                         context._orderby_alias_sql.update(prev_ob_map)
-                    # Snapshot join_params length before translating — sort expr adds new params here.
+                    # Snapshot join_params AND select_params length before translating.
+                    # Property references in segment="inline" add to select_params (correlated subquery),
+                    # not join_params. We capture both to cover all sort expression param types.
                     _join_params_before = len(context.join_params)
+                    _select_params_before = len(context.select_params)
                     # Use segment="inline" so numeric literals become inline constants.
                     # Property references add JOINs to context (join_params) as needed.
                     expr = translate_expression(item.expression, context, segment="inline")
                     # Capture params added by this sort expression (will appear in SQL before FROM).
                     _new_sort_params = context.join_params[_join_params_before:]
+                    _new_select_sort_params = context.select_params[_select_params_before:]
                     sort_expr_params.extend(_new_sort_params)
+                    sort_expr_params.extend(_new_select_sort_params)
                     context._orderby_alias_sql = prev_ob_map
                     # If the expression references JOIN aliases (p\d+.val) or a correlated
                     # rdf_props subquery, it cannot be used in OVER() — project it as a sort column.
@@ -1860,8 +1882,12 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
             context.all_stage_params.extend(_rn_stage_params)
             context.stages.append(f"{_rn_stage} AS (\n{_rn_sql}\n)")
             stage_params = []
+            # TOP inside a CTE body enables ORDER BY (IRIS rejects bare ORDER BY in CTEs).
+            # Ordering by __rn preserves the sort semantics established by the OVER() clause.
             sql = (
-                f"SELECT * FROM {_rn_stage} WHERE __rn > {skip} AND __rn <= {skip + limit}"
+                f"SELECT TOP 9223372036854775807 {_rn_stage}.* FROM {_rn_stage}"
+                f" WHERE {_rn_stage}.__rn > {skip} AND {_rn_stage}.__rn <= {skip + limit}"
+                f" ORDER BY {_rn_stage}.__rn"
             )
         elif limit is not None:
             if order_by_items:
@@ -1884,7 +1910,12 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
             context.all_stage_params.extend(stage_params)
             context.stages.append(f"{_rn_stage} AS (\n{_rn_sql}\n)")
             stage_params = []
-            sql = f"SELECT * FROM {_rn_stage} WHERE __rn > {skip}"
+            # TOP inside a CTE body enables ORDER BY (IRIS rejects bare ORDER BY in CTEs).
+            sql = (
+                f"SELECT TOP 9223372036854775807 {_rn_stage}.* FROM {_rn_stage}"
+                f" WHERE {_rn_stage}.__rn > {skip}"
+                f" ORDER BY {_rn_stage}.__rn"
+            )
         elif order_by_items:
             # ORDER BY only (no LIMIT/SKIP): IRIS rejects ORDER BY inside a CTE body.
             # Use TOP with max BIGINT to produce an ordered subquery IRIS accepts in a CTE.
@@ -3279,6 +3310,13 @@ def _create_resolve_prop_value(v, context):
                 return sql_val[1:-1]
         except Exception:
             pass
+    if isinstance(v, ast.PropertyReference):
+        # Property reference to a previously-created node in the same CREATE clause.
+        # e.g. CREATE (a {id: 0}), ({num: a.id}) — resolve a.id from already-set props.
+        node_props = getattr(context, '_create_node_props', {})
+        node_prop_map = node_props.get(v.variable, {})
+        if v.property_name in node_prop_map:
+            return node_prop_map[v.property_name]
     return v
 
 
@@ -3293,11 +3331,21 @@ def _create_node_literal(node, node_id_expr, context):
             f"INSERT INTO {_table('rdf_labels')} (s, label) SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE s = ? AND label = ?)",
             [node_id, label, node_id, label],
         )
+    if node.variable and node.properties:
+        if not hasattr(context, '_create_node_props'):
+            context._create_node_props = {}
+        if node.variable not in context._create_node_props:
+            context._create_node_props[node.variable] = {}
     for k, v in node.properties.items():
         val = _create_resolve_prop_value(v, context)
         # openCypher: setting a property to null removes it; skip null values in CREATE
         if val is None and not isinstance(val, ast.Variable):
             continue
+        # Track resolved property values for cross-node references in the same CREATE.
+        if node.variable and not isinstance(val, (ast.Variable, ast.PropertyReference)):
+            if not hasattr(context, '_create_node_props'):
+                context._create_node_props = {}
+            context._create_node_props.setdefault(node.variable, {})[k] = val
         if isinstance(val, ast.Variable):
             # Property value is a bound stage variable — use SELECT-based INSERT
             var_alias = context.variable_aliases[val.name]
