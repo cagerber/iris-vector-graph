@@ -4863,11 +4863,17 @@ def translate_node_pattern(node, context, metadata, optional=False):
         # applied as filter JOINs against the already-registered alias.
         if node.labels or node.properties:
             alias = context.variable_aliases[node.variable]
+            # For CTE stage aliases (Stage1, Stage2…), the node_id column is stored
+            # under the variable name (e.g. Stage1.a1), not Stage1.node_id.
+            if alias.startswith("Stage"):
+                node_id_col = f"{alias}.{node.variable}"
+            else:
+                node_id_col = f"{alias}.node_id"
             jt = "LEFT OUTER JOIN" if optional else "JOIN"
             for label in node.labels:
                 l_alias = context.next_alias("l")
                 context.join_clauses.append(
-                    f"{jt} {_table('rdf_labels')} {l_alias} ON {l_alias}.s = {alias}.node_id AND {l_alias}.label = {context.add_join_param(label)}"
+                    f"{jt} {_table('rdf_labels')} {l_alias} ON {l_alias}.s = {node_id_col} AND {l_alias}.label = {context.add_join_param(label)}"
                 )
                 if not optional:
                     context.where_conditions.append(f"{l_alias}.s IS NOT NULL")
@@ -4876,12 +4882,12 @@ def translate_node_pattern(node, context, metadata, optional=False):
                     # reached (node_id IS NOT NULL) the label must match; otherwise the
                     # edge is treated as non-matching (null result).
                     context.where_conditions.append(
-                        f"({alias}.node_id IS NULL OR {l_alias}.s IS NOT NULL)"
+                        f"({node_id_col} IS NULL OR {l_alias}.s IS NOT NULL)"
                     )
             for k, v in node.properties.items():
                 val_sql = translate_expression(v, context, segment="where")
                 if k == "node_id":
-                    context.where_conditions.append(f"{alias}.node_id = {val_sql}")
+                    context.where_conditions.append(f"{node_id_col} = {val_sql}")
                 else:
                     if not optional:
                         context.where_conditions.append(
@@ -4890,7 +4896,7 @@ def translate_node_pattern(node, context, metadata, optional=False):
                     p_alias = context.next_alias("p")
                     context.join_clauses.append(
                         f"{jt} {_table('rdf_props')} {p_alias} "
-                        f'ON {p_alias}.s = {alias}.node_id AND {p_alias}."key" = {context.add_join_param(k)}'
+                        f'ON {p_alias}.s = {node_id_col} AND {p_alias}."key" = {context.add_join_param(k)}'
                     )
                     if optional:
                         context.where_conditions.append(
@@ -5841,7 +5847,24 @@ def translate_relationship_pattern(
                        edge_cond, target_on, jt, is_anon_source, is_new_target)
 
 
+def _check_where_unbound_vars(expr, context):
+    """Raise SyntaxError if expr uses unbound node/relationship variables at WHERE level."""
+    if isinstance(expr, ast.LabelPredicate):
+        var = expr.variable
+        if (var and var not in context.variable_aliases
+                and var not in context.input_params
+                and var not in getattr(context, "scalar_variables", set())):
+            raise SyntaxError(f"UndefinedVariable: Variable `{var}` not defined")
+    elif isinstance(expr, ast.Variable):
+        var = expr.name
+        if (var not in context.variable_aliases
+                and var not in context.input_params
+                and var not in getattr(context, "scalar_variables", set())):
+            raise SyntaxError(f"UndefinedVariable: Variable `{var}` not defined")
+
+
 def translate_where_clause(where, context):
+    _check_where_unbound_vars(where.expression, context)
     cond = translate_boolean_expression(where.expression, context)
     # NULL in WHERE is invalid SQL. In Cypher, NULL in WHERE means "no match" — use (1=0).
     if cond == "NULL" or cond == "(NULL)":
@@ -5969,6 +5992,20 @@ def _register_unbound_node(node, child_ctx, sub_froms, sub_wheres):
 
 def _boolean_expr_exists(expr, context) -> Optional[str]:
     pat = expr.pattern
+
+    # Pattern predicates (WHERE (n)-[r]->(a)) require all named variables to be pre-bound.
+    # Variables introduced fresh in the predicate are an UndefinedVariable error per openCypher.
+    if getattr(expr, "is_pattern_predicate", False):
+        for node in pat.nodes:
+            if node and node.variable and node.variable not in context.variable_aliases:
+                raise SyntaxError(
+                    f"UndefinedVariable: Variable `{node.variable}` not defined"
+                )
+        for rel in pat.relationships:
+            if rel and rel.variable and rel.variable not in context.variable_aliases:
+                raise SyntaxError(
+                    f"UndefinedVariable: Variable `{rel.variable}` not defined"
+                )
 
     # Full existential subquery with aggregation: EXISTS { MATCH ... WITH ..., count(*) AS alias WHERE alias = N }
     # Translates to: (SELECT COUNT(*) FROM ... WHERE ...) = N
@@ -6228,11 +6265,14 @@ def _boolean_expr_logical(op, expr, context):
         _wp0_or = len(context.where_params)
         _jp0_or = len(context.join_params)
         # Suppress the structural guard (OPT-3) for properties that appear in IS NULL
-        # checks anywhere in this OR expression.  Without this, a node lacking a property
-        # would be excluded by the EXISTS guard even though `a.x IS NULL` should match it.
+        # checks, or in disjunctive (OR) branches.  Without this, a node lacking a property
+        # would be excluded by the EXISTS guard even though `a.x IS NULL` or `a.x = 12 OR
+        # a.y = 13` should work correctly on nodes missing one of the properties (NULL = 12
+        # evaluates to NULL/false in SQL, which is the correct Cypher semantics).
         _prev_null_guarded = context._null_guarded_props.copy()
         for o in expr.operands:
             context._null_guarded_props |= _collect_is_null_props(o, context)
+            context._null_guarded_props |= _collect_all_prop_refs(o, context)
         try:
             for o in expr.operands:
                 p = translate_boolean_expression(o, context)
@@ -6601,6 +6641,22 @@ def _collect_is_null_props(expr, context) -> set:
         return result
     for operand in expr.operands:
         result |= _collect_is_null_props(operand, context)
+    return result
+
+
+def _collect_all_prop_refs(expr, context) -> set:
+    """Return {(alias, prop_name)} for ALL PropertyReference nodes found in expr (recursive).
+    Used in OR branches to suppress structural guards: NULL = X evaluates to NULL/false in SQL,
+    which is correct Cypher semantics for missing properties."""
+    result = set()
+    if isinstance(expr, ast.PropertyReference):
+        alias = context.variable_aliases.get(expr.variable)
+        if alias:
+            result.add((alias, expr.property_name))
+        return result
+    if isinstance(expr, ast.BooleanExpression):
+        for operand in expr.operands:
+            result |= _collect_all_prop_refs(operand, context)
     return result
 
 
@@ -12977,8 +13033,13 @@ def translate_with_clause(with_clause, context):
                 alias = f"{item.expression.variable}_{item.expression.property_name}"
             elif isinstance(item.expression, ast.Variable):
                 alias = item.expression.name
-            elif isinstance(item.expression, ast.AggregationFunction):
-                alias = f"{item.expression.function_name}"
+            elif isinstance(item.expression, (ast.AggregationFunction, ast.FunctionCall,
+                                               ast.BooleanExpression, ast.Literal,
+                                               ast.MapLiteral)):
+                # Non-variable, non-property expressions require an explicit alias in WITH
+                raise SyntaxError(
+                    "NoExpressionAlias: Expression in WITH must be aliased"
+                )
         if alias is None:
             alias = context.next_alias("v")
 

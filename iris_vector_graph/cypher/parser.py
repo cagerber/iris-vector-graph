@@ -1382,7 +1382,7 @@ class Parser:
                 if self.peek().kind == TokenType.WHERE:
                     self.eat()
                     where_cond = self.parse_expression()
-                return ast.ExistsExpression(pattern=pattern, negated=False, where_condition=where_cond)
+                return ast.ExistsExpression(pattern=pattern, negated=False, where_condition=where_cond, is_pattern_predicate=True)
             self.eat()
             expr = self.parse_expression()
             self.expect(TokenType.RPAREN)

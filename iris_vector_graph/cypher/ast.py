@@ -461,6 +461,7 @@ class ExistsExpression:
     negated: bool = False
     where_condition: Optional[Any] = None
     with_clause: Optional[Any] = None  # WithClause for full exists with aggregation
+    is_pattern_predicate: bool = False  # True when parsed as WHERE (n)-[r]->() predicate
 
 
 @dataclass(slots=True)
