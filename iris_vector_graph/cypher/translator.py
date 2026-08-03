@@ -13056,21 +13056,46 @@ def translate_with_clause(with_clause, context):
             if not hasattr(context, "edge_stage_variables"):
                 context.edge_stage_variables = set()
             context.edge_stage_variables.add(item.expression.name)
+            # Also register the WITH alias (e.g. WITH r1 AS r2: alias = "r2") so that
+            # downstream MATCH/RETURN using the alias name can find it in edge_stage_variables.
+            if alias != item.expression.name:
+                context.edge_stage_variables.add(alias)
+                # Rebind the alias in variable_aliases so the second MATCH resolves it to Stage
+                context.variable_aliases[alias] = context.variable_aliases.get(item.expression.name, "Stage1")
             # Preserve edge identity columns so DELETE can find the original edge row
             # even after the relationship variable is promoted to a CTE stage.
-            var_name = item.expression.name
+            # Use the final alias name so stage-bound MATCH uses matching column names.
+            stage_col_name = alias  # column in Stage CTE is named after the alias
             is_undirected = e_alias in getattr(context, "_undirected_aliases", set())
             if is_undirected:
-                context.select_items.append(f"{e_alias}._src AS __edge_{var_name}_s")
-                context.select_items.append(f"{e_alias}._p AS __edge_{var_name}_p")
-                context.select_items.append(f"{e_alias}._dst AS __edge_{var_name}_o")
+                context.select_items.append(f"{e_alias}._src AS __edge_{stage_col_name}_s")
+                context.select_items.append(f"{e_alias}._p AS __edge_{stage_col_name}_p")
+                context.select_items.append(f"{e_alias}._dst AS __edge_{stage_col_name}_o")
             else:
-                context.select_items.append(f"{e_alias}.s AS __edge_{var_name}_s")
-                context.select_items.append(f"{e_alias}.p AS __edge_{var_name}_p")
-                context.select_items.append(f"{e_alias}.o_id AS __edge_{var_name}_o")
+                context.select_items.append(f"{e_alias}.s AS __edge_{stage_col_name}_s")
+                context.select_items.append(f"{e_alias}.p AS __edge_{stage_col_name}_p")
+                context.select_items.append(f"{e_alias}.o_id AS __edge_{stage_col_name}_o")
         context.select_items.append(f"{sql} AS {_safe_alias(alias).replace('.', '_')}")
         if has_agg and not _contains_aggregation(item.expression):
-            context.group_by_items.append(sql)
+            # For edge variables in GROUP BY, also include s/p/o identity columns so that
+            # edges with the same qualifiers (e.g. both {}) are not collapsed into one group.
+            if (isinstance(item.expression, ast.Variable)
+                    and context.variable_aliases.get(item.expression.name, "").startswith("e")
+                    and not context.variable_aliases.get(item.expression.name, "").startswith("Stage")):
+                e_alias_gb = context.variable_aliases[item.expression.name]
+                is_undirected_gb = e_alias_gb in getattr(context, "_undirected_aliases", set())
+                if is_undirected_gb:
+                    context.group_by_items.extend([
+                        f"{e_alias_gb}._src", f"{e_alias_gb}._p",
+                        f"{e_alias_gb}._dst", f"{e_alias_gb}.qualifiers"
+                    ])
+                else:
+                    context.group_by_items.extend([
+                        f"{e_alias_gb}.s", f"{e_alias_gb}.p",
+                        f"{e_alias_gb}.o_id", f"{e_alias_gb}.qualifiers"
+                    ])
+            else:
+                context.group_by_items.append(sql)
         if isinstance(item.expression, ast.AggregationFunction):
             agg_aliases.add(alias)
             # Store SQL for this aggregate so it can be reused in HAVING without re-translating
