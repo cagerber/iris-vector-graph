@@ -981,7 +981,7 @@ class Parser:
         var_len = None
         if self.matches(TokenType.STAR):
             min_h = 1
-            max_h = 10
+            max_h = 100
             if self.peek().kind == TokenType.INTEGER_LITERAL:
                 min_tok = self.eat()
                 if min_tok.value:

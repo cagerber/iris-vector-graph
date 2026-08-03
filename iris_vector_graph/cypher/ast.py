@@ -77,7 +77,7 @@ class VariableLength:
             raise ValueError("min_hops must be >= 0")
         if self.max_hops < self.min_hops:
             raise ValueError("max_hops must be >= min_hops")
-        limit = 15 if (self.shortest or self.all_shortest) else 10
+        limit = 15 if (self.shortest or self.all_shortest) else 100
         if self.max_hops > limit:
             raise ValueError(f"max_hops must be <= {limit} (complexity limit)")
 
