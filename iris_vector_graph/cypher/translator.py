@@ -6335,6 +6335,11 @@ def _list_literal_in_3vl(lhs_list, rhs_items):
 
 
 def _boolean_expr_in(left, right_expr, context, left_expr=None):
+    # Validate RHS is a list type; non-list literals (bool, int, str) are type errors
+    if isinstance(right_expr, ast.Literal) and not isinstance(right_expr.value, list):
+        raise SyntaxError(
+            "InvalidArgumentType: IN requires a list on the right-hand side"
+        )
     if isinstance(right_expr, ast.SubscriptExpression):
         inner_sql = translate_expression(right_expr.expression, context, segment="where")
         idx = right_expr.index
