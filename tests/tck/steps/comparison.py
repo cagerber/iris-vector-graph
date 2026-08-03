@@ -611,9 +611,24 @@ def normalise_iris_value(iris_val: Any, expected_tck_val: Any) -> Any:
                 pass
     if isinstance(expected_tck_val, list):
         if isinstance(iris_val, (list, tuple)):
+            import json as _json
             result_list = list(iris_val)
             # Strip TCK isolation labels (TCK_*) from lists (e.g., from labels() function)
             result_list = [item for item in result_list if not (isinstance(item, str) and item.startswith("TCK_"))]
+            # Recursively normalize nested elements against expected element types
+            if expected_tck_val:
+                norm = []
+                for i, item in enumerate(result_list):
+                    exp_elem = expected_tck_val[i] if i < len(expected_tck_val) else expected_tck_val[-1]
+                    if isinstance(item, str) and isinstance(exp_elem, list):
+                        try:
+                            parsed_item = _json.loads(item)
+                            norm.append(normalise_iris_value(parsed_item, exp_elem))
+                        except (ValueError, TypeError):
+                            norm.append(item)
+                    else:
+                        norm.append(normalise_iris_value(item, exp_elem))
+                return norm
             return result_list
         # JSON string → list (e.g., labels() returns JSON array as string)
         if isinstance(iris_val, str):
@@ -623,7 +638,7 @@ def normalise_iris_value(iris_val: Any, expected_tck_val: Any) -> Any:
                 if isinstance(parsed, list):
                     # Strip TCK isolation labels from the parsed list
                     result_list = [item for item in parsed if not (isinstance(item, str) and item.startswith("TCK_"))]
-                    return result_list
+                    return normalise_iris_value(result_list, expected_tck_val)
             except (json.JSONDecodeError, ValueError):
                 pass
     # None vs 0: IRIS count() may return None instead of 0
