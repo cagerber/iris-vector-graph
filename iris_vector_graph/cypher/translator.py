@@ -3002,7 +3002,7 @@ def translate_unwind_clause(unwind, context):
             _union_rows = _items
 
     if _use_union:
-        col = unwind.alias
+        col = _safe_alias(unwind.alias)
         if not _union_rows:
             # Empty list — produce zero rows via a no-match subquery
             union_sql = f"(SELECT ? AS {col} FROM (SELECT 1) _empty WHERE 1=0) {alias}"
@@ -3063,7 +3063,7 @@ def translate_unwind_clause(unwind, context):
         val = context.input_params[unwind.expression.name]
         if isinstance(val, list):
             context.join_params[-1] = json.dumps(val)
-    json_table_sql = f"JSON_TABLE({expr}, '$[*]' COLUMNS ({unwind.alias} VARCHAR(1000) PATH '$')) {alias}"
+    json_table_sql = f"JSON_TABLE({expr}, '$[*]' COLUMNS ({_safe_alias(unwind.alias)} VARCHAR(1000) PATH '$')) {alias}"
     if context.from_clauses:
         context.join_clauses.append(f"CROSS JOIN {json_table_sql}")
     else:
@@ -6505,10 +6505,15 @@ def translate_boolean_expression(expr, context) -> str:
             if expr.value is False:
                 return "(1=0)"
         # When a PropertyReference is used directly in a boolean context,
-        # convert it to a proper boolean comparison. IVG stores booleans as '1'/'0'.
+        # convert it to a proper boolean comparison. IVG stores booleans as '1'/'0'
+        # for graph node properties (rdf_props), but JSON map scalar variables store
+        # them as 'true'/'false' (JSON text). Distinguish by scalar_variables set.
         if isinstance(expr, ast.PropertyReference):
             prop_expr = translate_expression(expr, context, segment="where")
-            # Convert VARCHAR '1'/'0' to boolean: property = '1'
+            if expr.variable in context.scalar_variables:
+                # JSON map: boolean stored as 'true'/'false'
+                return f"({prop_expr} = 'true')"
+            # rdf_props: boolean stored as '1'/'0'
             return f"({prop_expr} = '1')"
         # Quantifier expressions (any/all/none/single) return a CASE WHEN 0/1/NULL
         # expression. When used as a standalone boolean predicate in WHERE, wrap with
@@ -6519,6 +6524,11 @@ def translate_boolean_expression(expr, context) -> str:
         if isinstance(expr, ast.ListPredicateExpression):
             case_sql = translate_expression(expr, context, segment="where")
             return f"({case_sql} = 1)"
+        # Map property access (e.g. input.fixed) returns a string value in IRIS JSON_VALUE.
+        # Cypher booleans are stored as 'true'/'false' in JSON — coerce to comparison.
+        if isinstance(expr, ast.PropertyAccessExpression):
+            val_sql = translate_expression(expr, context, segment="where")
+            return f"({val_sql} = 'true')"
         return translate_expression(expr, context, segment="where")
     op = expr.operator
     logical = _boolean_expr_logical(op, expr, context)
@@ -7077,7 +7087,7 @@ def _expr_list_predicate(expr, context, segment):
     counts_alias = context.next_alias("qc")
     sat_pred = where_pred.replace(f"{alias}.", f"{counts_alias}.")
     not_pred = where_pred.replace(f"{alias}.", f"{counts_alias}.")
-    jt_from = f"FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} {col_type} PATH '$')) {counts_alias}"
+    jt_from = f"FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({_safe_alias(expr.variable)} {col_type} PATH '$')) {counts_alias}"
     sat_expr = f"SUM(CASE WHEN {sat_pred} THEN 1 ELSE 0 END)"
     dfail_expr = f"SUM(CASE WHEN NOT ({not_pred}) THEN 1 ELSE 0 END)"
     total_expr = "COUNT(*)"
@@ -7216,6 +7226,7 @@ def _expr_list_comprehension(expr, context, segment):
         return f"JSON_ARRAYAGG({select_expr})"
     source_sql = translate_expression(expr.source, context, segment="inline")
     var = sanitize_identifier(expr.variable)
+    safe_var = _safe_alias(expr.variable)
     alias = context.next_alias("lc")
     # Map the variable to the table alias only (not alias.var) — consistent with
     # _expr_list_predicate. _expr_variable resolves scalar vars as "{alias}.{name}",
@@ -7230,7 +7241,7 @@ def _expr_list_comprehension(expr, context, segment):
         else:
             pred_sql = translate_expression(expr.predicate, context, segment="inline")
         where_clause = f" WHERE {pred_sql}"
-    select_expr = f"{alias}.{var}"
+    select_expr = f"{alias}.{safe_var}"
     if expr.projection:
         proj_sql = translate_expression(expr.projection, context, segment="inline")
         select_expr = proj_sql
@@ -7239,7 +7250,7 @@ def _expr_list_comprehension(expr, context, segment):
     # Use VARCHAR to support both scalar values and JSON objects
     return (
         f"(SELECT JSON_ARRAYAGG({select_expr}) FROM "
-        f"JSON_TABLE({source_sql}, '$[*]' COLUMNS({var} VARCHAR(32767) PATH '$')) {alias}"
+        f"JSON_TABLE({source_sql}, '$[*]' COLUMNS({safe_var} VARCHAR(32767) PATH '$')) {alias}"
         f"{where_clause})"
     )
 
@@ -7286,7 +7297,10 @@ def _expr_case(expr, context, segment):
     if expr.test_expression is not None:
         parts.append(translate_expression(expr.test_expression, context, segment))
     for wc in expr.when_clauses:
-        if isinstance(wc.condition, ast.BooleanExpression):
+        if expr.test_expression is None:
+            # Searched CASE: WHEN condition must be a boolean predicate in SQL.
+            cond = translate_boolean_expression(wc.condition, context)
+        elif isinstance(wc.condition, ast.BooleanExpression):
             cond = translate_boolean_expression(wc.condition, context)
         else:
             cond = translate_expression(wc.condition, context, segment)
@@ -7733,7 +7747,7 @@ def _expr_property_reference(expr, context, segment):
     # Guard: only call JSON_VALUE when the value is a JSON object (starts with '{').
     # JSON_VALUE raises SQLCODE=-400 on non-JSON or non-matching path.
     if expr.variable in context.scalar_variables:
-        col_ref = f"{alias}.{sanitize_identifier(expr.variable)}"
+        col_ref = f"{alias}.{_safe_alias(expr.variable)}"
         prop = expr.property_name.replace("'", "''")
         return (
             f"CASE WHEN ({col_ref}) IS NULL OR SUBSTRING({col_ref}, 1, 1) <> '{{' "
@@ -8079,7 +8093,7 @@ def _expr_variable(expr, context, segment):
             return f"{alias}.{_safe_alias(expr.name)}"
         if alias == "scalar" or alias in _PROC_CTE_ALIASES:
             return expr.name
-        return f"{alias}.{expr.name}"
+        return f"{alias}.{_safe_alias(expr.name)}"
     if alias.startswith("Stage"):
         return _safe_alias(expr.name)
     if alias.startswith("e"):
