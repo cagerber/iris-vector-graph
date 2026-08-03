@@ -1722,7 +1722,7 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
     # These params appear in the SQL BEFORE the FROM clause (injected into SELECT list)
     # but are added to join_params AFTER MATCH-clause params. We track them separately
     # so we can fix the params order after build_stage_sql.
-    sort_expr_params: list = []
+    sort_expr_params: list = []  # select_params only — params in SQL SELECT before FROM
     import re as _re_ob
     if part.with_clause.order_by_clause:
         for item in part.with_clause.order_by_clause.items:
@@ -1801,7 +1801,9 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
                     # Capture params added by this sort expression (will appear in SQL before FROM).
                     _new_sort_params = context.join_params[_join_params_before:]
                     _new_select_sort_params = context.select_params[_select_params_before:]
-                    sort_expr_params.extend(_new_sort_params)
+                    # Only track select_params (correlated subquery params in SELECT list) for
+                    # front-loading. join_params from sort expressions are in JOIN position
+                    # (after MATCH label JOINs) and must stay in their natural order.
                     sort_expr_params.extend(_new_select_sort_params)
                     context._orderby_alias_sql = prev_ob_map
                     # If the expression references JOIN aliases (p\d+.val) or a correlated
@@ -1832,13 +1834,11 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
                 # Fallback: append to SELECT line
                 sql = sql + f", ({sort_expr}) AS {sort_alias}"
 
-        # Fix params order: sort expression params appear in SQL before the FROM/JOIN params.
-        # stage_params has them after JOIN params (since join_params order is MATCH-params first).
-        # Move sort_expr_params to the front of stage_params to match SQL ? positions.
+        # Fix params order: correlated subquery sort params appear in SQL SELECT (before FROM),
+        # but build_stage_sql places select_params after join_params. Move only select_params
+        # added by sort expressions to the front. join_params from sort LEFT JOINs stay in
+        # their natural position (after MATCH label JOINs) — they're already correct.
         if sort_expr_params:
-            remaining = [p for p in stage_params if p not in sort_expr_params]
-            # Rebuild: sort params first (SQL SELECT columns), then remaining (FROM/JOIN/WHERE)
-            # Use a more careful approach: remove sort_expr_params from their current positions.
             _sp = list(stage_params)
             for _p in sort_expr_params:
                 try:
@@ -3444,9 +3444,35 @@ def _create_node_literal(node, node_id_expr, context):
 
 
 def _create_node_from_alias(node, node_id_expr, var_alias, context):
-    cte, sql, p = context.build_dml_subquery(
-        select_override=f"SELECT {var_alias}.{node_id_expr.name} AS node_id"
-    )
+    if var_alias == "__foreach_literal__":
+        # UNWIND loop: the variable alias is a sentinel. Resolve to the current literal value
+        # and delegate to _create_node_literal so that properties are also inserted.
+        lit_val = getattr(context, "foreach_literals", {}).get(node_id_expr.name)
+        if lit_val is not None:
+            # Resolve all property values that reference the UNWIND variable too
+            resolved_props = {}
+            for pk, pv in node.properties.items():
+                if isinstance(pv, ast.Variable):
+                    fl = getattr(context, "foreach_literals", {})
+                    resolved_props[pk] = fl.get(pv.name, context.input_params.get(pv.name, pv))
+                elif isinstance(pv, ast.Literal):
+                    resolved_props[pk] = pv.value
+                else:
+                    resolved_props[pk] = pv
+            # Build a synthetic node with resolved properties for literal creation
+            import copy as _copy
+            synthetic_node = _copy.copy(node)
+            synthetic_node.properties = {
+                pk: ast.Literal(pv) if not isinstance(pv, ast.Literal) else pv
+                for pk, pv in resolved_props.items()
+            }
+            _create_node_literal(synthetic_node, ast.Literal(lit_val), context)
+            return
+        # Fallback: no literal found — use NULL
+        select_override = f"SELECT NULL AS node_id"
+    else:
+        select_override = f"SELECT {var_alias}.{node_id_expr.name} AS node_id"
+    cte, sql, p = context.build_dml_subquery(select_override=select_override)
     context.add_dml(
         f"{cte}INSERT INTO {_table('nodes')} (node_id) SELECT t.node_id FROM ({sql}) AS t WHERE NOT EXISTS (SELECT 1 FROM {_table('nodes')} WHERE node_id = t.node_id)",
         p,
@@ -3785,7 +3811,7 @@ def translate_delete_clause(delete, context, metadata):
             )
 
 
-def _merge_pattern_existence_sql(merge_node):
+def _merge_pattern_existence_sql(merge_node, context=None):
     """Build the NOT EXISTS sub-SELECT that checks whether any node already matches
     the MERGE pattern (labels + properties).  Returns (sql_fragment, params_list).
 
@@ -3794,6 +3820,18 @@ def _merge_pattern_existence_sql(merge_node):
     """
     labels = merge_node.labels if merge_node else []
     props = merge_node.properties if merge_node else {}
+
+    def _resolve_val(v):
+        if isinstance(v, ast.Literal):
+            return v.value
+        if isinstance(v, ast.Variable) and context is not None:
+            # Check foreach_literals (UNWIND loop context)
+            fl = getattr(context, "foreach_literals", {})
+            if v.name in fl:
+                return fl[v.name]
+            # Check input_params
+            return context.input_params.get(v.name, v)
+        return v
 
     if not labels and not props:
         # No constraints — any node in the graph matches; check by a sentinel always-true.
@@ -3834,7 +3872,7 @@ def _merge_pattern_existence_sql(merge_node):
         prop_joins = ""
         prop_params: list = []
         for ki, (k, v) in enumerate(props.items()):
-            val = v.value if isinstance(v, ast.Literal) else v
+            val = _resolve_val(v)
             p_alias = f"_mp{ki}"
             prop_joins += (
                 f' JOIN {_table("rdf_props")} {p_alias} ON '
@@ -3850,7 +3888,7 @@ def _merge_pattern_existence_sql(merge_node):
     prop_joins_parts = []
     prop_params = []
     for ki, (k, v) in enumerate(props.items()):
-        val = v.value if isinstance(v, ast.Literal) else v
+        val = _resolve_val(v)
         p_alias = f"_mp{ki}"
         if ki == 0:
             prop_joins_parts.append(
@@ -3933,7 +3971,7 @@ def translate_merge_clause(merge, context, metadata):
             and f"{node_alias}.node_id = ?" in added_wheres[0]
         )
 
-        exist_sql, exist_params = _merge_pattern_existence_sql(merge_node)
+        exist_sql, exist_params = _merge_pattern_existence_sql(merge_node, context)
         new_uuid = generated_uuid
 
         if new_uuid and (_has_uuid_from or _has_uuid_where or True):
@@ -3986,9 +4024,13 @@ def translate_merge_clause(merge, context, metadata):
                     f"{l_alias}.label = {context.add_join_param(label)}"
                 )
             for k, v in merge_node.properties.items():
-                val = v.value if isinstance(v, ast.Literal) else (
-                    context.input_params.get(v.name) if isinstance(v, ast.Variable) else v
-                )
+                if isinstance(v, ast.Literal):
+                    val = v.value
+                elif isinstance(v, ast.Variable):
+                    fl = getattr(context, "foreach_literals", {})
+                    val = fl.get(v.name) if v.name in fl else context.input_params.get(v.name)
+                else:
+                    val = v
                 p_alias = context.next_alias("p")
                 context.join_clauses.append(
                     f'JOIN {_table("rdf_props")} {p_alias} ON '
@@ -4062,6 +4104,7 @@ def translate_merge_clause(merge, context, metadata):
             # Register the edge alias and add JOIN for SELECT
             if rel.variable:
                 e_alias = context.register_variable(rel.variable, prefix="e")
+                context.rel_variables.add(rel.variable)
                 context.join_clauses.append(
                     f"JOIN {_table('rdf_edges')} {e_alias} ON "
                     f"{e_alias}.s = {src_alias}.node_id AND "
@@ -4104,6 +4147,36 @@ def translate_merge_clause(merge, context, metadata):
                         raise SyntaxError(f"Undefined variable: {var_name}")
                     k, v = item.expression.property_name, item.value
                     val = v.value if isinstance(v, ast.Literal) else v
+                    # Relationship property SET: update rdf_edges.qualifiers
+                    if var_name in context.rel_variables and _edge_contexts:
+                        src_a, tgt_a, rel_type = _edge_contexts[0]
+                        from_parts = context.from_clauses[:_pre_from_len]
+                        join_parts = context.join_clauses[:_pre_join_len]
+                        where_parts = context.where_conditions[:_pre_where_len]
+                        where_params_parts = context.where_params[:_pre_where_params_len]
+                        join_params_parts = context.join_params[:_pre_join_params_len]
+                        from_sql = ", ".join(from_parts) if from_parts else ""
+                        join_sql = (" " + " ".join(join_parts)) if join_parts else ""
+                        where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+                        all_params = join_params_parts + where_params_parts
+                        json_val = str(val) if val is not None else None
+                        if json_val is None:
+                            context.add_dml(
+                                f'UPDATE {_table("rdf_edges")} SET qualifiers = '
+                                f'SQLUser.CypherFn_IVGJSONREMOVE(qualifiers, ?) '
+                                f'WHERE s IN (SELECT {src_a}.node_id FROM {from_sql}{join_sql}{where_sql}) '
+                                f'AND p = ? AND o_id IN (SELECT {tgt_a}.node_id FROM {from_sql}{join_sql}{where_sql})',
+                                [k] + all_params + [rel_type] + all_params,
+                            )
+                        else:
+                            context.add_dml(
+                                f'UPDATE {_table("rdf_edges")} SET qualifiers = '
+                                f'SQLUser.CypherFn_IVGJSONSET(COALESCE(qualifiers, CAST(\'{{}}\' AS VARCHAR(256))), ?, ?) '
+                                f'WHERE s IN (SELECT {src_a}.node_id FROM {from_sql}{join_sql}{where_sql}) '
+                                f'AND p = ? AND o_id IN (SELECT {tgt_a}.node_id FROM {from_sql}{join_sql}{where_sql})',
+                                [k, json_val] + all_params + [rel_type] + all_params,
+                            )
+                        continue
                     if is_create:
                         if actual_id:
                             # ON CREATE fires only when the node was just created.
@@ -4152,7 +4225,7 @@ def translate_merge_clause(merge, context, metadata):
                             # actual_id is the new UUID — only present if node was just created.
                             # ON MATCH fires for pre-existing nodes; find them via MERGE pattern.
                             _on_mn = merge.pattern.nodes[0] if merge.pattern.nodes else None
-                            _on_es, _on_ep = _merge_pattern_existence_sql(_on_mn)
+                            _on_es, _on_ep = _merge_pattern_existence_sql(_on_mn, context)
                             _on_labels = _on_mn.labels if _on_mn else []
                             _on_props = _on_mn.properties if _on_mn else {}
                             if _on_labels or _on_props:
@@ -4205,8 +4278,41 @@ def translate_merge_clause(merge, context, metadata):
                                     [val, sql_alias, k],
                                 )
                 elif isinstance(item.expression, ast.Variable):
-                    # Label assignment: MERGE (...) ON CREATE SET a:SomeLabel or SET a:Foo:Bar
                     var_name = item.expression.name
+                    # Relationship map assignment: SET r = {map} or SET r += {map}
+                    if var_name in context.rel_variables and isinstance(item.value, ast.MapLiteral) and _edge_contexts:
+                        src_a, tgt_a, rel_type = _edge_contexts[0]
+                        from_parts = context.from_clauses[:_pre_from_len]
+                        join_parts = context.join_clauses[:_pre_join_len]
+                        where_parts = context.where_conditions[:_pre_where_len]
+                        where_params_parts = context.where_params[:_pre_where_params_len]
+                        join_params_parts = context.join_params[:_pre_join_params_len]
+                        from_sql = ", ".join(from_parts) if from_parts else ""
+                        join_sql = (" " + " ".join(join_parts)) if join_parts else ""
+                        where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+                        all_params = join_params_parts + where_params_parts
+                        # Build the qualifiers JSON for each key in the map
+                        for mk, mv in item.value.entries.items():
+                            json_val = (mv.value if isinstance(mv, ast.Literal) else
+                                        context.input_params.get(mv.name) if isinstance(mv, ast.Variable) else str(mv))
+                            if json_val is None:
+                                context.add_dml(
+                                    f'UPDATE {_table("rdf_edges")} SET qualifiers = '
+                                    f'SQLUser.CypherFn_IVGJSONREMOVE(qualifiers, ?) '
+                                    f'WHERE s IN (SELECT {src_a}.node_id FROM {from_sql}{join_sql}{where_sql}) '
+                                    f'AND p = ? AND o_id IN (SELECT {tgt_a}.node_id FROM {from_sql}{join_sql}{where_sql})',
+                                    [mk] + all_params + [rel_type] + all_params,
+                                )
+                            else:
+                                context.add_dml(
+                                    f'UPDATE {_table("rdf_edges")} SET qualifiers = '
+                                    f'SQLUser.CypherFn_IVGJSONSET(COALESCE(qualifiers, CAST(\'{{}}\' AS VARCHAR(256))), ?, ?) '
+                                    f'WHERE s IN (SELECT {src_a}.node_id FROM {from_sql}{join_sql}{where_sql}) '
+                                    f'AND p = ? AND o_id IN (SELECT {tgt_a}.node_id FROM {from_sql}{join_sql}{where_sql})',
+                                    [mk, str(json_val)] + all_params + [rel_type] + all_params,
+                                )
+                        continue
+                    # Label assignment: MERGE (...) ON CREATE SET a:SomeLabel or SET a:Foo:Bar
                     # Validate: variable must be defined.
                     if (var_name not in context.variable_aliases
                             and context.input_params.get(f"__create_id_{var_name}") is None):
@@ -4228,7 +4334,7 @@ def translate_merge_clause(merge, context, metadata):
                         else:
                             # ON MATCH: add label to the pre-existing node identified by MERGE pattern.
                             _lbl_mn = merge.pattern.nodes[0] if merge.pattern.nodes else None
-                            _lbl_es, _lbl_ep = _merge_pattern_existence_sql(_lbl_mn)
+                            _lbl_es, _lbl_ep = _merge_pattern_existence_sql(_lbl_mn, context)
                             _lbl_labels = _lbl_mn.labels if _lbl_mn else []
                             _lbl_props = _lbl_mn.properties if _lbl_mn else {}
                             if _lbl_labels or _lbl_props:
@@ -8301,7 +8407,14 @@ def _expr_subscript(expr, context, segment):
         base_alias = context.variable_aliases.get(base.name, "")
         is_scalar = base_alias.startswith("Stage") or base.name in context.scalar_variables
         if not is_scalar:
-            # base is a node variable — subscript is a property key expression
+            # Relationship variable: r[key] → JSON_VALUE(e.qualifiers, '$.' || key)
+            if base.name in context.rel_variables:
+                rel_alias = base_alias
+                idx_sql = translate_expression(idx, context, segment=segment)
+                return (
+                    f"SQLUser.JSON_VALUE({rel_alias}.qualifiers, '$.' || CAST(({idx_sql}) AS VARCHAR))"
+                )
+            # Node variable — subscript is a property key expression via rdf_props JOIN
             node_alias = base_alias
             node_ref = f"{node_alias}.node_id" if node_alias else "NULL"
             p_alias = context.next_alias("dp")
@@ -12691,7 +12804,13 @@ _IRIS_RESERVED = frozenset({
     "table","schema","column","row","data","id","user","date","time",
     "result","results","null","true","false","top","exists","not","and","or",
     "input","first","second","only","rows","fetch","with","offset","limit",
-    "values",
+    "values","int","integer","varchar","char","double","float","decimal",
+    "boolean","bit","case","when","then","else","end","in","is","as",
+    "like","between","distinct","all","any","some","by","asc","desc",
+    "inner","outer","left","right","full","cross","natural","on","using",
+    "intersect","except","minus","having","into","for","primary","foreign",
+    "references","unique","default","check","constraint","index","trigger",
+    "view","procedure","function","begin","commit","rollback","transaction",
 })
 
 
