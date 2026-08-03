@@ -1769,25 +1769,31 @@ class Parser:
         return ast.OrderByClause(items=items)
 
     def parse_limit(self) -> Any:
-        """Parse LIMIT clause. Accepts integer literals or parameter references ($name)."""
+        """Parse LIMIT clause. Accepts integer literals, parameter references ($name), or expressions."""
         if self.matches(TokenType.LIMIT):
             tok = self.peek()
             if tok.kind == TokenType.PARAMETER:
                 self.eat()
                 return ast.Variable(tok.value or "")  # resolved later against params
-            tok = self.expect(TokenType.INTEGER_LITERAL)
-            return int(tok.value) if tok.value is not None else None
+            if tok.kind == TokenType.INTEGER_LITERAL:
+                tok = self.expect(TokenType.INTEGER_LITERAL)
+                return int(tok.value) if tok.value is not None else None
+            # Expression (e.g. toInteger(ceil(1.7))) — parse and store as AST node
+            return self.parse_expression()
         return None
 
     def parse_skip(self) -> Any:
-        """Parse SKIP clause. Accepts integer literals or parameter references ($name)."""
+        """Parse SKIP clause. Accepts integer literals, parameter references ($name), or expressions."""
         if self.matches(TokenType.SKIP):
             tok = self.peek()
             if tok.kind == TokenType.PARAMETER:
                 self.eat()
                 return ast.Variable(tok.value or "")  # resolved later against params
-            tok = self.expect(TokenType.INTEGER_LITERAL)
-            return int(tok.value) if tok.value is not None else None
+            if tok.kind == TokenType.INTEGER_LITERAL:
+                tok = self.expect(TokenType.INTEGER_LITERAL)
+                return int(tok.value) if tok.value is not None else None
+            # Expression (e.g. toInteger(rand()*9)) — parse and store as AST node
+            return self.parse_expression()
         return None
 
 

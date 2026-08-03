@@ -3033,6 +3033,75 @@ def _preprocess_order_by_items(query, context, items, alias_to_sql, _proc_prefix
     return items
 
 
+def _eval_pagination_expr(value) -> Optional[float]:
+    """Evaluate a SKIP/LIMIT expression that contains no Variable references.
+
+    Returns the float result, or None if the expression contains variables.
+    Supports: integer/float literals, FunctionCall (tointeger, ceil, floor, round,
+    abs, rand, sqrt, log, exp, sin, cos, tan), and binary arithmetic.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, ast.Literal):
+        v = value.value
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+    if isinstance(value, (ast.Variable, ast.PropertyReference)):
+        return None  # contains variable reference — cannot eval statically
+    if isinstance(value, ast.FunctionCall):
+        fname = value.function_name.lower()
+        import math as _math, random as _random
+        # Arithmetic operators are encoded as __arith_<op> by the parser
+        if fname.startswith('__arith_') and len(value.arguments) == 2:
+            lv = _eval_pagination_expr(value.arguments[0])
+            rv = _eval_pagination_expr(value.arguments[1])
+            if lv is None or rv is None:
+                return None
+            op = fname[len('__arith_'):]
+            if op == '*':
+                return lv * rv
+            if op == '+':
+                return lv + rv
+            if op == '-':
+                return lv - rv
+            if op == '/':
+                return lv / rv if rv != 0 else None
+            if op == '%':
+                return lv % rv if rv != 0 else None
+            if op == '^':
+                return lv ** rv
+            return None
+        args = [_eval_pagination_expr(a) for a in value.arguments]
+        # rand() needs no arguments evaluated
+        if fname == 'rand':
+            return _random.random()
+        if any(a is None for a in args):
+            return None  # variable arg — cannot eval statically
+        _fn_map = {
+            'tointeger': lambda a: float(int(a[0])),
+            'tofloat': lambda a: float(a[0]),
+            'ceil': lambda a: float(_math.ceil(a[0])),
+            'floor': lambda a: float(_math.floor(a[0])),
+            'round': lambda a: float(round(a[0])),
+            'abs': lambda a: float(abs(a[0])),
+            'sqrt': lambda a: float(_math.sqrt(a[0])),
+            'log': lambda a: float(_math.log(a[0])),
+            'exp': lambda a: float(_math.exp(a[0])),
+            'sin': lambda a: float(_math.sin(a[0])),
+            'cos': lambda a: float(_math.cos(a[0])),
+            'tan': lambda a: float(_math.tan(a[0])),
+        }
+        if fname in _fn_map:
+            try:
+                return _fn_map[fname](args)
+            except Exception:
+                return None
+        return None
+
+
 def _resolve_pagination_value(value, context: TranslationContext, clause: str = "SKIP/LIMIT") -> Optional[int]:
     """Resolve a SKIP/LIMIT value that may be an integer literal or a parameter variable."""
     if value is None:
@@ -3054,7 +3123,17 @@ def _resolve_pagination_value(value, context: TranslationContext, clause: str = 
         resolved_int = int(resolved)
         _validate_pagination_int(resolved_int, clause)
         return resolved_int
-    # Non-constant expression in SKIP/LIMIT
+    # Try to evaluate function/arithmetic expressions with no variable references
+    evaled = _eval_pagination_expr(value)
+    if evaled is not None:
+        if evaled != int(evaled):
+            raise SyntaxError(
+                f"InvalidArgumentType: {clause} requires an integer, got float: {evaled}"
+            )
+        result = int(evaled)
+        _validate_pagination_int(result, clause)
+        return result
+    # Expression contains variable references (NonConstantExpression)
     if not isinstance(value, (int, float)):
         raise SyntaxError(
             f"NonConstantExpression: {clause} value must be a constant expression"
