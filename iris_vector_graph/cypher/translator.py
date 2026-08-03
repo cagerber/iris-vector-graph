@@ -221,6 +221,10 @@ class TranslationContext:
         self.node_obj_aliases: Dict[int, str] = (
             {} if parent is None else parent.node_obj_aliases.copy()
         )
+        # Maps node alias → SQL expression for its node_id (for anon source nodes with no nodes JOIN)
+        self.node_id_expr: Dict[str, str] = (
+            {} if parent is None else parent.node_id_expr.copy()
+        )
         self.var_length_paths: List[dict] = (
             [] if parent is None else parent.var_length_paths
         )
@@ -4554,7 +4558,9 @@ def translate_match_clause(match_clause, context, metadata):
         # Track path variable type for semantic validation
         context.bind_variable_type(np.variable, "path")
         node_aliases = [
-            context.variable_aliases.get(n.variable, f"n{i}")
+            context.variable_aliases.get(n.variable)
+            if n.variable
+            else context.node_obj_aliases.get(id(n), f"n{i}")
             for i, n in enumerate(np.pattern.nodes)
         ]
         # For relationships: first try the variable alias, then look up by object id
@@ -5018,6 +5024,7 @@ def _trp_setup_aliases(rel, source_node, target_node, context):
             is_anon_source = False  # treat as bound — it has a backing JOIN
         else:
             source_alias = context.next_alias("n")
+            context.node_obj_aliases[node_id_key] = source_alias
     else:
         existing = context.variable_aliases.get(source_node.variable)
         if existing is None:
@@ -5112,7 +5119,7 @@ def _trp_temporal_edge(rel, source_node, target_node, context, source_alias, edg
     if not hasattr(context, "cte_clauses"):
         context.cte_clauses = []
     context.cte_clauses.append(
-        f"{cte_name}(s, p, o, ts, weight) AS ({cte_sql})"
+        f"{cte_name} AS ({cte_sql})"
     )
     context.temporal_rel_ctes[rel.variable] = cte_name
     context.temporal_derived[cte_name] = cte_sql
@@ -5235,7 +5242,7 @@ def _trp_undirected_edge(
     cte_name = f"_u{edge_alias}"
     if not hasattr(context, "cte_clauses"):
         context.cte_clauses = []
-    context.cte_clauses.append(f"{cte_name}(_src, _p, _dst, _os, _oo, qualifiers) AS (\n{cte_body}\n)")
+    context.cte_clauses.append(f"{cte_name} AS (\n{cte_body}\n)")
 
     # Join the CTE as the edge alias.
     target_on = f"{target_alias}.{t_col} = {edge_alias}._dst"
@@ -5752,6 +5759,8 @@ def translate_relationship_pattern(
         if is_anon_source:
             edge_cond = "1=1"
             target_on = f"{target_alias}.{t_col} = {edge_alias}.o_id"
+            # Anon source has no nodes JOIN — record edge column for path node_id lookups
+            context.node_id_expr[source_alias] = f"{edge_alias}.s"
         else:
             edge_cond = f"{edge_alias}.s = {source_alias}.{s_col}"
             target_on = f"{target_alias}.{t_col} = {edge_alias}.o_id"
@@ -5759,6 +5768,8 @@ def translate_relationship_pattern(
         if is_anon_source:
             edge_cond = "1=1"
             target_on = f"{target_alias}.{t_col} = {edge_alias}.s"
+            # Anon source has no nodes JOIN — record edge column for path node_id lookups
+            context.node_id_expr[source_alias] = f"{edge_alias}.o_id"
         else:
             edge_cond = f"{edge_alias}.o_id = {source_alias}.{s_col}"
             target_on = f"{target_alias}.{t_col} = {edge_alias}.s"
@@ -12659,7 +12670,10 @@ def translate_return_clause(ret, context):
                 alias = item.alias or var_name
                 node_aliases = context.path_node_aliases[var_name]
                 edge_aliases = context.path_edge_aliases[var_name]
-                nodes_arr = ", ".join(f"{a}.node_id" for a in node_aliases)
+                node_id_expr = getattr(context, "node_id_expr", {})
+                nodes_arr = ", ".join(
+                    node_id_expr.get(a, f"{a}.node_id") for a in node_aliases
+                )
                 # Use _p for bidirectional (undirected) edges, p for directed edges
                 undirected_aliases = getattr(context, "_undirected_aliases", set())
                 rels_parts = []
