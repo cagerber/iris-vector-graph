@@ -2889,18 +2889,67 @@ def preprocess_order_by(query: ast.CypherQuery, context: TranslationContext) -> 
 
 
 def _preprocess_order_by_items(query, context, items, alias_to_sql, _proc_prefix_re):
+    edge_stage_vars = getattr(context, "edge_stage_variables", set())
     for item in query.order_by_clause.items:
         try:
             if (isinstance(item.expression, ast.Variable)
                     and item.expression.name in alias_to_sql):
                 expr = _proc_prefix_re.sub('', alias_to_sql[item.expression.name])
+            elif (isinstance(item.expression, ast.PropertyReference)
+                    and item.expression.variable not in context.variable_aliases):
+                # ORDER BY alias.property where alias is a RETURN alias not in variable_aliases.
+                var = item.expression.variable
+                prop = item.expression.property_name
+                # Check if it's a stage-promoted edge variable — look up qualifiers column directly.
+                orig_var = None
+                # The return alias might map back to an edge_stage var via context.return_alias_map
+                return_alias_map = getattr(context, "_return_alias_map", {})
+                orig_var = return_alias_map.get(var, var)
+                if orig_var in edge_stage_vars:
+                    stage_alias = context.variable_aliases.get(orig_var, "")
+                    if stage_alias.startswith("Stage"):
+                        col_ref = f"{stage_alias}.{orig_var}"
+                        expr = f"CASE WHEN {col_ref} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{prop}') END"
+                    else:
+                        expr = translate_expression(item.expression, context, segment="select")
+                        expr = _proc_prefix_re.sub('', expr)
+                elif var in alias_to_sql:
+                    # Fallback: try to use alias_to_sql entry — only works if it's a simple col ref
+                    import re as _re2
+                    alias_sql = alias_to_sql[var]
+                    stage_col_m = _re2.match(r'^(?:Stage\d+\.)?\w+$', alias_sql.strip())
+                    if stage_col_m:
+                        col_ref = alias_sql.strip()
+                        expr = f"CASE WHEN {col_ref} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{prop}') END"
+                    else:
+                        expr = translate_expression(item.expression, context, segment="select")
+                        expr = _proc_prefix_re.sub('', expr)
+                else:
+                    expr = translate_expression(item.expression, context, segment="select")
+                    expr = _proc_prefix_re.sub('', expr)
             else:
                 expr = translate_expression(item.expression, context, segment="select")
                 expr = _proc_prefix_re.sub('', expr)
-        except ValueError:
+        except (ValueError, SyntaxError):
             if (isinstance(item.expression, ast.Variable)
                     and item.expression.name in alias_to_sql):
                 expr = _proc_prefix_re.sub('', alias_to_sql[item.expression.name])
+            elif (isinstance(item.expression, ast.PropertyReference)
+                    and item.expression.variable in alias_to_sql):
+                prop = item.expression.property_name
+                var = item.expression.variable
+                orig_var = getattr(context, "_return_alias_map", {}).get(var, var)
+                if orig_var in edge_stage_vars:
+                    stage_alias = context.variable_aliases.get(orig_var, "")
+                    if stage_alias.startswith("Stage"):
+                        col_ref = f"{stage_alias}.{orig_var}"
+                        expr = f"CASE WHEN {col_ref} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{prop}') END"
+                    else:
+                        col_ref = alias_to_sql[var].strip()
+                        expr = f"CASE WHEN {col_ref} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{prop}') END"
+                else:
+                    col_ref = alias_to_sql[var].strip()
+                    expr = f"CASE WHEN {col_ref} IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{prop}') END"
             else:
                 raise
         items.append(f"{expr} {'ASC' if item.ascending else 'DESC'}")
@@ -4045,11 +4094,15 @@ def _translate_set_value(expr, context, target_prop: str) -> tuple:
             val = json.dumps(val)
         return ("?", [val], False)
 
-    if isinstance(expr, ast.Variable) and expr.name in context.input_params:
-        v = context.input_params[expr.name]
-        if isinstance(v, (list, dict)):
-            v = json.dumps(v)
-        return ("?", [v], False)
+    if isinstance(expr, ast.Variable):
+        if expr.name in context.input_params:
+            v = context.input_params[expr.name]
+            if isinstance(v, (list, dict)):
+                v = json.dumps(v)
+            return ("?", [v], False)
+        raise SyntaxError(
+            f"UndefinedVariable: Variable `{expr.name}` not defined"
+        )
 
     # For complex expressions, translate inline with property refs as correlated subqueries.
     def _translate_expr_for_update(e, node_var: str) -> tuple:
@@ -4071,7 +4124,9 @@ def _translate_set_value(expr, context, target_prop: str) -> tuple:
                     safe = v.replace("'", "''")
                     return f"CAST('{safe}' AS VARCHAR(256))", []
                 return str(v), []
-            return "NULL", []
+            raise SyntaxError(
+                f"UndefinedVariable: Variable `{e.name}` not defined"
+            )
 
         if isinstance(e, ast.PropertyReference):
             # n.prop reference — translate to correlated subquery
@@ -4374,6 +4429,14 @@ def translate_match_clause(match_clause, context, metadata):
         context.optional_prebound_aliases = set(context.variable_aliases.values())
     else:
         context.optional_prebound_aliases = set()
+        # Non-optional MATCH after a stage (WITH clause): a prior OPTIONAL MATCH may have
+        # registered a null-row fallback. Clear it — the non-optional MATCH will naturally
+        # produce 0 rows when the optionally-bound variable is null, so the null-row
+        # UNION ALL must not fire (it would produce spurious null result rows).
+        if context.stages:
+            context.optional_null_row_labels = []
+            context.optional_null_row_items = []
+            context.optional_null_row_unconditional = False
     # Validate no duplicate variables within the same MATCH clause (across all patterns)
     vars_in_match = set()
     for pattern in match_clause.patterns:
@@ -12579,8 +12642,12 @@ def translate_return_clause(ret, context):
             edge_stage_vars = getattr(context, "edge_stage_variables", set())
             if alias_name.startswith("Stage") and var_name in edge_stage_vars:
                 p_col = f"__edge_{var_name}_p"
-                # Emit p (type) as the relationship identifier
-                context.select_items.append(f"{alias_name}.{p_col} AS {var_name}")
+                q_col = f"{alias_name}.{var_name}"  # Stage column holding qualifiers JSON
+                edge_json = (
+                    f"'{{\"type\":\"' || {alias_name}.{p_col} || '\",\"props\":' || "
+                    f"COALESCE({q_col}, '{{}}') || '}}'"
+                )
+                context.select_items.append(f"{edge_json} AS {var_name}")
                 context.optional_null_row_items.append("NULL")
                 continue
 
@@ -12719,19 +12786,26 @@ def translate_return_clause(ret, context):
                 context.optional_null_row_items.append("NULL")
                 continue
             # Stage-promoted edge variables (e.g. WITH r promoted to Stage1 with __edge_r_s/p/o)
-            # must NOT go through the node path — emit edge identity columns instead.
+            # must NOT go through the node path — emit edge identity + qualifiers as JSON.
             edge_stage_vars = getattr(context, "edge_stage_variables", set())
             if alias_name and alias_name.startswith("Stage") and var_name in edge_stage_vars:
                 prefix = item.alias or var_name
                 p_col = f"__edge_{var_name}_p"
-                s_col = f"__edge_{var_name}_s"
-                o_col = f"__edge_{var_name}_o"
-                # Emit p (type) as the relationship identifier and s/p/o for identity.
-                context.select_items.append(f"{alias_name}.{p_col} AS {prefix}")
+                q_col = f"{alias_name}.{var_name}"  # Stage1.r = qualifiers JSON
+                edge_json = (
+                    f"'{{\"type\":\"' || {alias_name}.{p_col} || '\",\"props\":' || "
+                    f"COALESCE({q_col}, '{{}}') || '}}'"
+                )
+                context.select_items.append(f"{edge_json} AS {_safe_alias(prefix)}")
                 context.optional_null_row_items.append("NULL")
                 # When aggregates are present, edge variables must be in GROUP BY
                 if has_agg:
                     context.group_by_items.append(f"{alias_name}.{p_col}")
+                # Track RETURN alias → original var for ORDER BY property resolution
+                if prefix != var_name:
+                    if not hasattr(context, "_return_alias_map"):
+                        context._return_alias_map = {}
+                    context._return_alias_map[prefix] = var_name
                 continue
             if alias_name == "scalar":
                 continue
