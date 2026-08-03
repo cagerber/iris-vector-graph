@@ -6664,6 +6664,42 @@ def translate_boolean_expression(expr, context) -> str:
                     bool_val = is_eq if op == ast.BooleanOperator.EQUALS else not is_eq
                     return "(1=1)" if bool_val else "(1=0)"
 
+    # Ordering operators on literal lists: constant folding (SQL can't do lexicographic
+    # list ordering with null semantics — evaluate in Python).
+    _ordering_ops = (
+        ast.BooleanOperator.LESS_THAN,
+        ast.BooleanOperator.LESS_THAN_OR_EQUAL,
+        ast.BooleanOperator.GREATER_THAN,
+        ast.BooleanOperator.GREATER_THAN_OR_EQUAL,
+    )
+    if op in _ordering_ops and right_expr is not None:
+        _is_lit_list = lambda e: isinstance(e, ast.Literal) and isinstance(e.value, list)
+        if _is_lit_list(left_expr) and _is_lit_list(right_expr):
+            if _is_fully_literal(left_expr) and _is_fully_literal(right_expr):
+                lv = _literal_to_python(left_expr)
+                rv = _literal_to_python(right_expr)
+                cmp = _cypher_list_cmp(lv, rv)
+                if cmp is None:
+                    return "NULL"
+                if op == ast.BooleanOperator.LESS_THAN:
+                    return "(1=1)" if cmp < 0 else "(1=0)"
+                if op == ast.BooleanOperator.LESS_THAN_OR_EQUAL:
+                    return "(1=1)" if cmp <= 0 else "(1=0)"
+                if op == ast.BooleanOperator.GREATER_THAN:
+                    return "(1=1)" if cmp > 0 else "(1=0)"
+                if op == ast.BooleanOperator.GREATER_THAN_OR_EQUAL:
+                    return "(1=1)" if cmp >= 0 else "(1=0)"
+        # Cross-type literal ordering: string vs numeric → null (Cypher has no ordering between types)
+        if isinstance(left_expr, ast.Literal) and isinstance(right_expr, ast.Literal):
+            lv, rv = left_expr.value, right_expr.value
+            if lv is not None and rv is not None and not isinstance(lv, bool) and not isinstance(rv, bool):
+                lv_str = isinstance(lv, str)
+                rv_str = isinstance(rv, str)
+                lv_num = isinstance(lv, (int, float))
+                rv_num = isinstance(rv, (int, float))
+                if (lv_str and rv_num) or (lv_num and rv_str):
+                    return "NULL"
+
     # String predicate type guard: STARTS WITH, ENDS WITH, CONTAINS require string operands.
     # If either operand is a known non-string literal (number, bool, list, map), return NULL.
     if op in (ast.BooleanOperator.STARTS_WITH, ast.BooleanOperator.ENDS_WITH, ast.BooleanOperator.CONTAINS):
@@ -6755,6 +6791,33 @@ def _cypher_eq(a, b):
                 result = None
         return result
     return a == b
+
+
+def _cypher_list_cmp(a, b):
+    """Three-valued Cypher lexicographic list comparison.
+    Returns -1, 0, 1, or None (null — when a null element determines the ordering).
+    Cross-type comparisons (str vs numeric) return None per Cypher semantics.
+    """
+    if not isinstance(a, list) or not isinstance(b, list):
+        return None
+    for x, y in zip(a, b):
+        if x is None or y is None:
+            return None
+        # Cross-type comparison → null
+        x_num = isinstance(x, (int, float)) and not isinstance(x, bool)
+        y_num = isinstance(y, (int, float)) and not isinstance(y, bool)
+        x_str = isinstance(x, str)
+        y_str = isinstance(y, str)
+        if (x_num and y_str) or (x_str and y_num):
+            return None
+        try:
+            if x < y:
+                return -1
+            if x > y:
+                return 1
+        except TypeError:
+            return None
+    return len(a) - len(b)
 
 
 def _inline_literal(expr) -> Optional[str]:
@@ -8320,7 +8383,7 @@ def _scalar_coalesce(fn, args, args_exprs):
     return None
 
 
-def _scalar_string(fn, args, args_exprs):
+def _scalar_string(fn, args, args_exprs, context=None):
     if fn == "tointeger":
         return f"CASE WHEN ISNUMERIC({args[0]}) = 1 THEN CAST({args[0]} AS INTEGER) ELSE NULL END"
     if fn == "tofloat":
@@ -11967,6 +12030,33 @@ def _expr_function_call(expr, context, segment):
         if isinstance(arg0, ast.BooleanExpression):
             cond = translate_boolean_expression(arg0, context)
             return f"CASE WHEN ({cond}) THEN 'true' ELSE 'false' END"
+
+    # tointeger/tofloat: CASE WHEN ISNUMERIC(x) THEN CAST(x ...) uses arg expression TWICE.
+    # If arg translation adds params (? placeholders), we must duplicate them so one copy
+    # goes to ISNUMERIC and one to CAST. Snapshot all param lists, translate once, then
+    # re-append whatever was added.
+    if fn in ("tointeger", "tofloat") and expr.arguments:
+        _sp0 = len(context.select_params)
+        _wp0 = len(context.where_params)
+        _jp0 = len(context.join_params)
+        if isinstance(expr.arguments[0], ast.Literal) and not isinstance(expr.arguments[0].value, list):
+            inlined = _inline_literal(expr.arguments[0])
+            if inlined is not None:
+                arg_sql = inlined
+            else:
+                arg_sql = translate_expression(expr.arguments[0], context, segment="inline")
+        else:
+            arg_sql = translate_expression(expr.arguments[0], context, segment="inline")
+        # Duplicate any params that were added during arg translation
+        _sp_added = context.select_params[_sp0:]
+        _wp_added = context.where_params[_wp0:]
+        _jp_added = context.join_params[_jp0:]
+        if _sp_added or _wp_added or _jp_added:
+            context.select_params.extend(_sp_added)
+            context.where_params.extend(_wp_added)
+            context.join_params.extend(_jp_added)
+        cast_type = "INTEGER" if fn == "tointeger" else "DOUBLE"
+        return f"CASE WHEN ISNUMERIC({arg_sql}) = 1 THEN CAST({arg_sql} AS {cast_type}) ELSE NULL END"
 
     # size(pattern-predicate) raises SyntaxError — ExistsExpression arg is a pattern, not a list
     if fn == "size" and expr.arguments and isinstance(expr.arguments[0], ast.ExistsExpression):
