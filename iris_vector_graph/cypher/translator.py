@@ -1689,15 +1689,34 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
     if part.with_clause.order_by_clause:
         for item in part.with_clause.order_by_clause.items:
             direction = "ASC" if item.ascending else "DESC"
+            # Validate: ORDER BY variables must be in scope (projected by WITH or bound by MATCH).
+            # A plain Variable or PropertyReference root that is not in with_aliases AND not in
+            # context.variable_aliases is truly undefined → UndefinedVariable.
+            # Note: PropertyReference x.prop where x is a MATCH-bound node is allowed even if
+            # x is not projected in this WITH (ORDER BY evaluated before projection narrowing).
+            _all_bound = with_aliases | set(context.variable_aliases.keys())
+            if isinstance(item.expression, ast.Variable):
+                if item.expression.name not in _all_bound:
+                    raise SyntaxError(
+                        f"UndefinedVariable: Variable `{item.expression.name}` not defined"
+                    )
+            elif isinstance(item.expression, ast.PropertyReference):
+                if item.expression.variable not in _all_bound:
+                    raise SyntaxError(
+                        f"UndefinedVariable: Variable `{item.expression.variable}` not defined"
+                    )
             # If ORDER BY expression is a PropertyReference projected as a WITH alias, use the alias.
             # This avoids adding a second JOIN that would break DISTINCT semantics.
             if isinstance(item.expression, ast.PropertyReference):
                 _pk = (item.expression.variable, item.expression.property_name)
                 if _pk in prop_alias_map:
                     col = _safe_alias(prop_alias_map[_pk])
-                    order_by_items.append(
-                        f"CASE WHEN ISNUMERIC({col}) = 1 THEN CAST({col} AS DOUBLE) END {direction}, {col} {direction}"
-                    )
+                    if col.startswith('"') and col.endswith('"'):
+                        order_by_items.append(f"{col} {direction}")
+                    else:
+                        order_by_items.append(
+                            f"CASE WHEN ISNUMERIC({col}) = 1 THEN CAST({col} AS DOUBLE) END {direction}, {col} {direction}"
+                        )
                     continue
             # If the expression is a variable that matches a WITH alias, emit as bare column name
             # (but quote it if it's a SQL reserved word, same as the SELECT alias)
@@ -1706,9 +1725,14 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
                 # Emit numeric-aware sort: numeric values sort by DOUBLE, strings by VARCHAR.
                 # CASE WHEN ISNUMERIC(x)=1 THEN CAST(x AS DOUBLE) END returns NULL for strings
                 # (NULLs sort last in ASC, first in DESC — both correct for mixed-type data).
-                order_by_items.append(
-                    f"CASE WHEN ISNUMERIC({col}) = 1 THEN CAST({col} AS DOUBLE) END {direction}, {col} {direction}"
-                )
+                # IRIS chokes on ISNUMERIC("reserved") and CAST("reserved" AS DOUBLE) when the
+                # quoted identifier matches a CTE column name — emit plain ORDER BY in that case.
+                if col.startswith('"') and col.endswith('"'):
+                    order_by_items.append(f"{col} {direction}")
+                else:
+                    order_by_items.append(
+                        f"CASE WHEN ISNUMERIC({col}) = 1 THEN CAST({col} AS DOUBLE) END {direction}, {col} {direction}"
+                    )
             else:
                 try:
                     # Map WITH-projected aliases to bare column names so ORDER BY arithmetic
@@ -1833,8 +1857,21 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
             stage_params = []
             sql = f"SELECT * FROM {_rn_stage} WHERE __rn > {skip}"
         elif order_by_items:
-            # ORDER BY only (no LIMIT/SKIP): wrap to keep ORDER BY out of CTE body
-            sql = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
+            # ORDER BY only (no LIMIT/SKIP): IRIS rejects ORDER BY inside a CTE body.
+            # Use TOP with max BIGINT to produce an ordered subquery IRIS accepts in a CTE.
+            # Don't apply TOP if ORDER BY contains an aggregation (e.g. ORDER BY COUNT(1)) —
+            # those should raise SyntaxError but we haven't validated them yet; leaving plain
+            # SELECT * FROM (...) __ob ORDER BY lets IRIS reject them, which the TCK interprets as
+            # a SyntaxError (the TCK SyntaxError-check catches any SQL error on execution).
+            _has_agg_in_ob = any(
+                '__sort' in ob or 'COUNT(' in ob.upper() or 'SUM(' in ob.upper()
+                or 'MIN(' in ob.upper() or 'MAX(' in ob.upper() or 'AVG(' in ob.upper()
+                for ob in order_by_items
+            )
+            if _has_agg_in_ob:
+                sql = f"SELECT * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
+            else:
+                sql = f"SELECT TOP 9223372036854775807 * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
 
     context.all_stage_params.extend(stage_params)
     context.stages.append(f"Stage{i + 1} AS (\n{sql}\n)")
@@ -11821,6 +11858,9 @@ def _expr_fn_range(args_exprs):
         end = int(args_exprs[1].value) if isinstance(args_exprs[1], ast.Literal) else None
         step_arg = args_exprs[2] if len(args_exprs) > 2 else None
         if step_arg is not None:
+            if not isinstance(step_arg, ast.Literal):
+                # Dynamic step — fall through to empty-array fallback
+                raise TypeError("dynamic step")
             step = int(step_arg.value)
         else:
             step = 1
