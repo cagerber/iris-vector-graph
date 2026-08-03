@@ -12537,13 +12537,13 @@ def translate_return_clause(ret, context):
                 )
             seen_aliases.add(effective_alias)
 
-    # RETURN * after a WITH stage: the star is parsed as Literal('*').
+    # RETURN * — the star is parsed as Literal('*').
     # Expand * into explicit hydration for all variables in scope.
     if (
         len(ret.items) == 1
         and isinstance(ret.items[0].expression, ast.Literal)
         and ret.items[0].expression.value == "*"
-        and context.stages
+        and (context.stages or context.variable_aliases or context.named_paths)
     ):
         # Expand RETURN * into explicit select items for each variable.
         # Variables must be sorted deterministically for test reproducibility.
@@ -12614,6 +12614,25 @@ def translate_return_clause(ret, context):
                     f"{properties_subquery(node_expr)} AS {prefix}_props"
                 )
                 context.optional_null_row_items.extend(["NULL", "NULL", "NULL"])
+        # Also expand named path variables from context.named_paths
+        for path_var in sorted(context.named_paths.keys()):
+            if path_var not in (context.path_node_aliases or {}):
+                continue
+            node_aliases = context.path_node_aliases[path_var]
+            edge_aliases = context.path_edge_aliases.get(path_var, [])
+            node_id_expr_map = getattr(context, "node_id_expr", {})
+            nodes_arr = ", ".join(
+                node_id_expr_map.get(a, f"{a}.node_id") for a in node_aliases
+            )
+            undirected_aliases = getattr(context, "_undirected_aliases", set())
+            rels_parts = []
+            for a in edge_aliases:
+                col = "_p" if a in undirected_aliases else "p"
+                rels_parts.append(f"{a}.{col}")
+            rels_arr = ", ".join(rels_parts)
+            json_expr = f"'{{\"nodes\":' || JSON_ARRAY({nodes_arr}) || ',\"rels\":' || JSON_ARRAY({rels_arr}) || '}}'"
+            context.select_items.append(f"{json_expr} AS {_safe_alias(path_var)}")
+            context.optional_null_row_items.append("NULL")
         return
     # Detect if there are any aggregation functions in the RETURN items (including nested)
     has_agg = any(_contains_aggregation(i.expression) for i in ret.items)
