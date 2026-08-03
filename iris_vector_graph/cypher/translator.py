@@ -6194,11 +6194,13 @@ def _boolean_expr_comparison_ops(op, left, left_expr, right, right_expr) -> Opti
     if op == ast.BooleanOperator.LESS_THAN:
         return f"{left} < {right}"
     if op == ast.BooleanOperator.LESS_THAN_OR_EQUAL:
-        return f"{left} <= {right}"
+        # Decompose to avoid IRIS returning true for NaN <= x (NaN is treated as max float by IRIS)
+        return f"(({left} < {right}) OR ({left} = {right}))"
     if op == ast.BooleanOperator.GREATER_THAN:
         return f"{left} > {right}"
     if op == ast.BooleanOperator.GREATER_THAN_OR_EQUAL:
-        return f"{left} >= {right}"
+        # Decompose to avoid IRIS returning true for NaN >= x (NaN is treated as max float by IRIS)
+        return f"(({left} > {right}) OR ({left} = {right}))"
     if op == ast.BooleanOperator.STARTS_WITH:
         # %EXACT() forces byte-level (case-sensitive) comparison on SQLUPPER-collated columns.
         return f"%EXACT({left}) LIKE %EXACT({right} || '%')"
