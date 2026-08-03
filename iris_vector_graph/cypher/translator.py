@@ -4399,6 +4399,11 @@ def _translate_set_value(expr, context, target_prop: str) -> tuple:
             if isinstance(e.value, str):
                 safe = e.value.replace("'", "''")
                 return f"CAST('{safe}' AS VARCHAR(256))", []
+            if isinstance(e.value, list):
+                import json as _json
+                js = _json.dumps(_extract_literal_value(e))
+                safe = js.replace("'", "''")
+                return f"CAST('{safe}' AS VARCHAR({max(len(js)+1, 64)}))", []
             return str(e.value), []
 
         if isinstance(e, ast.Variable):
@@ -4438,6 +4443,11 @@ def _translate_set_value(expr, context, target_prop: str) -> tuple:
             if op == "+":
                 def _is_str_arg(a):
                     return isinstance(a, ast.Literal) and isinstance(a.value, str)
+                def _is_list_arg(a):
+                    if isinstance(a, ast.Literal):
+                        v = _extract_literal_value(a)
+                        return isinstance(v, list)
+                    return False
                 left_is_str = _is_str_arg(e.arguments[0])
                 right_is_str = _is_str_arg(e.arguments[1])
                 if left_is_str or right_is_str:
@@ -4456,6 +4466,41 @@ def _translate_set_value(expr, context, target_prop: str) -> tuple:
                     left_sql, left_params = _str_aware_translate(e.arguments[0])
                     right_sql, right_params = _str_aware_translate(e.arguments[1])
                     return f"(CAST({left_sql} AS VARCHAR(4096)) || CAST({right_sql} AS VARCHAR(4096)))", left_params + right_params
+                left_is_list = _is_list_arg(e.arguments[0])
+                right_is_list = _is_list_arg(e.arguments[1])
+                if left_is_list or right_is_list:
+                    # JSON array concatenation: use string-manipulation approach
+                    # left_arr + right_arr → remove trailing ] from left, remove leading [ from right
+                    import json as _json
+                    def _list_sql(a, is_left_side):
+                        if _is_list_arg(a):
+                            js = _json.dumps(_extract_literal_value(a))
+                            safe_js = js.replace("'", "''")
+                            return f"CAST('{safe_js}' AS VARCHAR({max(len(js)+1, 64)}))", []
+                        if isinstance(a, ast.PropertyReference):
+                            prop = a.property_name
+                            safe_prop = prop.replace("'", "''")
+                            if prop == target_prop:
+                                # Use VARCHAR cast so INSERT branch can substitute via _iv_subq replacement
+                                return "CAST(val AS VARCHAR(4096))", []
+                            return (
+                                f"(SELECT _upd.val FROM {_table('rdf_props')} _upd "
+                                f"WHERE _upd.s = {_table('rdf_props')}.s "
+                                f"AND _upd.\"key\" = '{safe_prop}')"
+                            ), []
+                        return _translate_expr_for_update(a, node_var)
+                    left_sql, left_params = _list_sql(e.arguments[0], True)
+                    right_sql, right_params = _list_sql(e.arguments[1], False)
+                    # Concat: strip trailing ] from left, strip leading [ from right, join with ,
+                    # Handle empty arrays: if left='[]' just use right; if right='[]' just use left
+                    concat_sql = (
+                        f"CASE "
+                        f"WHEN {left_sql} IS NULL OR {left_sql} = '[]' THEN {right_sql} "
+                        f"WHEN {right_sql} IS NULL OR {right_sql} = '[]' THEN {left_sql} "
+                        f"ELSE SUBSTR({left_sql}, 1, CHAR_LENGTH({left_sql})-1) || ',' || SUBSTR({right_sql}, 2) "
+                        f"END"
+                    )
+                    return concat_sql, left_params + right_params
             left_sql, left_params = _translate_expr_for_update(e.arguments[0], node_var)
             right_sql, right_params = _translate_expr_for_update(e.arguments[1], node_var)
             return f"({left_sql} {sql_op} {right_sql})", left_params + right_params
@@ -4529,21 +4574,34 @@ def translate_set_clause(set_cl, context, metadata):
                 # Null value means remove the property (Cypher semantics)
                 val_sql, val_params, is_expr = _translate_set_value(v, context, k)
                 val_for_json = val_params[0] if val_params and not is_expr else None
-                if val_for_json is None:
-                    # null → remove the key from qualifiers
-                    cte, subquery, subparams = context.build_dml_subquery(
-                        select_override=f"SELECT {alias}.edge_id"
-                    )
+                cte, subquery, subparams = context.build_dml_subquery(
+                    select_override=f"SELECT {alias}.edge_id"
+                )
+                if val_for_json is None and not is_expr:
+                    # null literal → remove the key from qualifiers
                     context.add_dml(
                         f'{cte}UPDATE {_table("rdf_edges")} SET qualifiers = '
                         f'SQLUser.CypherFn_IVGJSONREMOVE(qualifiers, ?) '
                         f'WHERE edge_id IN ({subquery})',
                         [k] + subparams,
                     )
-                else:
-                    cte, subquery, subparams = context.build_dml_subquery(
-                        select_override=f"SELECT {alias}.edge_id"
+                elif is_expr:
+                    # Expression (e.g. r.num + 1): val_sql uses `val` for current-prop refs.
+                    # For edges, current value is JSON_VALUE(qualifiers, '$.key').
+                    safe_k = k.replace("'", "''")
+                    edge_val_ref = f"CAST(CASE WHEN {_table('rdf_edges')}.qualifiers IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({_table('rdf_edges')}.qualifiers, '$.{safe_k}') END AS DOUBLE)"
+                    adapted_sql = val_sql.replace(
+                        "CAST(val AS NUMERIC)", edge_val_ref
+                    ).replace(
+                        "CAST(val AS VARCHAR(4096))", f"CASE WHEN {_table('rdf_edges')}.qualifiers IS NULL THEN NULL ELSE SQLUser.JSON_VALUE({_table('rdf_edges')}.qualifiers, '$.{safe_k}') END"
                     )
+                    context.add_dml(
+                        f'{cte}UPDATE {_table("rdf_edges")} SET qualifiers = '
+                        f'SQLUser.CypherFn_IVGJSONSET(COALESCE(qualifiers, CAST(\'{{}}\'  AS VARCHAR(256))), ?, CAST(({adapted_sql}) AS VARCHAR(256))) '
+                        f'WHERE edge_id IN ({subquery})',
+                        [k] + val_params + subparams,
+                    )
+                else:
                     context.add_dml(
                         f'{cte}UPDATE {_table("rdf_edges")} SET qualifiers = '
                         f'SQLUser.CypherFn_IVGJSONSET(qualifiers, ?, ?) '
@@ -12655,6 +12713,15 @@ def _expr_function_call(expr, context, segment):
             )
         if isinstance(arg0, ast.PropertyReference):
             col = args[0]
+            # col may contain ? placeholders (added once by inline arg translation).
+            # The CASE uses col 3 times → must duplicate any params that were added.
+            _n_q = col.count("?")
+            if _n_q > 0:
+                # col was added via inline translation; it added _n_q params to select_params.
+                # Duplicate them (2 more copies) so the 3 usages of col are all covered.
+                _added = context.select_params[-_n_q:]
+                context.select_params.extend(_added)
+                context.select_params.extend(_added)
             return (
                 f"CASE WHEN SUBSTRING({col}, 1, 1) IN ('[', '{{') "
                 f"THEN SQLUser.JSON_ARRAYLENGTH({col}) "

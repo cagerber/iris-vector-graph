@@ -1738,7 +1738,7 @@ class Parser:
                     "Expected property key", key_tok.line, key_tok.column
                 )
             self.expect(TokenType.COLON)
-            val = self.parse_primary_expression()
+            val = self.parse_expression()
             props[key] = val
             if not self.matches(TokenType.COMMA):
                 break

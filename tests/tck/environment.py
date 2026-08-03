@@ -273,9 +273,11 @@ def _ensure_named_graph(context, graph_name: str, label: str):
         return
 
     # Inject session label into CREATE
-    from tests.tck.steps.graph_setup import _inject_label
+    from tests.tck.steps.graph_setup import _inject_label, _sync_kg
     labeled_cql = _inject_label(cql.strip(), label)
     try:
         context.engine.execute_cypher(labeled_cql, {})
     except Exception as e:
         logger.warning("Failed to create named graph '%s': %s", graph_name, e)
+    # Rebuild ^KG so variable-length path queries work on this named graph.
+    _sync_kg(context)

@@ -1286,7 +1286,7 @@ class QueryMixin:
                     f"{post_joins}\n"
                     f"WHERE {' AND '.join(all_conds)}"
                 )
-                params = list(chunk) + list(post_params)
+                params = list(post_params) + list(chunk)
                 try:
                     cursor.execute(post_query, params)
                     for row in cursor.fetchall():

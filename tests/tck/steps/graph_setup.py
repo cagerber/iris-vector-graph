@@ -8,6 +8,14 @@ def _new_label() -> str:
     return f"TCK_{uuid4().hex[:8]}"
 
 
+def _sync_kg(context) -> None:
+    """Rebuild ^KG adjacency index after graph setup so variable-length paths work."""
+    try:
+        context.engine.sync()
+    except Exception:
+        pass  # sync failure is non-fatal; BFS will warn and fail gracefully
+
+
 @given("an empty graph")
 def step_empty_graph(context):
     context.scenario_label = _new_label()
@@ -35,6 +43,8 @@ def step_having_executed(context, query=None):
         )
     except Exception:
         pass  # setup queries may fail if already exists; ignore
+    # Rebuild ^KG adjacency index so variable-length path queries work.
+    _sync_kg(context)
 
 
 @step("the {graph_name} graph")
