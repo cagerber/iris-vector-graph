@@ -5768,9 +5768,11 @@ def translate_relationship_pattern(
 
 
 def translate_where_clause(where, context):
-    context.where_conditions.append(
-        translate_boolean_expression(where.expression, context)
-    )
+    cond = translate_boolean_expression(where.expression, context)
+    # NULL in WHERE is invalid SQL. In Cypher, NULL in WHERE means "no match" — use (1=0).
+    if cond == "NULL" or cond == "(NULL)":
+        cond = "(1=0)"
+    context.where_conditions.append(cond)
 
 
 def _is_temporal_ts_condition(expr, context) -> bool:
@@ -6258,6 +6260,9 @@ def _boolean_expr_logical(op, expr, context):
             left = translate_expression(operand.operands[0], context, segment="where")
             return f"{left} IS NULL"
         operand_sql = translate_boolean_expression(operand, context)
+        # NOT NULL = NULL per three-valued logic
+        if operand_sql == "NULL":
+            return "NULL"
         operand_sql = _coerce_varchar_boolean_if_needed(operand, operand_sql, context)
         return f"NOT ({operand_sql})"
     return None
