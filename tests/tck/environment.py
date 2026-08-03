@@ -122,6 +122,7 @@ def before_scenario(context, scenario):
     context.last_result = None
     context.last_error = None
     context._used_named_graph = None  # track if this scenario uses a named graph
+    context._tck_procedures = {}  # TCK test procedure registry (for CALL support)
 
 
 def after_scenario(context, scenario):
