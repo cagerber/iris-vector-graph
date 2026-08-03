@@ -311,6 +311,16 @@ class TranslationContext:
         self.non_map_vars: set = (
             set() if parent is None else parent.non_map_vars.copy()
         )
+        # UNWIND aliases that hold collected node JSON blobs ({_id, _labels, _props}).
+        # Property access must join rdf_props using the _id extracted from the blob.
+        self.collected_node_variables: set = (
+            set() if parent is None else parent.collected_node_variables.copy()
+        )
+        # Mapping from WITH alias → original node variable name for collect() sources.
+        # Used to detect UNWIND sources that are collected node lists.
+        self.collected_node_lists: Dict[str, str] = (
+            {} if parent is None else parent.collected_node_lists.copy()
+        )
         # (alias, prop_name) pairs for properties that appear in IS NULL / IS NOT NULL
         # checks in the current boolean context.  The structural guard (OPT-3 EXISTS) is
         # suppressed for these so that nodes lacking the property produce a NULL val that
@@ -1915,12 +1925,23 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
                     context.bind_variable_type(alias, "scalar", force=True)
             if isinstance(item.expression, ast.AggregationFunction) and alias:
                 context.scalar_variables.add(alias)
+                # Track collect(node_var) → alias as a collected node list
+                if (item.expression.function_name.lower() == "collect"
+                        and item.expression.argument
+                        and isinstance(item.expression.argument, ast.Variable)):
+                    collected_var = item.expression.argument.name
+                    if (collected_var not in context.scalar_variables
+                            and collected_var not in getattr(context, "edge_stage_variables", set())):
+                        context.collected_node_lists[alias] = collected_var
             elif alias and not isinstance(item.expression, ast.Variable):
                 context.scalar_variables.add(alias)
             elif (alias and isinstance(item.expression, ast.Variable)
                   and item.expression.name in context.scalar_variables):
                 # Scalar passthrough: WITH scalar_var AS alias — alias is also scalar
                 context.scalar_variables.add(alias)
+                # Propagate collected_node_lists for scalar passthroughs
+                if item.expression.name in context.collected_node_lists:
+                    context.collected_node_lists[alias] = context.collected_node_lists[item.expression.name]
     context.variable_aliases = new_aliases
 
 
@@ -3080,6 +3101,13 @@ def translate_unwind_clause(unwind, context):
     alias = context.register_variable(unwind.alias, prefix="u")
     context.scalar_variables.add(unwind.alias)
     context.bind_variable_type(unwind.alias, "scalar")
+
+    # Detect UNWIND of a collected node list: mark alias as collected_node_variable
+    # so property access generates a rdf_props join using the _id from the JSON blob.
+    if isinstance(unwind.expression, ast.Variable):
+        _src = unwind.expression.name
+        if _src in getattr(context, "collected_node_lists", {}):
+            context.collected_node_variables.add(unwind.alias)
 
     # For list literals with only scalar elements, use UNION ALL instead of JSON_TABLE.
     # IRIS JSON_TABLE coerces empty strings to NULL (JSON_TABLE PATH '$' issue).
@@ -7474,6 +7502,10 @@ def _expr_list_comprehension(expr, context, segment):
     context.variable_aliases[expr.variable] = f"{alias}"
     # Mark as scalar variable so property access uses JSON_VALUE
     context.scalar_variables.add(expr.variable)
+    # If source is a collected node list, mark loop var as collected_node_variable
+    if (isinstance(expr.source, ast.Variable)
+            and expr.source.name in getattr(context, "collected_node_lists", {})):
+        context.collected_node_variables.add(expr.variable)
     where_clause = ""
     if expr.predicate:
         if isinstance(expr.predicate, ast.BooleanExpression):
@@ -7487,6 +7519,7 @@ def _expr_list_comprehension(expr, context, segment):
         select_expr = proj_sql
     del context.variable_aliases[expr.variable]
     context.scalar_variables.discard(expr.variable)
+    context.collected_node_variables.discard(expr.variable)
     # Use VARCHAR to support both scalar values and JSON objects
     return (
         f"(SELECT JSON_ARRAYAGG({select_expr}) FROM "
@@ -7982,6 +8015,16 @@ def _expr_property_reference(expr, context, segment):
         return f"{p_alias}.val"
     if alias.startswith("e") and not alias.startswith("ES_"):
         return _expr_propref_edge_alias(expr, context, alias)
+    # Collected node variable: the column holds a full node JSON blob ({_id,_labels,_props}).
+    # Extract _id via a correlated subquery (can't use JSON_VALUE in JOIN ON in IRIS).
+    if expr.variable in getattr(context, "collected_node_variables", set()):
+        col_ref = f"{alias}.{_safe_alias(expr.variable)}"
+        prop_key = expr.property_name
+        context.select_params.append(prop_key)
+        return (
+            f"(SELECT val FROM {_table('rdf_props')} "
+            f"WHERE s = SQLUser.JSON_VALUE({col_ref}, '$._id') AND \"key\" = ?)"
+        )
     # Scalar variable from JSON_TABLE (list predicate / list comprehension): use JSON_VALUE
     # not rdf_props join.  The column holds a JSON-serialised value, not a graph node id.
     # Guard: only call JSON_VALUE when the value is a JSON object (starts with '{').
@@ -13107,6 +13150,26 @@ def translate_with_clause(with_clause, context):
                 _pval = context.input_params[_param_name]
                 if not isinstance(_pval, dict):
                     context.non_map_vars.add(alias)
+
+        # Stage-promoted edge variables forwarded through another WITH: propagate identity columns
+        # so downstream MATCH/RETURN can still reference __edge_<alias>_s/p/o.
+        edge_stage_vars = getattr(context, "edge_stage_variables", set())
+        if (isinstance(item.expression, ast.Variable)
+                and item.expression.name in edge_stage_vars
+                and context.variable_aliases.get(item.expression.name, "").startswith("Stage")):
+            prev_stage = context.variable_aliases[item.expression.name]
+            prev_var = item.expression.name
+            # Propagate identity columns using new alias name
+            stage_col_name = alias
+            for suffix in ("_s", "_p", "_o"):
+                context.select_items.append(
+                    f"{prev_stage}.__edge_{prev_var}{suffix} AS __edge_{stage_col_name}{suffix}"
+                )
+            if not hasattr(context, "edge_stage_variables"):
+                context.edge_stage_variables = set()
+            context.edge_stage_variables.add(alias)
+            if alias != prev_var:
+                context.edge_stage_variables.add(alias)
 
         # Edge variables: expose qualifiers JSON so downstream r.prop works via JSON_VALUE(r, '$.prop')
         if (isinstance(item.expression, ast.Variable)
