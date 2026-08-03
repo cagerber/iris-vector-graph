@@ -2138,16 +2138,27 @@ def _tts_process_parts(cypher_query, context, metadata):
         else:
             for clause in part.clauses:
                 if isinstance(clause, ast.MatchClause):
+                    aliases_before_match = set(context.variable_aliases.values())
                     translate_match_clause(clause, context, metadata)
+                    if clause.optional:
+                        context.optional_match_new_aliases = (
+                            set(context.variable_aliases.values()) - aliases_before_match
+                        )
+                    else:
+                        context.optional_match_new_aliases = set()
                 elif isinstance(clause, ast.UnwindClause):
                     translate_unwind_clause(clause, context)
+                    context.optional_match_new_aliases = set()
                 elif isinstance(clause, ast.SubqueryCall):
                     translate_subquery_call(clause, context, metadata)
+                    context.optional_match_new_aliases = set()
                 elif isinstance(clause, ast.ForeachClause):
                     is_transactional = _to_sql_handle_foreach(clause, context, metadata) or is_transactional
+                    context.optional_match_new_aliases = set()
                 elif isinstance(clause, ast.UpdatingClause):
                     is_transactional = True
                     translate_updating_clause(clause, context, metadata)
+                    context.optional_match_new_aliases = set()
                 elif isinstance(clause, ast.WhereClause):
                     translate_where_clause(clause, context)
         if part.procedure_call is not None:
@@ -2581,20 +2592,19 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
             sql = sql.replace("SELECT DISTINCT \nFROM", f"SELECT DISTINCT *\nFROM", 1)
     if hasattr(context, '_percentile_queries') and context._percentile_queries:
         import re as _re
-        from_match = _re.search(r'\nFROM\s+(.*?)(?:\nWHERE|\nORDER|\nFETCH|\nGROUP|\nHAVING|$)', sql, _re.DOTALL)
+        from_match = _re.search(r'\nFROM\s+(.*?)(?=\nWHERE|\nORDER|\nFETCH|\nGROUP|\nHAVING|$)', sql, _re.DOTALL)
         if from_match and len(context._percentile_queries) == 1:
             from_clause = from_match.group(0).strip()
             val_expr, pct_val, fn_name, var_name, alias = context._percentile_queries[0]
             col_alias = _re.search(r'AS\s+(\w+)\s*$', sql.split('\n')[0])
             out_alias = col_alias.group(1) if col_alias else "result"
             proc = "PCONT" if fn_name == "percentilecont" else "PDISC"
-            inner_col = val_expr.split('.')[-1] if '.' in val_expr else val_expr
             sql = (
                 f"SELECT IVG.Percentile_{proc}("
                 f"(SELECT JSON_ARRAYAGG(CAST({val_expr} AS DOUBLE)) "
                 f"\n{from_clause}), {pct_val}) AS {out_alias}"
             )
-            p = []
+            # Keep p (params) — val_expr and pct_val may contain ? placeholders that need p
     # When fetch_first_unsafe and we have SKIP or LIMIT with ORDER BY that references
     # JOIN aliases (p\d+.val), project those sort expressions as __sort_N columns so
     # they survive the subquery wrapping in apply_pagination.
@@ -7144,13 +7154,31 @@ def _expr_arith(expr, context, segment):
                 return True
             if not isinstance(arg, ast.MapLiteral) and isinstance(arg, ast.FunctionCall) and arg.function_name in (
                 "collect", "nodes", "relationships", "labels", "keys", "range",
+                "reverse", "tail", "head", "__list_comprehension", "__arith_+",
+                "filter", "extract",
             ):
                 return True
+            # __arith_+ that returns a list (recursively check)
+            if isinstance(arg, ast.FunctionCall) and arg.function_name == "__arith_+":
+                if any(_is_list(a) for a in arg.arguments):
+                    return True
             # Also check if it's a variable that references a Stage column (likely a list from WITH clause)
             if isinstance(arg, ast.Variable) and arg.name in context.variable_aliases:
                 alias = context.variable_aliases[arg.name]
                 # Check if the alias is a Stage reference (e.g., "Stage0" or "Stage1.col_name")
                 if alias.startswith("Stage"):
+                    return True
+            # Also check if it's a variable known to be a list from scalar_variables tracking
+            if isinstance(arg, ast.Variable) and arg.name in getattr(context, "scalar_variables", set()):
+                # scalar_variables includes collect() output; check if it's from a list source
+                if arg.name in getattr(context, "collected_node_lists", {}):
+                    return True
+            # CASE expression: treat as list if all branches are lists
+            if isinstance(arg, ast.CaseExpression):
+                branches = [wc.result for wc in arg.when_clauses]
+                if arg.else_result is not None:
+                    branches.append(arg.else_result)
+                if branches and all(_is_list(b) for b in branches):
                     return True
             return False
         left_str = _is_str(expr.arguments[0])
@@ -11898,10 +11926,31 @@ def _scalar_statistical(fn, args, args_exprs, context):
         val_expr = args[0]
         pct_expr = args[1] if len(args) > 1 else "0.5"
         context._percentile_queries = getattr(context, "_percentile_queries", [])
+        # Accept Variable or PropertyReference as the value expression
         if args_exprs and isinstance(args_exprs[0], ast.Variable):
             var_name = args_exprs[0].name
             alias = context.variable_aliases.get(var_name, "")
-            pct_val = float(pct_expr) if isinstance(pct_expr, str) and pct_expr.replace('.','',1).isdigit() else 0.5
+        elif args_exprs and isinstance(args_exprs[0], ast.PropertyReference):
+            var_name = args_exprs[0].variable
+            alias = context.variable_aliases.get(var_name, "")
+        else:
+            var_name = ""
+            alias = ""
+        # Resolve the percentile value: if the 2nd arg is a named param, inline it
+        # so it doesn't create a stray ? placeholder in where_params without a condition.
+        if len(args_exprs) > 1 and isinstance(args_exprs[1], ast.Variable):
+            pct_name = args_exprs[1].name
+            if pct_name in context.input_params:
+                pct_val = float(context.input_params[pct_name])
+                # Remove the stray where_param that _translate_arg added for this variable
+                if context.where_params and context.where_params[-1] == context.input_params[pct_name]:
+                    context.where_params.pop()
+                pct_expr = str(pct_val)
+            else:
+                pct_val = pct_expr
+        else:
+            pct_val = float(pct_expr) if isinstance(pct_expr, str) and pct_expr.replace('.','',1).isdigit() else pct_expr
+        if var_name or val_expr:
             context._percentile_queries.append((val_expr, pct_val, fn, var_name, alias))
         return f"__PERCENTILE_PLACEHOLDER_{len(context._percentile_queries)-1 if context._percentile_queries else 0}__"
     return None
