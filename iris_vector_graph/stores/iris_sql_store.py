@@ -364,11 +364,15 @@ class IRISGraphStore:
             import re as _del_re
             # Use re.search (not re.match) so CTE-prefixed DELETE statements like
             # "WITH Stage1 AS (...) DELETE FROM nodes ..." are also detected.
-            # Include rdf_edges so relationship DELETE also triggers pre-snapshot.
+            # Include rdf_edges and rdf_labels so all label/relationship DELETE operations
+            # trigger pre-snapshot. For rdf_labels: the outer MATCH JOINs use the deleted
+            # labels as filter conditions, so the SELECT must run before DELETE. The
+            # labels() function in the translator excludes removed labels from its result
+            # via NOT IN (...) to return the post-deletion view.
             has_delete_dml = any(
                 isinstance(s, str) and
                 _del_re.search(
-                    r'DELETE\s+FROM\s+(?:\w+\.)?(?:nodes|rdf_labels|rdf_edges)\b',
+                    r'DELETE\s+FROM\s+(?:\w+\.)?(?:nodes|rdf_edges|rdf_labels)\b',
                     s, _del_re.IGNORECASE
                 ) and
                 not s.startswith("__constraint_check_delete_connected__")

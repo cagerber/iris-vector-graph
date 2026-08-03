@@ -127,8 +127,23 @@ def _table(name: str, prefix: Optional[str] = None) -> str:
     return name
 
 
-def labels_subquery(node_expr: str) -> str:
-    return f"COALESCE((SELECT JSON_ARRAYAGG(label) FROM {_table('rdf_labels')} WHERE s = {node_expr}), CAST('[]' AS VARCHAR(256)))"
+_JSONPATH_RESERVED = frozenset({"null", "true", "false"})
+
+
+def _jsonpath_key(prop: str) -> str:
+    """Return a JSONPath key segment, quoting reserved words like null/true/false."""
+    safe = prop.replace("'", "''")
+    if prop.lower() in _JSONPATH_RESERVED:
+        return f'"{safe}"'
+    return safe
+
+
+def labels_subquery(node_expr: str, exclude_labels=None) -> str:
+    extra = ""
+    if exclude_labels:
+        placeholders = ", ".join(f"'{lbl.replace(chr(39), chr(39)+chr(39))}'" for lbl in exclude_labels)
+        extra = f" AND label NOT IN ({placeholders})"
+    return f"COALESCE((SELECT JSON_ARRAYAGG(label) FROM {_table('rdf_labels')} WHERE s = {node_expr}{extra}), CAST('[]' AS VARCHAR(256)))"
 
 
 def properties_subquery(node_expr: str) -> str:
@@ -4412,6 +4427,8 @@ def translate_remove_clause(remove, context, metadata):
     # Track which properties are being REMOVED so we can exclude them from the final SELECT WHERE clause
     if not hasattr(context, '_removed_properties'):
         context._removed_properties = set()
+    if not hasattr(context, '_removed_labels'):
+        context._removed_labels = set()
 
     for item in remove.items:
         if isinstance(item.expression, ast.Variable) and item.label:
@@ -4422,6 +4439,7 @@ def translate_remove_clause(remove, context, metadata):
             # item.label may be a list (REMOVE n:Foo:Bar) or a single string
             label_list = item.label if isinstance(item.label, list) else [item.label]
             for lbl in label_list:
+                context._removed_labels.add(lbl)
                 context.add_dml(
                     f"{cte}DELETE FROM {_table('rdf_labels')} WHERE s IN ({subquery}) AND label = ?",
                     subparams + [lbl],
@@ -8059,7 +8077,7 @@ def _expr_property_reference(expr, context, segment):
     # JSON_VALUE raises SQLCODE=-400 on non-JSON or non-matching path.
     if expr.variable in context.scalar_variables:
         col_ref = f"{alias}.{_safe_alias(expr.variable)}"
-        prop = expr.property_name.replace("'", "''")
+        prop = _jsonpath_key(expr.property_name)
         return (
             f"CASE WHEN ({col_ref}) IS NULL OR SUBSTRING({col_ref}, 1, 1) <> '{{' "
             f"THEN NULL ELSE SQLUser.JSON_VALUE({col_ref}, '$.{prop}') END"
@@ -8177,7 +8195,7 @@ def _expr_subscript(expr, context, segment):
             return f"SQLUser.JSON_ARRAYGET({base_sql}, {idx.value})"
         if isinstance(idx, ast.Literal) and isinstance(idx.value, str):
             # String literal key → map property notation
-            safe_key = idx.value.replace("'", "''")
+            safe_key = _jsonpath_key(idx.value)
             return f"SQLUser.JSON_VALUE({base_sql}, '$.{safe_key}')"
         # Dynamic index: check if it's a known non-integer type variable → unconditional TypeError
         if isinstance(idx, ast.Variable):
@@ -8574,8 +8592,12 @@ def _expr_aggregation(expr, context, segment):
                 f"|| '\"_props\":' || COALESCE({props_sql}, '[]') || '}}'"
             )
             distinct_kw = "DISTINCT " if expr.distinct else ""
-            return f"JSON_ARRAYAGG({distinct_kw}{node_json})"
-    return f"{fn}({'DISTINCT ' if expr.distinct else ''}{arg})"
+            return f"COALESCE(JSON_ARRAYAGG({distinct_kw}{node_json}), CAST('[]' AS VARCHAR(256)))"
+    result_expr = f"{fn}({'DISTINCT ' if expr.distinct else ''}{arg})"
+    # collect() must return [] not NULL when all collected values are NULL
+    if fn == "JSON_ARRAYAGG":
+        result_expr = f"COALESCE({result_expr}, CAST('[]' AS VARCHAR(256)))"
+    return result_expr
 
 
 def _scalar_coalesce(fn, args, args_exprs):
@@ -12345,7 +12367,8 @@ def _expr_function_call(expr, context, segment):
         return result
 
     if fn == "labels":
-        return labels_subquery(args[0] if args else "NULL")
+        removed = getattr(context, '_removed_labels', None)
+        return labels_subquery(args[0] if args else "NULL", exclude_labels=removed or None)
     if fn == "properties":
         if expr.arguments:
             arg0 = expr.arguments[0]
@@ -12521,7 +12544,7 @@ def translate_expression(expr, context, segment="select") -> str:
                 f"EXISTS (SELECT 1 FROM {labels_tbl} _lp"
                 f" WHERE _lp.s = {node_col} AND _lp.label = {safe_label})"
             )
-            return f"CASE WHEN ({cond}) THEN 1 ELSE 0 END"
+            return f"CASE WHEN ({node_col} IS NULL) THEN NULL WHEN ({cond}) THEN 1 ELSE 0 END"
         safe_label = context.add_where_param(expr.label)
         return (
             f"EXISTS (SELECT 1 FROM {labels_tbl} _lp"
@@ -13115,10 +13138,10 @@ def translate_with_clause(with_clause, context):
     # Process WITH clause items: translate expressions and add to select
     for item in with_clause.items:
         sql = translate_expression(item.expression, context, segment="select")
-        # IRIS VARCHAR collation uppercases string values in SELECT/GROUP BY/DISTINCT.
-        # Wrap bare property-value references with %EXACT() to preserve case.
-        import re as _re_exact_w
-        sql = _re_exact_w.sub(r'\bp(\d+)\.val\b', r'%EXACT(p\1.val)', sql)
+        # Do NOT apply %EXACT() wrapping here — WITH items are intermediate CTE columns
+        # used in downstream WHERE comparisons. Wrapping with %EXACT() causes comparison
+        # mismatches when downstream queries use raw p*.val against Stage columns.
+        # %EXACT() is applied only in final RETURN clause output.
         alias = item.alias
         if alias is None:
             if isinstance(item.expression, ast.PropertyReference):
