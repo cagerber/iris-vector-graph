@@ -6560,6 +6560,8 @@ def _boolean_expr_logical(op, expr, context):
         _sp0 = len(context.select_params)
         _wp0 = len(context.where_params)
         _jp0 = len(context.join_params)
+        _jc0 = len(context.join_clauses)
+        _wc0 = len(context.where_conditions)
         for o in expr.operands:
             if _is_temporal_ts_condition(o, context):
                 continue
@@ -6573,11 +6575,13 @@ def _boolean_expr_logical(op, expr, context):
             # All operands were null or temporal
             return "NULL" if has_null else "1=1"
         # Three-value AND: if any operand is definitively false, result is false.
-        # Roll back any params added by discarded operands.
+        # Roll back any params, JOINs, and WHERE guards added by discarded operands.
         if "(1=0)" in parts:
             del context.select_params[_sp0:]
             del context.where_params[_wp0:]
             del context.join_params[_jp0:]
+            del context.join_clauses[_jc0:]
+            del context.where_conditions[_wc0:]
             return "(1=0)"
         # Unwrap nested nullable CASE WHEN parts (produced by inner 3VL AND/OR):
         # "CASE WHEN NOT (cond) THEN (1=0) ELSE NULL END" means: false if NOT cond, else NULL.
@@ -6617,6 +6621,8 @@ def _boolean_expr_logical(op, expr, context):
         _sp0_or = len(context.select_params)
         _wp0_or = len(context.where_params)
         _jp0_or = len(context.join_params)
+        _jc0_or = len(context.join_clauses)
+        _wc0_or = len(context.where_conditions)
         # Suppress the structural guard (OPT-3) for properties that appear in IS NULL
         # checks, or in disjunctive (OR) branches.  Without this, a node lacking a property
         # would be excluded by the EXISTS guard even though `a.x IS NULL` or `a.x = 12 OR
@@ -6637,11 +6643,13 @@ def _boolean_expr_logical(op, expr, context):
             if not parts_or:
                 return "NULL" if has_null_or else "(1=0)"
             # Three-value OR: if any operand is definitively true, result is true.
-            # Roll back params added by discarded operands.
+            # Roll back params, JOINs, and WHERE guards added by discarded operands.
             if "(1=1)" in parts_or:
                 del context.select_params[_sp0_or:]
                 del context.where_params[_wp0_or:]
                 del context.join_params[_jp0_or:]
+                del context.join_clauses[_jc0_or:]
+                del context.where_conditions[_wc0_or:]
                 return "(1=1)"
             # Unwrap nested nullable CASE WHEN parts from inner 3VL AND/OR:
             import re as _re_or
@@ -13196,7 +13204,14 @@ def translate_return_clause(ret, context):
                 col = "_p" if a in undirected_aliases else "p"
                 rels_parts.append(f"{a}.{col}")
             rels_arr = ", ".join(rels_parts)
-            json_expr = f"'{{\"nodes\":' || JSON_ARRAY({nodes_arr}) || ',\"rels\":' || JSON_ARRAY({rels_arr}) || '}}'"
+            raw_json = f"'{{\"nodes\":' || JSON_ARRAY({nodes_arr}) || ',\"rels\":' || JSON_ARRAY({rels_arr}) || '}}'"
+            # For OPTIONAL MATCH named paths: if any relationship alias is NULL (no match),
+            # the path should be NULL rather than a JSON string with null elements.
+            if rels_parts:
+                null_check = " OR ".join(f"{rp} IS NULL" for rp in rels_parts)
+                json_expr = f"CASE WHEN ({null_check}) THEN NULL ELSE {raw_json} END"
+            else:
+                json_expr = raw_json
             context.select_items.append(f"{json_expr} AS {_safe_alias(path_var)}")
             context.optional_null_row_items.append("NULL")
         return
@@ -13266,7 +13281,13 @@ def translate_return_clause(ret, context):
                     col = "_p" if a in undirected_aliases else "p"
                     rels_parts.append(f"{a}.{col}")
                 rels_arr = ", ".join(rels_parts)
-                json_expr = f"'{{\"nodes\":' || JSON_ARRAY({nodes_arr}) || ',\"rels\":' || JSON_ARRAY({rels_arr}) || '}}'"
+                raw_json = f"'{{\"nodes\":' || JSON_ARRAY({nodes_arr}) || ',\"rels\":' || JSON_ARRAY({rels_arr}) || '}}'"
+                # For OPTIONAL MATCH: if any relationship alias is NULL, path should be NULL.
+                if rels_parts:
+                    null_check = " OR ".join(f"{rp} IS NULL" for rp in rels_parts)
+                    json_expr = f"CASE WHEN ({null_check}) THEN NULL ELSE {raw_json} END"
+                else:
+                    json_expr = raw_json
                 context.select_items.append(f"{json_expr} AS {_safe_alias(alias)}")
                 continue
             alias_name = context.variable_aliases.get(var_name)
