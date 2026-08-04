@@ -1579,6 +1579,26 @@ class Parser:
             self.eat()
             items = []
             if not self.matches(TokenType.RBRACKET):
+                # [p = (pattern) WHERE pred | proj] — named-path pattern comprehension
+                if (
+                    self.peek().kind == TokenType.IDENTIFIER
+                    and self.lexer.peek_ahead(1).kind == TokenType.EQUALS
+                    and self.lexer.peek_ahead(2).kind == TokenType.LPAREN
+                ):
+                    path_var = self.eat().value
+                    self.eat()  # consume =
+                    pattern = self.parse_graph_pattern()
+                    predicate = None
+                    if self.matches(TokenType.WHERE):
+                        predicate = self.parse_expression()
+                    projection = None
+                    if self.matches(TokenType.PIPE):
+                        projection = self.parse_expression()
+                    self.expect(TokenType.RBRACKET)
+                    return ast.PatternComprehension(
+                        pattern=pattern, predicate=predicate, projection=projection,
+                        path_variable=path_var
+                    )
                 if self.peek().kind == TokenType.LPAREN and self._is_pattern_comprehension_start():
                     pattern = self.parse_graph_pattern()
                     predicate = None

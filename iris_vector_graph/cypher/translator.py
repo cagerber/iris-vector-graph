@@ -7353,7 +7353,7 @@ def _expr_pattern_comprehension(expr, context, segment):
     tgt_node = pat.nodes[1] if len(pat.nodes) > 1 else None
     rel = pat.relationships[0] if pat.relationships else None
 
-    e_alias = context.next_alias("pce")
+    e_alias = context.next_alias("epc")
     t_alias = context.next_alias("pct")
 
     pred_type = ""
@@ -7374,7 +7374,59 @@ def _expr_pattern_comprehension(expr, context, segment):
         src_id = f"{context.variable_aliases[src_node.variable]}.node_id"
         src_bind = f" AND {e_alias}.s = {src_id}"
 
+    # Target node label filters
+    tgt_label_join = ""
+    tgt_label_cond = ""
+    if tgt_node and tgt_node.labels:
+        lbl_alias = context.next_alias("pcl")
+        tgt_label_join = (
+            f" JOIN {_table('rdf_labels')} {lbl_alias}"
+            f" ON {lbl_alias}.s = {t_alias}.node_id"
+        )
+        if len(tgt_node.labels) == 1:
+            safe_lbl = tgt_node.labels[0].replace("'", "''")
+            tgt_label_cond = f" AND {lbl_alias}.label = '{safe_lbl}'"
+        else:
+            safe_lbls = ", ".join(f"'{l.replace(chr(39), chr(39)*2)}'" for l in tgt_node.labels)
+            tgt_label_cond = f" AND {lbl_alias}.label IN ({safe_lbls})"
+
+    # Target node variable binding (bound target node in MATCH)
+    tgt_bind = ""
+    if (
+        tgt_node
+        and tgt_node.variable
+        and tgt_node.variable in context.variable_aliases
+    ):
+        tgt_id = f"{context.variable_aliases[tgt_node.variable]}.node_id"
+        tgt_bind = f" AND {t_alias}.node_id = {tgt_id}"
+
     tgt_var = tgt_node.variable if tgt_node else None
+    path_var = getattr(expr, "path_variable", None)
+
+    # When projection is the path variable itself, return path JSON
+    if (
+        path_var
+        and expr.projection
+        and isinstance(expr.projection, ast.Variable)
+        and expr.projection.name == path_var
+    ):
+        src_node_id = (
+            f"{context.variable_aliases[src_node.variable]}.node_id"
+            if src_node and src_node.variable and src_node.variable in context.variable_aliases
+            else f"{e_alias}.s"
+        )
+        rel_type_expr = f"{e_alias}.p"
+        path_json = (
+            f"'{{\"nodes\":' || JSON_ARRAY({src_node_id}, {t_alias}.node_id)"
+            f" || ',\"rels\":' || JSON_ARRAY({rel_type_expr}) || '}}'"
+        )
+        return (
+            f"COALESCE((SELECT JSON_ARRAYAGG({path_json}) FROM "
+            f"{_table('rdf_edges')} {e_alias} "
+            f"JOIN {_table('nodes')} {t_alias} ON {t_alias}.node_id = {e_alias}.o_id"
+            f"{tgt_label_join}"
+            f" WHERE 1=1{pred_type}{src_bind}{tgt_label_cond}{tgt_bind}), '[]')"
+        )
 
     if (
         expr.projection
@@ -7405,8 +7457,9 @@ def _expr_pattern_comprehension(expr, context, segment):
     return (
         f"(SELECT JSON_ARRAYAGG({proj_sql}) FROM "
         f"{_table('rdf_edges')} {e_alias} "
-        f"JOIN {_table('nodes')} {t_alias} ON {t_alias}.node_id = {e_alias}.o_id "
-        f"WHERE 1=1{pred_type}{src_bind})"
+        f"JOIN {_table('nodes')} {t_alias} ON {t_alias}.node_id = {e_alias}.o_id"
+        f"{tgt_label_join}"
+        f" WHERE 1=1{pred_type}{src_bind}{tgt_label_cond}{tgt_bind})"
     )
 
 

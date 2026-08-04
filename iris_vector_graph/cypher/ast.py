@@ -436,6 +436,7 @@ class PatternComprehension:
     pattern: Any
     predicate: Optional[Any] = None
     projection: Optional[Any] = None
+    path_variable: Optional[str] = None
 
 
 @dataclass(slots=True)
