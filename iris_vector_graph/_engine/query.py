@@ -99,7 +99,7 @@ def _handle_gds_shim(proc) -> Optional["IVGResult"]:
 
 
 def _build_path_func_columns(return_path_funcs: list, source_var: str, target_var: str,
-                              col_map: dict) -> list:
+                              col_map: dict, path_named_var: str = None) -> list:
     """Build ordered output column names for a labeled path function result.
 
     Uses col_map to find the RETURN aliases for path functions and node variables.
@@ -148,6 +148,8 @@ def _build_path_func_columns(return_path_funcs: list, source_var: str, target_va
                 added.add(sql_alias)
     else:
         # No col_map: use standard names
+        if "path" in return_path_funcs:
+            columns.append(path_named_var or "p")
         if "nodes" in return_path_funcs or "length" in return_path_funcs:
             columns.append(source_var)
         if "nodes" in return_path_funcs or "length" in return_path_funcs:
@@ -561,6 +563,7 @@ class QueryMixin:
         source_alias = vl0.get("source_alias") or ""
         target_alias = vl0.get("target_alias") or ""
         return_path_funcs = vl0.get("return_path_funcs") or []
+        path_named_var = vl0.get("path_named_var")
         col_map = sql_query.column_name_map or {}
         sql_str = sql_query.sql if isinstance(sql_query.sql, str) else ""
 
@@ -632,26 +635,47 @@ class QueryMixin:
 
         if not source_ids:
             # Return empty with correct columns
-            columns = _build_path_func_columns(return_path_funcs, source_var, target_var, col_map)
+            columns = _build_path_func_columns(return_path_funcs, source_var, target_var, col_map, path_named_var)
             return IVGResult(columns=columns, rows=[], metadata=sql_query.query_metadata)
 
         # Step 2: BFS from each source — collect ALL (src, tgt, hop) triples
         # For min_hops=0, include 0-hop self-pairs
         path_triples: list = []  # [(src_id, tgt_id, hop)]
+        # full_paths: list of (node_list, edge_type_list) — only populated when "path" is returned
+        full_paths: list = []
+        need_full_paths = "path" in return_path_funcs
 
         for src_id in source_ids:
             if min_hops == 0:
                 path_triples.append((src_id, src_id, 0))
-            try:
-                bfs_result = self._store.execute_bfs(src_id, predicates, max_hops, direction, 0)
-                if bfs_result and not getattr(bfs_result, "error", False):
-                    for row in bfs_result.rows:
-                        tgt_id = row[0] if row else None
-                        hop = row[1] if len(row) > 1 else 1
-                        if tgt_id and min_hops <= hop <= max_hops:
+                if need_full_paths:
+                    full_paths.append(([src_id], []))
+            if need_full_paths:
+                # Use _bfs_with_paths to get full node/edge sequence per path
+                try:
+                    for node_list, edge_list in self._bfs_with_paths(
+                        src_id, predicates, max_hops, direction
+                    ):
+                        if not node_list:
+                            continue
+                        hop = len(edge_list)
+                        tgt_id = node_list[-1]
+                        if min_hops <= hop <= max_hops:
                             path_triples.append((src_id, tgt_id, hop))
-            except Exception as exc:
-                logger.debug("BFS failed for %s: %s", src_id, exc)
+                            full_paths.append((node_list, edge_list))
+                except Exception as exc:
+                    logger.debug("BFS with paths failed for %s: %s", src_id, exc)
+            else:
+                try:
+                    bfs_result = self._store.execute_bfs(src_id, predicates, max_hops, direction, 0)
+                    if bfs_result and not getattr(bfs_result, "error", False):
+                        for row in bfs_result.rows:
+                            tgt_id = row[0] if row else None
+                            hop = row[1] if len(row) > 1 else 1
+                            if tgt_id and min_hops <= hop <= max_hops:
+                                path_triples.append((src_id, tgt_id, hop))
+                except Exception as exc:
+                    logger.debug("BFS failed for %s: %s", src_id, exc)
 
         # Step 3: Filter by target_labels if specified
         if target_labels and path_triples:
@@ -664,14 +688,24 @@ class QueryMixin:
                 except Exception as exc:
                     logger.debug("target label lookup failed for %s: %s", lbl, exc)
             if all_labeled:
-                path_triples = [(s, t, h) for s, t, h in path_triples if t in all_labeled]
+                if need_full_paths and full_paths:
+                    filtered = [(t, fp) for (s, t, h), fp in zip(path_triples, full_paths)
+                                if t in all_labeled]
+                    path_triples = [(s, t, h) for (s, t, h) in path_triples
+                                    if t in all_labeled]
+                    full_paths = [fp for (_, fp) in filtered]
+                else:
+                    path_triples = [(s, t, h) for s, t, h in path_triples if t in all_labeled]
 
         if not path_triples:
-            columns = _build_path_func_columns(return_path_funcs, source_var, target_var, col_map)
+            columns = _build_path_func_columns(return_path_funcs, source_var, target_var, col_map, path_named_var)
             return IVGResult(columns=columns, rows=[], metadata=sql_query.query_metadata)
 
-        # Step 4: Fetch node data for all source and target IDs
-        all_node_ids = list({nid for s, t, h in path_triples for nid in (s, t)})
+        # Step 4: Fetch node data for all source and target IDs (+ intermediates for full paths)
+        if need_full_paths and full_paths:
+            all_node_ids = list({nid for nl, _ in full_paths for nid in nl})
+        else:
+            all_node_ids = list({nid for s, t, h in path_triples for nid in (s, t)})
         node_data_map: dict = {}  # node_id -> {"_id": ..., "_labels": ..., "_props": ...}
         try:
             nodes_result = self._store.query_nodes()
@@ -800,14 +834,33 @@ class QueryMixin:
             return f":{rel_type}"
 
         # Determine output columns from RETURN clause and col_map
-        columns = _build_path_func_columns(return_path_funcs, source_var, target_var, col_map)
+        columns = _build_path_func_columns(return_path_funcs, source_var, target_var, col_map, path_named_var)
 
+        path_var_col = path_named_var or "p"
         rows_out = []
+        path_iter = iter(full_paths) if (need_full_paths and full_paths) else None
+
         for src_id, tgt_id, hop in path_triples:
+            fp_nodes, fp_edges = (next(path_iter) if path_iter else (None, None))
             row = []
             for col in columns:
                 cypher_col = col_map.get(col, col) if col_map else col
-                if cypher_col == source_var or col == source_var:
+                if "path" in return_path_funcs and (col == path_var_col or cypher_col == path_var_col):
+                    # Build path JSON object: {"nodes": [...node_data...], "rels": [...edge_types...]}
+                    if fp_nodes:
+                        import json as _pj
+                        path_json = _pj.dumps({
+                            "nodes": [_get_node(n) for n in fp_nodes],
+                            "rels": list(fp_edges),
+                        })
+                    else:
+                        import json as _pj
+                        path_json = _pj.dumps({
+                            "nodes": [_get_node(src_id), _get_node(tgt_id)],
+                            "rels": [],
+                        })
+                    row.append(path_json)
+                elif cypher_col == source_var or col == source_var:
                     row.append(_get_node(src_id))
                 elif cypher_col == target_var or col == target_var:
                     row.append(_get_node(tgt_id))
@@ -819,7 +872,7 @@ class QueryMixin:
                     rels = _get_edge_rels(src_id, tgt_id, hop, predicates)
                     row.append(rels)
                 elif "nodes" in return_path_funcs and "node" in col.lower():
-                    row.append([_get_node(n) for n in [src_id, tgt_id]])
+                    row.append([_get_node(n) for n in (fp_nodes if fp_nodes else [src_id, tgt_id])])
                 else:
                     row.append(None)
             rows_out.append(row)

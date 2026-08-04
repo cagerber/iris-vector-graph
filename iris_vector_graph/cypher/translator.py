@@ -2580,10 +2580,12 @@ def _tts_collect_path_funcs(cypher_query, vl):
             else []
         )
     }
+    path_named_var = None  # the Cypher variable name for the path (e.g. "p")
     for item in cypher_query.return_clause.items:
         expr = item.expression
         if isinstance(expr, ast.Variable) and expr.name in named_path_vars:
             path_funcs.append("path")
+            path_named_var = expr.name
         elif isinstance(
             expr, ast.FunctionCall
         ) and expr.function_name.lower() in (
@@ -2596,6 +2598,8 @@ def _tts_collect_path_funcs(cypher_query, vl):
                     path_funcs.append(expr.function_name.lower())
     if path_funcs:
         vl[0]["return_path_funcs"] = path_funcs
+        if path_named_var:
+            vl[0]["path_named_var"] = path_named_var
     elif not is_shortest:
         # For non-shortest var-length paths with no path-function returns,
         # don't set return_path_funcs — use the faster labeled-BFS path.
@@ -12791,9 +12795,13 @@ def _expr_boolean(expr, context, segment):
             return cond
     # IRIS rejects parentheses around IS NULL/IS NOT NULL predicates in CASE WHEN.
     # e.g. CASE WHEN (NULL IS NULL) fails; CASE WHEN NULL IS NULL works.
+    # IS NULL/IS NOT NULL predicates always return 0 or 1, never null — ELSE 0 is correct.
     if cond.endswith(" IS NULL") or cond.endswith(" IS NOT NULL"):
         return f"CASE WHEN {cond} THEN 1 ELSE 0 END"
-    return f"CASE WHEN ({cond}) THEN 1 ELSE 0 END"
+    # 3VL null propagation: CASE WHEN cond THEN 1 WHEN NOT cond THEN 0 ELSE NULL END.
+    # This preserves Cypher 3-value logic: boolean expressions over null inputs produce null,
+    # not false. e.g. NOT null → null, null = null → null, null AND true → null.
+    return f"CASE WHEN ({cond}) THEN 1 WHEN NOT ({cond}) THEN 0 ELSE NULL END"
 
 
 def translate_expression(expr, context, segment="select") -> str:
