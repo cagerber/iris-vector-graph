@@ -589,6 +589,13 @@ class Parser:
         # Scan past the node pattern (...)
         depth = 0
         j = i
+        _expr_only_tokens = frozenset({
+            TokenType.NOT, TokenType.AND, TokenType.OR, TokenType.XOR,
+            TokenType.TRUE, TokenType.FALSE, TokenType.NULL, TokenType.CASE,
+            TokenType.EQUALS, TokenType.NOT_EQUALS,
+            TokenType.LESS_THAN, TokenType.LESS_THAN_OR_EQUAL,
+            TokenType.GREATER_THAN, TokenType.GREATER_THAN_OR_EQUAL,
+        })
         while j < len(tokens):
             t = tokens[j]
             if t.kind == TokenType.LPAREN:
@@ -604,6 +611,9 @@ class Parser:
             elif depth == 1 and t.kind in (TokenType.PLUS, TokenType.SLASH,
                                             TokenType.STAR, TokenType.PERCENT,
                                             TokenType.CARET, TokenType.MINUS):
+                return False
+            elif t.kind in _expr_only_tokens:
+                # Boolean/comparison operators can't appear in a node pattern at any depth
                 return False
             j += 1
         else:
