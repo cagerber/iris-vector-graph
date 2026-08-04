@@ -6199,6 +6199,20 @@ def translate_relationship_pattern(
             )
             dir_checks.append(f"{tgt_id} = {stage}.{tgt_edge_col}")
         dir_cond = " AND ".join(dir_checks) if dir_checks else "1=1"
+        # If the new MATCH specifies relationship types, filter the Stage-bound edge
+        # by type. This handles the case where the same variable is re-used with a
+        # different type (conflicting types → empty result).
+        if rel.types:
+            p_col_stage = f"__edge_{var_name}_p"
+            if len(rel.types) == 1:
+                context.where_conditions.append(
+                    f"{stage}.{p_col_stage} = {context.add_where_param(rel.types[0])}"
+                )
+            else:
+                type_preds = " OR ".join(
+                    f"{stage}.{p_col_stage} = {context.add_where_param(t)}" for t in rel.types
+                )
+                context.where_conditions.append(f"({type_preds})")
         # When optional and source was pre-registered by translate_node_pattern (is_unbound_src
         # is False but source was not stage-bound), it got a CROSS JOIN.  Upgrade it to a LEFT
         # OUTER JOIN anchored on the edge column so OPTIONAL semantics are preserved.
