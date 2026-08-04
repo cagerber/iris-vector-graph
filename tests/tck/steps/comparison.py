@@ -745,6 +745,46 @@ def _rows_equal(exp: dict, act: dict, columns: list[str], list_unordered: bool) 
                         pass
                 return item
             av_parsed = [_parse_node_item(x) for x in av]
+            # List-of-paths comparison: TCK [<(:A)-[:R]->(:B)>] vs actual [{"nodes":[...],"rels":[...]}]
+            ev_path_patterns = [_parse_path_pattern(x) if isinstance(x, str) else None for x in ev]
+            all_path_patterns = all(p is not None for p in ev_path_patterns)
+            av_path_dicts = []
+            for item in av_parsed:
+                if isinstance(item, dict) and "nodes" in item and "rels" in item:
+                    av_path_dicts.append(item)
+                elif isinstance(item, str):
+                    try:
+                        parsed = _json_list.loads(item)
+                        if isinstance(parsed, dict) and "nodes" in parsed and "rels" in parsed:
+                            av_path_dicts.append(parsed)
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                    av_path_dicts.append(None)
+                else:
+                    av_path_dicts.append(None)
+            all_path_dicts = all(p is not None for p in av_path_dicts)
+            if all_path_patterns and all_path_dicts:
+                if len(ev_path_patterns) != len(av_path_dicts):
+                    return False
+                if list_unordered:
+                    def _list_paths_match(patterns, avail):
+                        if not patterns:
+                            return True
+                        p = patterns[0]
+                        for i in avail:
+                            if _paths_equal(p, av_path_dicts[i]):
+                                remaining = [j for j in avail if j != i]
+                                if _list_paths_match(patterns[1:], remaining):
+                                    return True
+                        return False
+                    if not _list_paths_match(ev_path_patterns, list(range(len(av_path_dicts)))):
+                        return False
+                else:
+                    for pat, path in zip(ev_path_patterns, av_path_dicts):
+                        if not _paths_equal(pat, path):
+                            return False
+                continue
             # Detect if all expected items are node patterns
             ev_patterns = [_parse_node_pattern(x) if isinstance(x, str) else None for x in ev]
             all_node_patterns = all(p is not None for p in ev_patterns)
