@@ -12887,7 +12887,7 @@ def _expr_function_call(expr, context, segment):
                 arg_sql = translate_expression(expr.arguments[0], context, segment="inline")
         else:
             arg_sql = translate_expression(expr.arguments[0], context, segment="inline")
-        # Duplicate any params that were added during arg translation
+        # Duplicate any params that were added during arg translation (arg appears twice: ISNUMERIC + CAST).
         _sp_added = context.select_params[_sp0:]
         _wp_added = context.where_params[_wp0:]
         _jp_added = context.join_params[_jp0:]
@@ -12895,6 +12895,15 @@ def _expr_function_call(expr, context, segment):
             context.select_params.extend(_sp_added)
             context.where_params.extend(_wp_added)
             context.join_params.extend(_jp_added)
+        # When toInteger/toFloat appears in a WHERE clause (segment="where"), the "inline" sub-
+        # translation above added the property-key params to select_params. But select_params are
+        # placed BEFORE join_params in build_stage_sql, while the correlated-subquery ? placeholders
+        # appear inside the WHERE condition string — after the JOINs in the emitted SQL. Correct
+        # placement: move those params from select_params to where_params so order matches SQL.
+        if segment == "where" and _sp_added:
+            # Remove the duplicated select_params entries and re-add to where_params.
+            del context.select_params[_sp0:]
+            context.where_params.extend(_sp_added * 2)
         cast_type = "INTEGER" if fn == "tointeger" else "DOUBLE"
         return f"CASE WHEN ISNUMERIC({arg_sql}) = 1 THEN CAST({arg_sql} AS {cast_type}) ELSE NULL END"
 

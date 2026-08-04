@@ -148,6 +148,10 @@ def _inject_match_label_in_line(line: str, label: str, skip_vars: set = None) ->
         # to check if it's already bound
         inner_stripped = inner.strip()
         var_name = inner_stripped.split(':')[0].split('{')[0].strip() if inner_stripped else ''
+        # If var_name contains '.' or is a complex expression (function arg), skip.
+        # Node patterns never have dots in the variable portion.
+        if '.' in var_name or ' ' in var_name or var_name.startswith('%'):
+            return m.group(0)
         if var_name and var_name in skip_vars:
             return m.group(0)  # Don't add label to already-bound variable
         # Insert label BEFORE any property map {…} so the result is valid Cypher.
