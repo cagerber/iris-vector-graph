@@ -12780,6 +12780,8 @@ def _expr_function_call(expr, context, segment):
 
 
 def _expr_boolean(expr, context, segment):
+    _sp0 = len(context.select_params)
+    _wp0 = len(context.where_params)
     cond = translate_boolean_expression(expr, context)
     # If the condition evaluates to SQL NULL (e.g. NOT null, null = null),
     # the result must also be NULL (Cypher three-valued logic).
@@ -12807,8 +12809,11 @@ def _expr_boolean(expr, context, segment):
     if cond.endswith(" IS NULL") or cond.endswith(" IS NOT NULL"):
         return f"CASE WHEN {cond} THEN 1 ELSE 0 END"
     # 3VL null propagation: CASE WHEN cond THEN 1 WHEN NOT cond THEN 0 ELSE NULL END.
-    # This preserves Cypher 3-value logic: boolean expressions over null inputs produce null,
-    # not false. e.g. NOT null → null, null = null → null, null AND true → null.
+    # cond appears twice in the SQL string, so any ? placeholders inside cond must appear
+    # twice. select_params and where_params embed ? inside cond; join_params embed ? in
+    # JOIN clauses (structural, not in cond) — only duplicate the former two.
+    context.select_params.extend(context.select_params[_sp0:])
+    context.where_params.extend(context.where_params[_wp0:])
     return f"CASE WHEN ({cond}) THEN 1 WHEN NOT ({cond}) THEN 0 ELSE NULL END"
 
 
