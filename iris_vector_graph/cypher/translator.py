@@ -7455,11 +7455,11 @@ def _expr_pattern_comprehension(expr, context, segment):
         proj_sql = f"{t_alias}.node_id"
 
     return (
-        f"(SELECT JSON_ARRAYAGG({proj_sql}) FROM "
+        f"COALESCE((SELECT JSON_ARRAYAGG({proj_sql}) FROM "
         f"{_table('rdf_edges')} {e_alias} "
         f"JOIN {_table('nodes')} {t_alias} ON {t_alias}.node_id = {e_alias}.o_id"
         f"{tgt_label_join}"
-        f" WHERE 1=1{pred_type}{src_bind}{tgt_label_cond}{tgt_bind})"
+        f" WHERE 1=1{pred_type}{src_bind}{tgt_label_cond}{tgt_bind}), '[]')"
     )
 
 
