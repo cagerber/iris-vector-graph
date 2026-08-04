@@ -7796,9 +7796,14 @@ def _expr_arith(expr, context, segment):
             def _ensure_array_sql(arg_expr, arg_sql):
                 """Return SQL that is always a JSON array (wrapping scalar in [v] if needed)."""
                 if _is_list(arg_expr):
+                    # Variables that alias a Stage column may be UNWIND scalars at runtime
+                    # (UNWIND x → Stage2.x is a scalar but _is_list() returns True due to Stage prefix).
+                    # Use a runtime check: if the value doesn't start with '[', wrap it.
+                    if isinstance(arg_expr, ast.Variable):
+                        return f"(CASE WHEN SUBSTRING(CAST({arg_sql} AS VARCHAR(10)), 1, 1) = '[' THEN {arg_sql} ELSE ('[' || CAST({arg_sql} AS VARCHAR(4096)) || ']') END)"
                     return arg_sql
                 # Scalar: wrap in JSON array string
-                return f"('[' || CAST({arg_sql} AS VARCHAR(1000)) || ']')"
+                return f"('[' || CAST({arg_sql} AS VARCHAR(4096)) || ']')"
             left_arr = _ensure_array_sql(expr.arguments[0], left)
             right_arr = _ensure_array_sql(expr.arguments[1], right)
             # Generate row numbers up to 100 to handle practical list sizes (each element is extracted)
@@ -7973,7 +7978,8 @@ def _expr_list_predicate(expr, context, segment):
     counts_alias = context.next_alias("qc")
     sat_pred = where_pred.replace(f"{alias}.", f"{counts_alias}.")
     not_pred = where_pred.replace(f"{alias}.", f"{counts_alias}.")
-    jt_from = f"FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({_safe_alias(expr.variable)} {col_type} PATH '$')) {counts_alias}"
+    _jt_null_filter = f" WHERE {counts_alias}.{_safe_alias(expr.variable)} IS NOT NULL" if null_sentinel else ""
+    jt_from = f"FROM JSON_TABLE({source_sql}, '$[*]' COLUMNS({_safe_alias(expr.variable)} {col_type} PATH '$')) {counts_alias}{_jt_null_filter}"
     sat_expr = f"SUM(CASE WHEN {sat_pred} THEN 1 ELSE 0 END)"
     dfail_expr = f"SUM(CASE WHEN NOT ({not_pred}) THEN 1 ELSE 0 END)"
     total_expr = "COUNT(*)"
@@ -9220,6 +9226,14 @@ def _scalar_string(fn, args, args_exprs, context=None):
         ) or isinstance(arg_expr, ast.ListComprehension)
         if is_list:
             return f"SQLUser.LIST_REVERSE({args[0]})"
+        # For variables or expressions that may be either a string or a JSON array
+        # at runtime, use CASE to dispatch: arrays start with '[', strings use REVERSE.
+        if isinstance(arg_expr, (ast.Variable, ast.CaseExpression)):
+            return (
+                f"(CASE WHEN SUBSTRING(CAST({args[0]} AS VARCHAR(10)), 1, 1) = '['"
+                f" THEN SQLUser.LIST_REVERSE({args[0]})"
+                f" ELSE REVERSE({args[0]}) END)"
+            )
         return f"REVERSE({args[0]})"
     if fn == "split":
         return f"SQLUser.STR_SPLIT({args[0]}, {args[1]})" if len(args) >= 2 else "NULL"
@@ -13211,7 +13225,11 @@ def _expr_to_cypher_text(expr) -> str:
         return f"{expr.variable}.{expr.property_name}"
     if isinstance(expr, ast.PropertyAccessExpression):
         base = _expr_to_cypher_text(expr.expression)
-        return f"{base}.{expr.property_name}" if base else f".{expr.property_name}"
+        # Wrap in parens when the base is a non-simple expression (subscript, function, etc.)
+        # so the column name matches the original Cypher text: (list[1]).prop not list[1].prop
+        needs_parens = base and not isinstance(expr.expression, (ast.Variable, ast.PropertyReference))
+        base_str = f"({base})" if needs_parens else base
+        return f"{base_str}.{expr.property_name}" if base_str else f".{expr.property_name}"
     if isinstance(expr, ast.Variable):
         return expr.name
     if isinstance(expr, ast.Literal) and isinstance(expr.value, list):
