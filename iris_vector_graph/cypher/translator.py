@@ -3934,6 +3934,12 @@ def translate_merge_clause(merge, context, metadata):
     # Cypher semantic rule: null cannot be matched in MERGE operations.
     merge_node = merge.pattern.nodes[0] if merge.pattern.nodes else None
     _validate_merge_pattern_no_null_properties(merge_node)
+    for _rel in merge.pattern.relationships:
+        for _k, _v in (_rel.properties or {}).items():
+            if isinstance(_v, ast.Literal) and _v.value is None:
+                raise ValueError(
+                    f"Cannot merge on null property value: property '{_k}' has value null"
+                )
 
     # Snapshot context state before translate_create_clause so we can replace the
     # UUID-based DMLs and WHERE with label/property-based equivalents.
@@ -3944,7 +3950,28 @@ def translate_merge_clause(merge, context, metadata):
     _pre_where_len = len(context.where_conditions)
     _pre_where_params_len = len(context.where_params)
 
-    translate_create_clause(ast.CreateClause(patterns=[merge.pattern]), context, metadata)
+    # For undirected relationships, treat as OUTGOING for CREATE
+    # (openCypher spec: MERGE creates in outgoing direction when unspecified)
+    _create_pattern = merge.pattern
+    if any(r.direction == ast.Direction.BOTH for r in merge.pattern.relationships):
+        import copy as _copy
+        _create_rels = []
+        for r in merge.pattern.relationships:
+            if r.direction == ast.Direction.BOTH:
+                _r2 = _copy.copy(r)
+                _r2 = ast.RelationshipPattern(
+                    variable=r.variable, types=r.types, properties=r.properties,
+                    variable_length=r.variable_length,
+                    direction=ast.Direction.OUTGOING,
+                )
+                _create_rels.append(_r2)
+            else:
+                _create_rels.append(r)
+        _create_pattern = ast.GraphPattern(
+            nodes=merge.pattern.nodes,
+            relationships=_create_rels,
+        )
+    translate_create_clause(ast.CreateClause(patterns=[_create_pattern]), context, metadata)
 
     # --- Rewrite DML + SELECT for single-node MERGE patterns ---
     # translate_create_clause generates INSERT ... WHERE NOT EXISTS (node_id = <uuid>).
@@ -4055,7 +4082,8 @@ def translate_merge_clause(merge, context, metadata):
                 continue
 
             left_node, right_node = merge.pattern.nodes[rel_idx], merge.pattern.nodes[rel_idx + 1]
-            # For INCOMING direction, source is right_node
+            is_undirected = rel.direction == ast.Direction.BOTH
+            # For INCOMING direction, source is right_node; BOTH treated as OUTGOING for CREATE
             if rel.direction == ast.Direction.INCOMING:
                 source_node, target_node = right_node, left_node
             else:
@@ -4067,11 +4095,68 @@ def translate_merge_clause(merge, context, metadata):
             src_alias = context.variable_aliases.get(src_var) if src_var else None
             tgt_alias = context.variable_aliases.get(tgt_var) if tgt_var else None
 
-            if not src_alias or not tgt_alias:
-                # Source or target not bound in MATCH; skip edge registration
-                continue
-
             rel_type = rel.types[0]
+
+            # For CREATE-bound nodes: get UUID params directly and rewrite VALUES INSERT
+            src_uuid = (
+                context.input_params.get(f"__create_id_{src_var}") if src_var else None
+            ) or (context._anon_node_keys.get(id(source_node)) if hasattr(context, '_anon_node_keys') else None)
+            tgt_uuid = (
+                context.input_params.get(f"__create_id_{tgt_var}") if tgt_var else None
+            ) or (context._anon_node_keys.get(id(target_node)) if hasattr(context, '_anon_node_keys') else None)
+
+            # Build NOT EXISTS conditions for both styles:
+            # alias-ref style (for SELECT-based INSERT) and UUID style (for VALUES INSERT)
+            if src_alias and tgt_alias:
+                # For Stage CTE aliases (Stage1, Stage2, ...) the node_id column is named
+                # after the original variable (e.g. Stage1.a), not Stage1.node_id.
+                _stage_names = {s.split(" AS ")[0].strip() for s in getattr(context, "stages", [])}
+                _s_ref = (
+                    f"{src_alias}.{src_var}"
+                    if src_alias in _stage_names
+                    else f"{src_alias}.node_id"
+                )
+                _t_ref = (
+                    f"{tgt_alias}.{tgt_var}"
+                    if tgt_alias in _stage_names
+                    else f"{tgt_alias}.node_id"
+                )
+                if not is_undirected:
+                    not_exists_alias_sql = (
+                        f"SELECT 1 FROM {_table('rdf_edges')} WHERE "
+                        f"s = {_s_ref} AND p = ? AND o_id = {_t_ref}"
+                    )
+                    not_exists_alias_params = [rel_type]
+                else:
+                    not_exists_alias_sql = (
+                        f"SELECT 1 FROM {_table('rdf_edges')} WHERE "
+                        f"(s = {_s_ref} AND p = ? AND o_id = {_t_ref}) OR "
+                        f"(s = {_t_ref} AND p = ? AND o_id = {_s_ref})"
+                    )
+                    not_exists_alias_params = [rel_type, rel_type]
+            else:
+                not_exists_alias_sql = None
+                not_exists_alias_params = []
+
+            if src_uuid and tgt_uuid:
+                if not is_undirected:
+                    not_exists_uuid_sql = (
+                        f"SELECT 1 FROM {_table('rdf_edges')} WHERE "
+                        f"s = ? AND p = ? AND o_id = ?"
+                    )
+                    not_exists_uuid_params = [src_uuid, rel_type, tgt_uuid]
+                else:
+                    not_exists_uuid_sql = (
+                        f"SELECT 1 FROM {_table('rdf_edges')} WHERE "
+                        f"(s = ? AND p = ? AND o_id = ?) OR (s = ? AND p = ? AND o_id = ?)"
+                    )
+                    not_exists_uuid_params = [
+                        src_uuid, rel_type, tgt_uuid,
+                        tgt_uuid, rel_type, src_uuid,
+                    ]
+            else:
+                not_exists_uuid_sql = not_exists_alias_sql
+                not_exists_uuid_params = not_exists_alias_params
 
             # Find the rdf_edges INSERT for this relationship and wrap it with NOT EXISTS
             added_dmls = context.dml_statements[_pre_dml_len:]
@@ -4080,23 +4165,41 @@ def translate_merge_clause(merge, context, metadata):
 
             for sql, params in added_dmls:
                 if "INSERT INTO " + _table("rdf_edges") in sql and not edge_inserted:
-                    # Wrap the INSERT with NOT EXISTS guard for idempotency.
-                    # The original INSERT is:
-                    #   INSERT INTO rdf_edges (s, p, o_id) SELECT n0.node_id, ?, n2.node_id
-                    #   FROM nodes n0 ... WHERE ...
-                    # We need to add:
-                    #   AND NOT EXISTS (SELECT 1 FROM rdf_edges WHERE s = n0.node_id AND p = ? AND o_id = n2.node_id)
-                    wrapped_sql = sql.rstrip()
-                    # Add the NOT EXISTS guard at the end of the WHERE clause
-                    wrapped_sql = (
-                        f"{wrapped_sql} AND NOT EXISTS ("
-                        f"SELECT 1 FROM {_table('rdf_edges')} WHERE "
-                        f"s = {src_alias}.node_id AND p = ? AND o_id = {tgt_alias}.node_id"
-                        f")"
-                    )
-                    new_params = params + [rel_type]
-                    new_dmls.append((wrapped_sql, new_params))
-                    edge_inserted = True
+                    if not_exists_alias_sql is None and not_exists_uuid_sql is None:
+                        new_dmls.append((sql, params))
+                        edge_inserted = True
+                    elif " VALUES (" in sql:
+                        # VALUES-style INSERT (nodes created in same query):
+                        # Rewrite to SELECT WHERE NOT EXISTS using UUID literals.
+                        if not_exists_uuid_sql is None:
+                            new_dmls.append((sql, params))
+                            edge_inserted = True
+                            continue
+                        col_start = sql.index("(") + 1
+                        col_end = sql.index(")")
+                        col_list = sql[col_start:col_end]
+                        n_cols = len(col_list.split(","))
+                        placeholders = ", ".join(["?"] * n_cols)
+                        new_sql = (
+                            f"INSERT INTO {_table('rdf_edges')} ({col_list}) "
+                            f"SELECT {placeholders} WHERE NOT EXISTS ({not_exists_uuid_sql})"
+                        )
+                        new_dmls.append((new_sql, params + not_exists_uuid_params))
+                        edge_inserted = True
+                    elif not_exists_alias_sql is not None:
+                        # Append NOT EXISTS guard. Use WHERE if no WHERE clause exists yet,
+                        # AND if there already is one.
+                        sql_stripped = sql.rstrip()
+                        _upper = sql_stripped.upper()
+                        if " WHERE " in _upper or "\nWHERE " in _upper:
+                            new_sql = f"{sql_stripped} AND NOT EXISTS ({not_exists_alias_sql})"
+                        else:
+                            new_sql = f"{sql_stripped} WHERE NOT EXISTS ({not_exists_alias_sql})"
+                        new_dmls.append((new_sql, params + not_exists_alias_params))
+                        edge_inserted = True
+                    else:
+                        new_dmls.append((sql, params))
+                        edge_inserted = True
                 else:
                     new_dmls.append((sql, params))
 
@@ -4109,12 +4212,60 @@ def translate_merge_clause(merge, context, metadata):
             if rel.variable:
                 e_alias = context.register_variable(rel.variable, prefix="e")
                 context.rel_variables.add(rel.variable)
-                context.join_clauses.append(
-                    f"JOIN {_table('rdf_edges')} {e_alias} ON "
-                    f"{e_alias}.s = {src_alias}.node_id AND "
-                    f"{e_alias}.p = {context.add_join_param(rel_type)} AND "
-                    f"{e_alias}.o_id = {tgt_alias}.node_id"
+                # For undirected MERGE: replace any existing JOIN for this alias with
+                # one that matches both directions. For directed: translate_create_clause
+                # already added the correct JOIN (UUID-based or alias-based); skip re-adding.
+                added_joins = context.join_clauses[_pre_join_len:]
+                existing_join_idx = next(
+                    (i for i, j in enumerate(added_joins) if f" {e_alias} ON " in j),
+                    None,
                 )
+                if is_undirected:
+                    # Build undirected join. For UUID-based joins, inline the values as
+                    # literals (not params) to avoid join_params accounting issues when
+                    # replacing an existing join that already added params.
+                    _rt_esc = rel_type.replace("'", "''")
+                    if src_uuid and tgt_uuid:
+                        _s_esc = src_uuid.replace("'", "''")
+                        _t_esc = tgt_uuid.replace("'", "''")
+                        new_join = (
+                            f"JOIN {_table('rdf_edges')} {e_alias} ON "
+                            f"{e_alias}.p = '{_rt_esc}' AND ("
+                            f"({e_alias}.s = '{_s_esc}' AND {e_alias}.o_id = '{_t_esc}') OR "
+                            f"({e_alias}.s = '{_t_esc}' AND {e_alias}.o_id = '{_s_esc}'))"
+                        )
+                        if existing_join_idx is not None:
+                            # Remove the 3 join_params added by translate_create_clause
+                            # for the original directed join (s_uuid, rel_type, t_uuid).
+                            old_join = added_joins[existing_join_idx]
+                            old_param_count = old_join.count(" = ? ") + old_join.count(" = ?")
+                            if old_param_count > 0:
+                                del context.join_params[
+                                    _pre_join_params_len:_pre_join_params_len + old_param_count
+                                ]
+                    elif src_alias and tgt_alias:
+                        new_join = (
+                            f"JOIN {_table('rdf_edges')} {e_alias} ON "
+                            f"{e_alias}.p = {context.add_join_param(rel_type)} AND ("
+                            f"({e_alias}.s = {src_alias}.node_id AND {e_alias}.o_id = {tgt_alias}.node_id) OR "
+                            f"({e_alias}.s = {tgt_alias}.node_id AND {e_alias}.o_id = {src_alias}.node_id))"
+                        )
+                    else:
+                        new_join = None
+                    if new_join:
+                        if existing_join_idx is not None:
+                            context.join_clauses[_pre_join_len + existing_join_idx] = new_join
+                        else:
+                            context.join_clauses.append(new_join)
+                elif existing_join_idx is None:
+                    # Directed, no existing join: add one (MATCH-bound case)
+                    if src_alias and tgt_alias:
+                        context.join_clauses.append(
+                            f"JOIN {_table('rdf_edges')} {e_alias} ON "
+                            f"{e_alias}.s = {src_alias}.node_id AND "
+                            f"{e_alias}.p = {context.add_join_param(rel_type)} AND "
+                            f"{e_alias}.o_id = {tgt_alias}.node_id"
+                        )
 
     # Collect edge context for ON CREATE/ON MATCH SET on MATCH-bound node variables.
     # When a node variable comes from MATCH (not created by this MERGE), actual_id is None
@@ -7470,7 +7621,15 @@ def _expr_prop(expr, context, segment):
         prop = "node_id"
     inner_fn = inner_expr.function_name.lower() if isinstance(inner_expr, ast.FunctionCall) else ""
     if inner_fn in ("startnode", "endnode"):
-        return translate_expression(inner_expr, context, segment=segment)
+        # startNode(r).prop → look up prop from the node referenced by edge s or o_id
+        # Note: prop has already had 'id' rewritten to 'node_id' above; undo that for
+        # property lookup since 'id' is a user-defined property, not the internal node_id.
+        orig_prop = str(expr.arguments[1].value) if isinstance(expr.arguments[1], ast.Literal) else prop
+        node_id_expr = translate_expression(inner_expr, context, segment=segment)
+        _safe_prop = orig_prop.replace("'", "''")
+        return (
+            f"(SELECT val FROM {_table('rdf_props')} WHERE s = {node_id_expr} AND \"key\" = '{_safe_prop}')"
+        )
     inner = translate_expression(inner_expr, context, segment=segment)
     return f"{inner}.{prop}"
 
