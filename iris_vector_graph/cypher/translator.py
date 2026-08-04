@@ -12576,10 +12576,10 @@ def _expr_fn_list_ops(fn, args, args_exprs):
         static = _expr_fn_range(args_exprs)
         if static is not None and static != _EMPTY_JSON_ARRAY:
             return static
-        # Dynamic range: delegate to SQLUser.CypherFn_RANGE(start, end[, step])
+        # Dynamic range: delegate to SQLUser.CypherFn_IVGRANGE(start, end[, step])
         if len(args) >= 2:
             step_arg = args[2] if len(args) > 2 else "1"
-            return f"SQLUser.CypherFn_RANGE({args[0]}, {args[1]}, {step_arg})"
+            return f"SQLUser.CypherFn_IVGRANGE({args[0]}, {args[1]}, {step_arg})"
         return _EMPTY_JSON_ARRAY
     if fn == "size":
         if not args:
