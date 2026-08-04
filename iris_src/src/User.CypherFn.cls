@@ -220,4 +220,18 @@ ClassMethod IVGJSONREMOVE(json As %String = "", key As %String = "") As %String 
     } Catch { Return json }
 }
 
+/// Generate a Cypher range [start, end] as a JSON array. Step defaults to 1.
+ClassMethod RANGE(startVal As %Integer = 0, endVal As %Integer = 0, stepVal As %Integer = 1) As %String [ SqlProc ]
+{
+    If stepVal = 0 { Return "[]" }
+    Set arr = ##class(%DynamicArray).%New()
+    If stepVal > 0 {
+        For i = startVal:stepVal:endVal { Do arr.%Push(i) }
+    } Else {
+        Set i = startVal
+        While i >= endVal { Do arr.%Push(i)  Set i = i + stepVal }
+    }
+    Return arr.%ToJSON()
+}
+
 }

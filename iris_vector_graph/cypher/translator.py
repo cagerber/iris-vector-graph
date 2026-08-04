@@ -1924,7 +1924,7 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
             # SELECT * FROM (...) __ob ORDER BY lets IRIS reject them, which the TCK interprets as
             # a SyntaxError (the TCK SyntaxError-check catches any SQL error on execution).
             _has_agg_in_ob = any(
-                '__sort' in ob or 'COUNT(' in ob.upper() or 'SUM(' in ob.upper()
+                'COUNT(' in ob.upper() or 'SUM(' in ob.upper()
                 or 'MIN(' in ob.upper() or 'MAX(' in ob.upper() or 'AVG(' in ob.upper()
                 for ob in order_by_items
             )
@@ -12573,7 +12573,14 @@ def _expr_fn_list_ops(fn, args, args_exprs):
             return "NULL"
         return _expr_fn_keys(args)
     if fn == "range":
-        return _expr_fn_range(args_exprs)
+        static = _expr_fn_range(args_exprs)
+        if static is not None and static != _EMPTY_JSON_ARRAY:
+            return static
+        # Dynamic range: delegate to SQLUser.CypherFn_RANGE(start, end[, step])
+        if len(args) >= 2:
+            step_arg = args[2] if len(args) > 2 else "1"
+            return f"SQLUser.CypherFn_RANGE({args[0]}, {args[1]}, {step_arg})"
+        return _EMPTY_JSON_ARRAY
     if fn == "size":
         if not args:
             return "0"
