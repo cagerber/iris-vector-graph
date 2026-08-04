@@ -4189,9 +4189,15 @@ def translate_merge_clause(merge, context, metadata):
                     elif not_exists_alias_sql is not None:
                         # Append NOT EXISTS guard. Use WHERE if no WHERE clause exists yet,
                         # AND if there already is one.
+                        # Search only in the INSERT/SELECT body (after any CTE definition)
+                        # to avoid false-positive WHERE matches inside CTE WHERE clauses.
                         sql_stripped = sql.rstrip()
                         _upper = sql_stripped.upper()
-                        if " WHERE " in _upper or "\nWHERE " in _upper:
+                        _insert_pos = _upper.find("INSERT INTO")
+                        if _insert_pos < 0:
+                            _insert_pos = 0
+                        _body_upper = _upper[_insert_pos:]
+                        if " WHERE " in _body_upper or "\nWHERE " in _body_upper:
                             new_sql = f"{sql_stripped} AND NOT EXISTS ({not_exists_alias_sql})"
                         else:
                             new_sql = f"{sql_stripped} WHERE NOT EXISTS ({not_exists_alias_sql})"
@@ -4244,11 +4250,21 @@ def translate_merge_clause(merge, context, metadata):
                                     _pre_join_params_len:_pre_join_params_len + old_param_count
                                 ]
                     elif src_alias and tgt_alias:
+                        _sn_ref_u = (
+                            f"{src_alias}.{src_var}"
+                            if src_alias in _stage_names
+                            else f"{src_alias}.node_id"
+                        )
+                        _tn_ref_u = (
+                            f"{tgt_alias}.{tgt_var}"
+                            if tgt_alias in _stage_names
+                            else f"{tgt_alias}.node_id"
+                        )
                         new_join = (
                             f"JOIN {_table('rdf_edges')} {e_alias} ON "
                             f"{e_alias}.p = {context.add_join_param(rel_type)} AND ("
-                            f"({e_alias}.s = {src_alias}.node_id AND {e_alias}.o_id = {tgt_alias}.node_id) OR "
-                            f"({e_alias}.s = {tgt_alias}.node_id AND {e_alias}.o_id = {src_alias}.node_id))"
+                            f"({e_alias}.s = {_sn_ref_u} AND {e_alias}.o_id = {_tn_ref_u}) OR "
+                            f"({e_alias}.s = {_tn_ref_u} AND {e_alias}.o_id = {_sn_ref_u}))"
                         )
                     else:
                         new_join = None
@@ -4260,11 +4276,21 @@ def translate_merge_clause(merge, context, metadata):
                 elif existing_join_idx is None:
                     # Directed, no existing join: add one (MATCH-bound case)
                     if src_alias and tgt_alias:
+                        _sn_ref = (
+                            f"{src_alias}.{src_var}"
+                            if src_alias in _stage_names
+                            else f"{src_alias}.node_id"
+                        )
+                        _tn_ref = (
+                            f"{tgt_alias}.{tgt_var}"
+                            if tgt_alias in _stage_names
+                            else f"{tgt_alias}.node_id"
+                        )
                         context.join_clauses.append(
                             f"JOIN {_table('rdf_edges')} {e_alias} ON "
-                            f"{e_alias}.s = {src_alias}.node_id AND "
+                            f"{e_alias}.s = {_sn_ref} AND "
                             f"{e_alias}.p = {context.add_join_param(rel_type)} AND "
-                            f"{e_alias}.o_id = {tgt_alias}.node_id"
+                            f"{e_alias}.o_id = {_tn_ref}"
                         )
 
     # Collect edge context for ON CREATE/ON MATCH SET on MATCH-bound node variables.
@@ -5358,6 +5384,12 @@ def translate_node_pattern(node, context, metadata, optional=False):
             # Force the null-row fallback to fire unconditionally.
             context.optional_null_row_unconditional = True
             return
+        # Collected-node UNWIND variable: the scalar holds a node JSON blob.
+        # Allow using it as a node anchor in MATCH — the edge JOIN will use
+        # JSON_VALUE(alias.var, '$._id') to extract the node_id for comparison.
+        if node.variable in getattr(context, "collected_node_variables", set()):
+            context.variable_types[node.variable] = "node"
+            return
         # Validate type consistency: if variable was previously bound to a different type, error
         context.bind_variable_type(node.variable, "node")
         # Node already registered (e.g. as far-end of a relationship JOIN), but
@@ -5762,7 +5794,7 @@ def _trp_mapped_relation(rel, source_node, target_node, context, source_alias, t
 
 def _trp_undirected_edge(
     rel, source_node, target_node, context,
-    source_alias, target_alias, edge_alias, s_col, t_col, jt, is_new_target,
+    source_alias, target_alias, edge_alias, s_ref, t_ref, jt, is_new_target,
     is_anon_source=False,
 ):
     """Handle undirected (BOTH direction) patterns via CTE-based UNION ALL.
@@ -5816,7 +5848,7 @@ def _trp_undirected_edge(
     context.cte_clauses.append(f"{cte_name} AS (\n{cte_body}\n)")
 
     # Join the CTE as the edge alias.
-    target_on = f"{target_alias}.{t_col} = {edge_alias}._dst"
+    target_on = f"{t_ref} = {edge_alias}._dst"
     if is_anon_source:
         # No bound source node — the first hop; use as FROM or cross-JOIN.
         if not context.from_clauses:
@@ -5832,7 +5864,7 @@ def _trp_undirected_edge(
             )
     else:
         # Bound source: filter by source node id in the JOIN condition.
-        src_filter = f"{edge_alias}._src = {source_alias}.{s_col}"
+        src_filter = f"{edge_alias}._src = {s_ref}"
         context.join_clauses.append(f"{jt} {cte_name} {edge_alias} ON {src_filter}")
 
     context._undirected_aliases.add(edge_alias)
@@ -6042,7 +6074,7 @@ def _trp_move_target_cond_to_edge_join(context, edge_alias, target_on, source_al
 
 def _trp_directed_edge(
     rel, source_node, target_node, context,
-    source_alias, target_alias, edge_alias, s_col, t_col,
+    source_alias, target_alias, edge_alias, s_ref, t_ref,
     edge_cond, target_on, jt, is_anon_source, is_new_target,
 ):
     optional = jt == "LEFT OUTER JOIN"
@@ -6153,13 +6185,22 @@ def translate_relationship_pattern(
         context.rel_variables.add(rel.variable)
         # Track relationship type for semantic validation
         context.bind_variable_type(rel.variable, "relationship")
-    def _node_col(variable, alias):
+    def _node_id_ref(variable, alias):
+        """Return full SQL expression for the node_id of a node variable.
+
+        For Stage CTEs: alias.variable
+        For collected-node UNWIND variables: SQLUser.JSON_VALUE(alias.var, '$._id')
+        Otherwise: alias.node_id
+        """
         if alias.startswith("Stage") or alias == "VecSearch":
-            return variable
-        return "node_id"
+            return f"{alias}.{variable}"
+        if variable and variable in getattr(context, "collected_node_variables", set()):
+            safe_var = _safe_alias(variable)
+            return f"SQLUser.JSON_VALUE({alias}.{safe_var}, '$._id')"
+        return f"{alias}.node_id"
     direction = "in" if rel.direction == ast.Direction.INCOMING else "out"
-    s_col = _node_col(source_node.variable, source_alias)
-    t_col = _node_col(target_node.variable, target_alias)
+    s_ref = _node_id_ref(source_node.variable, source_alias)
+    t_ref = _node_id_ref(target_node.variable, target_alias)
     jt = "LEFT OUTER JOIN" if optional else "JOIN"
 
     # Stage-bound relationship: when the edge variable is already promoted to a CTE
@@ -6303,7 +6344,7 @@ def translate_relationship_pattern(
         return
     if rel.direction == ast.Direction.BOTH:
         _trp_undirected_edge(rel, source_node, target_node, context,
-                              source_alias, target_alias, edge_alias, s_col, t_col, jt, is_new_target,
+                              source_alias, target_alias, edge_alias, s_ref, t_ref, jt, is_new_target,
                               is_anon_source=is_anon_source)
         return
 
@@ -6313,12 +6354,12 @@ def translate_relationship_pattern(
     if is_unbound_src and not is_new_target:
         if rel.direction == ast.Direction.OUTGOING:
             # (t)-[:R]->(f_bound): anchor edge on f, join t from edge.s
-            edge_cond = f"{edge_alias}.o_id = {target_alias}.{t_col}"
-            src_on = f"{source_alias}.{s_col} = {edge_alias}.s"
+            edge_cond = f"{edge_alias}.o_id = {t_ref}"
+            src_on = f"{s_ref} = {edge_alias}.s"
         else:
             # (t)<-[:R]-(f_bound): anchor edge on f, join t from edge.o_id
-            edge_cond = f"{edge_alias}.s = {target_alias}.{t_col}"
-            src_on = f"{source_alias}.{s_col} = {edge_alias}.o_id"
+            edge_cond = f"{edge_alias}.s = {t_ref}"
+            src_on = f"{s_ref} = {edge_alias}.o_id"
         if rel.types:
             if len(rel.types) == 1:
                 edge_cond += f" AND {edge_alias}.p = {context.add_join_param(rel.types[0])}"
@@ -6343,23 +6384,23 @@ def translate_relationship_pattern(
     if rel.direction == ast.Direction.OUTGOING:
         if is_anon_source:
             edge_cond = "1=1"
-            target_on = f"{target_alias}.{t_col} = {edge_alias}.o_id"
+            target_on = f"{t_ref} = {edge_alias}.o_id"
             # Anon source has no nodes JOIN — record edge column for path node_id lookups
             context.node_id_expr[source_alias] = f"{edge_alias}.s"
         else:
-            edge_cond = f"{edge_alias}.s = {source_alias}.{s_col}"
-            target_on = f"{target_alias}.{t_col} = {edge_alias}.o_id"
+            edge_cond = f"{edge_alias}.s = {s_ref}"
+            target_on = f"{t_ref} = {edge_alias}.o_id"
     else:
         if is_anon_source:
             edge_cond = "1=1"
-            target_on = f"{target_alias}.{t_col} = {edge_alias}.s"
+            target_on = f"{t_ref} = {edge_alias}.s"
             # Anon source has no nodes JOIN — record edge column for path node_id lookups
             context.node_id_expr[source_alias] = f"{edge_alias}.o_id"
         else:
-            edge_cond = f"{edge_alias}.o_id = {source_alias}.{s_col}"
-            target_on = f"{target_alias}.{t_col} = {edge_alias}.s"
+            edge_cond = f"{edge_alias}.o_id = {s_ref}"
+            target_on = f"{t_ref} = {edge_alias}.s"
     _trp_directed_edge(rel, source_node, target_node, context,
-                       source_alias, target_alias, edge_alias, s_col, t_col,
+                       source_alias, target_alias, edge_alias, s_ref, t_ref,
                        edge_cond, target_on, jt, is_anon_source, is_new_target)
 
 

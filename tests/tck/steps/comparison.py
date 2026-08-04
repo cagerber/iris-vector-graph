@@ -506,16 +506,26 @@ def _node_matches(node_data: dict, pattern: dict, isolation_label: str | None = 
 
 def _normalise_row_with_nodes(actual: dict, expected: dict, columns: list[str]) -> dict:
     """Normalise actual row values, with special handling for node-format TCK cells."""
+    import json as _json
     result = {}
     for col in columns:
         aval = actual.get(col)
         eval_ = expected.get(col)
         if isinstance(eval_, str):
             pattern = _parse_node_pattern(eval_)
-            if pattern is not None and isinstance(aval, dict) and "_labels" in aval:
-                # Keep node data as-is; comparison is done in _rows_equal
-                result[col] = aval
-                continue
+            if pattern is not None:
+                # If actual value is a JSON string with node blob, parse it
+                if isinstance(aval, str):
+                    try:
+                        parsed = _json.loads(aval)
+                        if isinstance(parsed, dict) and "_id" in parsed and "_labels" in parsed:
+                            aval = parsed
+                    except (ValueError, TypeError):
+                        pass
+                if isinstance(aval, dict) and "_labels" in aval:
+                    # Keep node data as-is; comparison is done in _rows_equal
+                    result[col] = aval
+                    continue
         result[col] = normalise_iris_value(aval, eval_)
     return result
 
