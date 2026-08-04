@@ -215,17 +215,20 @@ class TCKResultTable:
 
 
 def _remap_node_columns(actual_row: dict, tck_columns: list[str], actual_columns: list[str]) -> dict:
-    """Collapse IVG's var_id/var_labels/var_props triplets into a single 'var' key.
+    """Collapse IVG's var_id/var_labels/var_props and var_s/var_p/var_o_id triplets.
 
-    IVG expands RETURN n into n_id, n_labels, n_props columns.
-    TCK expects a single 'n' column with node pattern notation.
-    This function detects the expansion and collapses it back to a NodeData dict.
+    IVG expands RETURN n into n_id, n_labels, n_props columns (nodes).
+    IVG expands RETURN r into r_s, r_p, r_o_id columns (relationships).
+    TCK expects a single column with node/relationship pattern notation.
     """
     result = dict(actual_row)
     for col in tck_columns:
         id_key = f"{col}_id"
         labels_key = f"{col}_labels"
         props_key = f"{col}_props"
+        s_key = f"{col}_s"
+        p_key = f"{col}_p"
+        o_id_key = f"{col}_o_id"
         if id_key in actual_columns and labels_key in actual_columns and props_key in actual_columns:
             node_id = actual_row.get(id_key)
             node_labels = actual_row.get(labels_key)
@@ -240,6 +243,15 @@ def _remap_node_columns(actual_row: dict, tck_columns: list[str], actual_columns
                     "_labels": node_labels,
                     "_props": node_props,
                 }
+        elif s_key in actual_columns and p_key in actual_columns and o_id_key in actual_columns:
+            # Relationship triplet: collapse var_s/var_p/var_o_id into var dict
+            rel_s = actual_row.get(s_key)
+            rel_type = actual_row.get(p_key)
+            rel_o = actual_row.get(o_id_key)
+            if rel_s is None and rel_type is None and rel_o is None:
+                result[col] = None
+            else:
+                result[col] = {"_type": rel_type, "_s": rel_s, "_o_id": rel_o}
     return result
 
 
@@ -690,7 +702,16 @@ def _rows_equal(exp: dict, act: dict, columns: list[str], list_unordered: bool) 
                 _expected_type = _rel_type_m.group(1)
                 _expected_props_str = _rel_type_m.group(2)
                 _expected_props = _parse_tck_value('{' + _expected_props_str + '}') if _expected_props_str else {}
-                # av may be: type string 'TYPE', or JSON edge object '{"type":"TYPE","props":{...}}'
+                # av may be: type string 'TYPE', JSON edge object '{"type":"TYPE","props":{...}}',
+                # or a remapped relationship dict {"_type": "TYPE", "_s": ..., "_o_id": ...}
+                if isinstance(av, dict) and "_type" in av:
+                    # Remapped relationship triplet from _remap_node_columns
+                    _actual_type = av["_type"]
+                    if _actual_type != _expected_type:
+                        return False
+                    if _expected_props:
+                        return False  # No props available in triplet format
+                    continue
                 if isinstance(av, str):
                     try:
                         _av_obj = _json_rel.loads(av)
