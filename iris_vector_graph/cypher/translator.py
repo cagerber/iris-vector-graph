@@ -291,6 +291,10 @@ class TranslationContext:
         # UNION ALL branch that emits one null row when the label has no nodes.
         # List of (label_value, param_placeholder) tuples — one per optional label constraint.
         self.optional_null_row_labels: List[tuple] = []
+        # Grouped version: list of label-lists, one list per anchor node.
+        # Each group is checked as a combined NOT EXISTS (node with ALL labels in group).
+        # This prevents TCK-injected labels (which always exist) from blocking the null row.
+        self.optional_null_row_label_groups: List[List[str]] = []
         # Parallel list of SQL values for the null row, one per select item.
         self.optional_null_row_items: List[str] = []
         # When True, the OPTIONAL MATCH null-row fallback fires unconditionally (no
@@ -1937,6 +1941,31 @@ def _to_sql_handle_with(part, context: TranslationContext, i: int, cypher_query=
             else:
                 sql = f"SELECT TOP 9223372036854775807 * FROM ({sql}) __ob ORDER BY {', '.join(order_by_items)}"
 
+    # If this stage captures an OPTIONAL MATCH anchor null-row, embed the UNION ALL
+    # directly into the Stage CTE so the null row survives subsequent MATCH stages.
+    _stage_null_row_groups = getattr(context, 'optional_null_row_label_groups', [])
+    _stage_null_row_labels = context.optional_null_row_labels
+    if _stage_null_row_labels or _stage_null_row_groups:
+        _n_cols = len(context.select_items)
+        _null_sel = ", ".join(["NULL"] * _n_cols)
+        _ne_parts = []
+        _ne_params: List[Any] = []
+        if _stage_null_row_groups:
+            for _grp in _stage_null_row_groups:
+                _ne_sql, _ne_p = _build_null_row_not_exists(_grp)
+                _ne_parts.append(_ne_sql)
+                _ne_params.extend(_ne_p)
+        else:
+            for _lbl in _stage_null_row_labels:
+                _ne_parts.append(f"NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE label = ?)")
+                _ne_params.append(_lbl)
+        _where_clause = " AND ".join(_ne_parts)
+        sql = sql + f"\nUNION ALL\nSELECT {_null_sel} WHERE {_where_clause}"
+        stage_params = list(stage_params) + _ne_params
+        # Clear so the final SELECT doesn't emit a duplicate UNION ALL
+        context.optional_null_row_labels = []
+        context.optional_null_row_label_groups = []
+        context.optional_null_row_items = []
     context.all_stage_params.extend(stage_params)
     context.stages.append(f"Stage{i + 1} AS (\n{sql}\n)")
     context.having_conditions = []
@@ -2508,6 +2537,42 @@ def _tts_finalize_context(cypher_query, context):
     return order_by_items
 
 
+def _build_null_row_not_exists(labels):
+    """Build NOT EXISTS SQL for an anchor node's full label set.
+
+    Returns (sql_fragment, params) where sql_fragment is a NOT EXISTS clause
+    that checks no single node has ALL labels in the group.  For a single label
+    this is equivalent to the old NOT EXISTS (... WHERE label = ?).  For multiple
+    labels (e.g. after TCK injection: ['NotThere', 'TCK_abc']), it checks that no
+    node carries both, so that a TCK-injected label that IS present doesn't block
+    the null-row fallback when the semantic label doesn't exist.
+    """
+    if not labels:
+        return "1=1", []
+    if len(labels) == 1:
+        return (
+            f"NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE label = ?)",
+            [labels[0]],
+        )
+    # Multi-label: require no node that has ALL labels
+    # SQL: NOT EXISTS (SELECT 1 FROM rdf_labels a0 JOIN rdf_labels a1 ON a1.s=a0.s AND a1.label=? WHERE a0.label=?)
+    from_part = f"{_table('rdf_labels')} _nrll0"
+    join_parts = []
+    where_label = labels[0]
+    params = []
+    for i, lbl in enumerate(labels[1:], start=1):
+        prev = f"_nrll{i-1}"
+        curr = f"_nrll{i}"
+        join_parts.append(
+            f"JOIN {_table('rdf_labels')} {curr} ON {curr}.s = {prev}.s AND {curr}.label = ?"
+        )
+        params.append(lbl)
+    params.append(where_label)  # WHERE param comes last (positionally after JOINs)
+    joins_str = " ".join(join_parts)
+    inner = f"SELECT 1 FROM {from_part} {joins_str} WHERE _nrll0.label = ?"
+    return f"NOT EXISTS ({inner})", params
+
+
 def _tts_transactional_result(cypher_query, context, metadata, order_by_items):
     """Assemble SQLQuery for transactional (DML) queries."""
     stmts, all_params = [], []
@@ -2527,11 +2592,18 @@ def _tts_transactional_result(cypher_query, context, metadata, order_by_items):
             null_items.append("NULL")
         null_select = ", ".join(null_items[:len(context.select_items)])
         not_exists_parts = []
-        for label in context.optional_null_row_labels:
-            not_exists_parts.append(
-                f"NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE label = ?)"
-            )
-            optional_extra_params.append(label)
+        label_groups = getattr(context, 'optional_null_row_label_groups', None) or []
+        if label_groups:
+            for group in label_groups:
+                ne_sql, ne_params = _build_null_row_not_exists(group)
+                not_exists_parts.append(ne_sql)
+                optional_extra_params.extend(ne_params)
+        else:
+            for label in context.optional_null_row_labels:
+                not_exists_parts.append(
+                    f"NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE label = ?)"
+                )
+                optional_extra_params.append(label)
         where_clause = " AND ".join(not_exists_parts)
         optional_union_sql = f"\nUNION ALL\nSELECT {null_select} WHERE {where_clause}"
 
@@ -2735,13 +2807,22 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
         while len(null_items) < len(context.select_items):
             null_items.append("NULL")
         null_select = ", ".join(null_items[:len(context.select_items)])
-        # NOT EXISTS check: all label constraints must have 0 matching nodes
+        # NOT EXISTS check: for each anchor node's label group, no node may have ALL labels.
+        # Using grouped check prevents TCK-injected labels (always present) from blocking
+        # the null row when the semantic label (e.g. 'NotThere') doesn't exist.
         not_exists_parts = []
-        for label in context.optional_null_row_labels:
-            not_exists_parts.append(
-                f"NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE label = ?)"
-            )
-            optional_extra_params.append(label)
+        label_groups = getattr(context, 'optional_null_row_label_groups', None) or []
+        if label_groups:
+            for group in label_groups:
+                ne_sql, ne_params = _build_null_row_not_exists(group)
+                not_exists_parts.append(ne_sql)
+                optional_extra_params.extend(ne_params)
+        else:
+            for label in context.optional_null_row_labels:
+                not_exists_parts.append(
+                    f"NOT EXISTS (SELECT 1 FROM {_table('rdf_labels')} WHERE label = ?)"
+                )
+                optional_extra_params.append(label)
         where_clause = " AND ".join(not_exists_parts)
         optional_union_sql = f"\nUNION ALL\nSELECT {null_select} WHERE {where_clause}"
 
@@ -5411,6 +5492,34 @@ def translate_node_pattern(node, context, metadata, optional=False):
                 node_id_col = f"{alias}.node_id"
             jt = "LEFT OUTER JOIN" if optional else "JOIN"
             for label in node.labels:
+                # For optional non-anchor targets: push the label check into the
+                # PRECEDING EDGE JOIN's ON clause via EXISTS, rather than a separate
+                # label JOIN + WHERE condition.  This ensures that when ALL edges from
+                # the anchor fail the label test, the LEFT OUTER JOIN produces exactly
+                # ONE null row (instead of filtering every expanded-edge row to 0 rows).
+                if optional and not alias.startswith("Stage"):
+                    import re as _re_lbl
+                    _node_join_pat = _re_lbl.compile(
+                        rf'LEFT OUTER JOIN\s+\S+\s+{_re_lbl.escape(alias)}\s+ON\s+'
+                        rf'{_re_lbl.escape(alias)}\.node_id\s*=\s*(\S+)'
+                    )
+                    _rhs_col = None
+                    _edge_join_idx = None
+                    for _jidx in range(len(context.join_clauses) - 1, -1, -1):
+                        _m = _node_join_pat.search(context.join_clauses[_jidx])
+                        if _m:
+                            _rhs_col = _m.group(1).rstrip(")")
+                            # The edge JOIN is the clause immediately before the node JOIN
+                            if _jidx > 0:
+                                _edge_join_idx = _jidx - 1
+                            break
+                    if _rhs_col is not None and _edge_join_idx is not None:
+                        label_param = context.add_join_param(label)
+                        context.join_clauses[_edge_join_idx] += (
+                            f" AND EXISTS(SELECT 1 FROM {_table('rdf_labels')}"
+                            f" WHERE s = {_rhs_col} AND \"label\" = {label_param})"
+                        )
+                        continue  # no separate label JOIN or WHERE needed
                 l_alias = context.next_alias("l")
                 context.join_clauses.append(
                     f"{jt} {_table('rdf_labels')} {l_alias} ON {l_alias}.s = {node_id_col} AND {l_alias}.label = {context.add_join_param(label)}"
@@ -5489,6 +5598,9 @@ def translate_node_pattern(node, context, metadata, optional=False):
     ):
         context.join_clauses.append(f"CROSS JOIN {nodes_tbl} {alias}")
     if node.labels:
+        if is_anchor_optional and node.labels:
+            # Track all labels for this anchor as a group (combined NOT EXISTS check).
+            context.optional_null_row_label_groups.append(list(node.labels))
         if getattr(node, 'labels_or', False) and len(node.labels) > 1:
             l_alias = context.next_alias("l")
             labels_inlined = ", ".join(f"'{lab}'" for lab in node.labels)
@@ -6111,21 +6223,16 @@ def _trp_directed_edge(
         #   even when the edge doesn't exist, e.g. OPTIONAL MATCH (x)-[r]->(b_bound)
         #   where x was found by a prior OPTIONAL MATCH.
         prebound = getattr(context, "optional_prebound_aliases", set())
-        if (
-            not is_anon_source
-            and source_alias
-            and not source_alias.startswith("Stage")
-        ):
-            if source_alias in prebound:
+        if not is_anon_source and source_alias:
+            # Determine whether to push target equality to edge JOIN or WHERE.
+            # Stage aliases are always pre-bound (produced by an earlier WITH clause).
+            is_stage_source = source_alias.startswith("Stage")
+            src_is_prebound = source_alias in prebound or is_stage_source
+            if src_is_prebound:
                 # Source was bound before this OPTIONAL — move the target equality
                 # constraint into the edge LEFT OUTER JOIN ON clause so that when
-                # a→c edge doesn't exist, e9 is NULL (r IS NULL) rather than
-                # polluting the result with spurious non-matching edge rows.
-                # The (target_on OR null_guard) pattern in WHERE is incorrect:
-                # it is trivially true when the LEFT JOIN returns no row (e9.o_id IS NULL),
-                # which prevents proper null-propagation for r IS NULL checks.
-                # Do NOT register source in opt_intermediate_nulled — the source was
-                # bound by the outer MATCH and should never be NULL.
+                # the target doesn't match, e is NULL (r IS NULL) rather than
+                # filtering the row (which drops Stage rows where target is NULL).
                 for i, jc in enumerate(context.join_clauses):
                     if f") {edge_alias} ON " in jc or f"rdf_edges {edge_alias} ON " in jc:
                         context.join_clauses[i] = jc + f" AND {target_on}"
@@ -6490,6 +6597,17 @@ def translate_where_clause(where, context):
                 cond_pushed = cond
                 for old, new in subst.items():
                     cond_pushed = cond_pushed.replace(old, new)
+                # IRIS crashes when correlated property-value subqueries appear in
+                # LEFT OUTER JOIN ON clauses (e.g. "(SELECT val FROM rdf_props ...)").
+                # EXISTS subqueries are fine. Skip the JOIN push only for val-fetch patterns.
+                _has_prop_subq = "(SELECT val FROM" in cond_pushed or "(SELECT %EXACT" in cond_pushed
+                if _has_prop_subq:
+                    opt_aliases = {context.variable_aliases[v] for v in opt_cypher_vars
+                                   if v in context.variable_aliases}
+                    if opt_aliases:
+                        null_checks = " OR ".join(f"{a}.node_id IS NULL" for a in sorted(opt_aliases))
+                        context.where_conditions.append(f"({null_checks} OR {cond})")
+                        return
                 # Move where_params added for this condition to join_params at the
                 # correct position. The pushed condition is appended to the string of
                 # join_clauses[opt_join_start], so its ?s come right after the ?s
