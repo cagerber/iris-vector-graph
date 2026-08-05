@@ -2189,11 +2189,13 @@ def _tts_process_parts(cypher_query, context, metadata):
             for clause in part.clauses:
                 if isinstance(clause, ast.MatchClause):
                     aliases_before_match = set(context.variable_aliases.values())
+                    _opt_join_start = len(context.join_clauses)
                     translate_match_clause(clause, context, metadata)
                     if clause.optional:
                         context.optional_match_new_aliases = (
                             set(context.variable_aliases.values()) - aliases_before_match
                         )
+                        context.opt_join_start_idx = _opt_join_start
                     else:
                         context.optional_match_new_aliases = set()
                 elif isinstance(clause, ast.UnwindClause):
@@ -6425,12 +6427,143 @@ def _check_where_unbound_vars(expr, context):
             raise SyntaxError(f"UndefinedVariable: Variable `{var}` not defined")
 
 
+def _collect_cypher_vars(expr) -> set:
+    """Collect all Cypher variable names referenced in an expression."""
+    vars_found = set()
+    if isinstance(expr, ast.LabelPredicate) and expr.variable:
+        vars_found.add(expr.variable)
+    elif isinstance(expr, ast.Variable):
+        vars_found.add(expr.name)
+    elif isinstance(expr, ast.PropertyReference):
+        vars_found.add(expr.variable)
+    elif isinstance(expr, ast.BooleanExpression):
+        for operand in (expr.operands or []):
+            vars_found.update(_collect_cypher_vars(operand))
+    elif isinstance(expr, ast.FunctionCall):
+        for arg in (expr.arguments or []):
+            vars_found.update(_collect_cypher_vars(arg))
+    elif hasattr(expr, 'left') and hasattr(expr, 'right'):
+        vars_found.update(_collect_cypher_vars(expr.left))
+        vars_found.update(_collect_cypher_vars(expr.right))
+    elif hasattr(expr, 'expression'):
+        vars_found.update(_collect_cypher_vars(expr.expression))
+    return vars_found
+
+
 def translate_where_clause(where, context):
     _check_where_unbound_vars(where.expression, context)
+    _wp_len_before = len(context.where_params)
     cond = translate_boolean_expression(where.expression, context)
     # NULL in WHERE is invalid SQL. In Cypher, NULL in WHERE means "no match" — use (1=0).
     if cond == "NULL" or cond == "(NULL)":
         cond = "(1=0)"
+    # When an OPTIONAL MATCH precedes this WHERE clause, conditions that reference
+    # ONLY optional-match variables must be pushed into the LEFT OUTER JOIN ON clause
+    # instead of WHERE. In Cypher, OPTIONAL MATCH + WHERE means: if the WHERE fails,
+    # null out the optional variables (return the row with NULLs) rather than drop the row.
+    opt_new = getattr(context, "optional_match_new_aliases", set())
+    if opt_new:
+        cypher_vars = _collect_cypher_vars(where.expression)
+        opt_cypher_vars = {
+            v for v in cypher_vars
+            if context.variable_aliases.get(v) in opt_new
+        }
+        non_opt_cypher_vars = cypher_vars - opt_cypher_vars
+        # Push into JOIN when all referenced variables are from the optional set.
+        # To correctly null out the edge alias when the condition fails, we push
+        # to the FIRST optional join (opt_join_start_idx) and substitute any later
+        # node alias references (nX.node_id) with the edge dst reference they equal.
+        if opt_cypher_vars and not non_opt_cypher_vars:
+            opt_join_start = getattr(context, "opt_join_start_idx", None)
+            if opt_join_start is not None and opt_join_start < len(context.join_clauses):
+                import re as _re
+                # Build substitution map: nX.node_id -> edge/CTE column it equals in JOIN ON
+                _node_dst_pat = _re.compile(
+                    r'LEFT OUTER JOIN\s+\S+\s+(\w+)\s+ON\s+\1\.node_id\s*=\s*(\w+\.\w+)\b'
+                )
+                subst = {}
+                for jc in context.join_clauses[opt_join_start:]:
+                    m = _node_dst_pat.search(jc)
+                    if m:
+                        subst[f"{m.group(1)}.node_id"] = m.group(2)
+                # Apply substitutions to the condition
+                cond_pushed = cond
+                for old, new in subst.items():
+                    cond_pushed = cond_pushed.replace(old, new)
+                # Move where_params added for this condition to join_params at the
+                # correct position. The pushed condition is appended to the string of
+                # join_clauses[opt_join_start], so its ?s come right after the ?s
+                # already in that clause. Count ?s in all join clauses up to and
+                # including opt_join_start to find the insertion offset in join_params.
+                n_new_where_params = len(context.where_params) - _wp_len_before
+                if n_new_where_params > 0:
+                    new_params = context.where_params[-n_new_where_params:]
+                    del context.where_params[-n_new_where_params:]
+                    # Find insertion offset: ?s in join clauses 0..opt_join_start (inclusive)
+                    insert_offset = sum(
+                        jc.count("?")
+                        for jc in context.join_clauses[:opt_join_start + 1]
+                    )
+                    for i, p in enumerate(new_params):
+                        context.join_params.insert(insert_offset + i, p)
+                context.join_clauses[opt_join_start] = context.join_clauses[opt_join_start] + f" AND {cond_pushed}"
+                return
+        elif opt_cypher_vars and non_opt_cypher_vars:
+            # Mixed: some mandatory, some optional vars. Push the condition to the FIRST
+            # optional JOIN's ON clause (with alias substitution) so that when the
+            # condition fails, the optional side becomes null (rather than filtering the
+            # whole row). Only push when the condition doesn't forward-reference JOIN
+            # aliases defined after opt_join_start — those can't be in the ON clause.
+            opt_join_start = getattr(context, "opt_join_start_idx", None)
+            if opt_join_start is not None and opt_join_start < len(context.join_clauses):
+                import re as _re
+                # Match "LEFT OUTER JOIN <table> <alias> ON <alias>.node_id = <rhs>"
+                # where <rhs> can be any column reference (standard or CTE).
+                _node_dst_pat = _re.compile(
+                    r'LEFT OUTER JOIN\s+\S+\s+(\w+)\s+ON\s+\1\.node_id\s*=\s*(\w+\.\w+)\b'
+                )
+                # Extract all join aliases from joins AFTER opt_join_start (except node aliases
+                # which we'll substitute out). These are forward references we can't push.
+                _join_alias_pat = _re.compile(
+                    r'(?:LEFT OUTER JOIN|LEFT JOIN|JOIN)\s+\S+\s+(\w+)\s+ON'
+                )
+                _forward_aliases = set()
+                for jc in context.join_clauses[opt_join_start:]:
+                    mm = _join_alias_pat.search(jc)
+                    if mm:
+                        _forward_aliases.add(mm.group(1))
+                subst = {}
+                for jc in context.join_clauses[opt_join_start:]:
+                    m = _node_dst_pat.search(jc)
+                    if m:
+                        subst[f"{m.group(1)}.node_id"] = m.group(2)
+                        _forward_aliases.discard(m.group(1))  # node aliases are substituted out
+                # Check if condition references any forward aliases (unsubstitutable)
+                cond_has_forward = any(f"{fa}." in cond for fa in _forward_aliases)
+                if not cond_has_forward:
+                    cond_pushed = cond
+                    for old, new in subst.items():
+                        cond_pushed = cond_pushed.replace(old, new)
+                    # Move where_params to join_params at correct position
+                    n_new_where_params = len(context.where_params) - _wp_len_before
+                    if n_new_where_params > 0:
+                        new_params = context.where_params[-n_new_where_params:]
+                        del context.where_params[-n_new_where_params:]
+                        insert_offset = sum(
+                            jc.count("?")
+                            for jc in context.join_clauses[:opt_join_start + 1]
+                        )
+                        for i, p in enumerate(new_params):
+                            context.join_params.insert(insert_offset + i, p)
+                    context.join_clauses[opt_join_start] = context.join_clauses[opt_join_start] + f" AND {cond_pushed}"
+                    return
+            # Fallback: wrap with IS NULL guard in outer WHERE
+            opt_aliases = {context.variable_aliases[v] for v in opt_cypher_vars
+                          if v in context.variable_aliases}
+            if opt_aliases:
+                null_checks = " OR ".join(f"{a}.node_id IS NULL" for a in sorted(opt_aliases))
+                context.where_conditions.append(f"({null_checks} OR {cond})")
+                return
     context.where_conditions.append(cond)
 
 
@@ -8678,6 +8811,14 @@ def _expr_property_reference(expr, context, segment):
         var_col = f"{alias}.node_id"
         return f"(SELECT val FROM {_table('rdf_props')} WHERE s = {var_col} AND \"key\" = ?)"
     if segment == "where":
+        opt_new = getattr(context, "optional_match_new_aliases", set())
+        if alias in opt_new:
+            # For optional-match variables in WHERE, use a correlated subquery so that
+            # the property reference can be pushed into the edge JOIN's ON clause via
+            # alias substitution (alias.node_id -> edge._dst) without creating a
+            # dangling JOIN that precedes the node JOIN that defines the alias.
+            context.where_params.append(expr.property_name)
+            return f"(SELECT val FROM {_table('rdf_props')} WHERE s = {alias}.node_id AND \"key\" = ?)"
         # Skip the structural guard when this property is also IS NULL / IS NOT NULL
         # checked in the current boolean context (e.g. `a.x IS NULL OR a.x > 'y'`).
         # In that case the LEFT JOIN NULL already handles the missing-property case.
@@ -12844,7 +12985,7 @@ def _expr_fn_list_ops(fn, args, args_exprs):
     if fn == "head":
         if not args:
             return "NULL"
-        return f"SQLUser.LIST_HEAD({args[0]})"
+        return f"SQLUser.JSON_ARRAYGET({args[0]}, 0)"
     if fn == "tail":
         if not args:
             return "JSON_ARRAY()"
@@ -12852,7 +12993,7 @@ def _expr_fn_list_ops(fn, args, args_exprs):
     if fn == "last":
         if not args:
             return "NULL"
-        return f"SQLUser.LIST_LAST({args[0]})"
+        return f"SQLUser.JSON_ARRAYGET({args[0]}, SQLUser.JSON_ARRAYLENGTH({args[0]})-1)"
     if fn == "isempty":
         if not args:
             return "1"
