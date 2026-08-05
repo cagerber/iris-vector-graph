@@ -4780,6 +4780,8 @@ def _translate_set_value(expr, context, target_prop: str) -> tuple:
         try:
             sql = translate_expression(e, context, segment="select")
             return sql, list(context.select_params)
+        except SyntaxError:
+            raise
         except Exception:
             return "NULL", []
 
@@ -7528,6 +7530,16 @@ def translate_boolean_expression(expr, context) -> str:
         if isinstance(expr, ast.PropertyAccessExpression):
             val_sql = translate_expression(expr, context, segment="where")
             return f"({val_sql} = 'true')"
+        # A bare node or relationship variable used as a boolean predicate is a type error.
+        # e.g. WHERE (n) or WHERE r — nodes/relationships are not booleans.
+        # Only fire for current-clause aliases (n0, e0) not Stage CTEs (which can be scalars).
+        if isinstance(expr, ast.Variable) and expr.name in context.variable_aliases:
+            alias = context.variable_aliases[expr.name]
+            # Node aliases start with 'n', relationship aliases with 'e' (but not Stage CTEs)
+            if alias and alias[0] in ('n', 'e') and not alias.startswith('ES_'):
+                raise SyntaxError(
+                    f"InvalidArgumentType: {expr.name} is a graph entity and cannot be used as a boolean predicate"
+                )
         return translate_expression(expr, context, segment="where")
     op = expr.operator
     logical = _boolean_expr_logical(op, expr, context)
@@ -13388,6 +13400,13 @@ def _expr_boolean(expr, context, segment):
 
 
 def translate_expression(expr, context, segment="select") -> str:
+    # Pattern predicates (n)-[r]->() are only valid in boolean WHERE context,
+    # not as expressions in RETURN, WITH, or SET.
+    if isinstance(expr, ast.ExistsExpression) and getattr(expr, "is_pattern_predicate", False):
+        raise SyntaxError(
+            "UnexpectedSyntax: Pattern expression is not allowed in an expression context "
+            "(RETURN, WITH, SET). Use it in a WHERE clause or as EXISTS{...}."
+        )
 
     if isinstance(expr, ast.PatternComprehension):
         return _expr_pattern_comprehension(expr, context, segment)
@@ -14059,6 +14078,36 @@ def translate_with_clause(with_clause, context):
     has_agg = any(_contains_aggregation(i.expression) for i in with_clause.items)
     agg_aliases: set = set()
     agg_alias_sql: dict = {}  # Maps aggregate alias -> SQL expression (computed once)
+
+    # AmbiguousAggregationExpression check for WITH clause (same rules as RETURN).
+    if has_agg:
+        non_agg_items = [i for i in with_clause.items if not _contains_aggregation(i.expression)]
+        grouping_exprs = set()
+        for gi in non_agg_items:
+            grouping_exprs.add(_expr_to_cypher_text(gi.expression))
+        for item in with_clause.items:
+            if not _contains_aggregation(item.expression):
+                continue
+            if isinstance(item.expression, ast.AggregationFunction):
+                continue
+            ambiguous_parts = _collect_non_agg_var_refs(item.expression)
+            for part in ambiguous_parts:
+                part_text = _expr_to_cypher_text(part)
+                if not part_text:
+                    continue
+                if isinstance(part, ast.Variable) and part.name in context.input_params:
+                    continue
+                is_simple = isinstance(part, (ast.Variable, ast.PropertyReference))
+                if not is_simple:
+                    raise SyntaxError(
+                        f"AmbiguousAggregationExpression: An expression using aggregation "
+                        f"and a non-aggregate is ambiguous: '{_expr_to_cypher_text(item.expression)}'"
+                    )
+                if part_text not in grouping_exprs:
+                    raise SyntaxError(
+                        f"AmbiguousAggregationExpression: An expression using aggregation "
+                        f"and a non-aggregate is ambiguous: '{_expr_to_cypher_text(item.expression)}'"
+                    )
 
     # Process WITH clause items: translate expressions and add to select
     for item in with_clause.items:

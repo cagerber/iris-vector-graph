@@ -295,7 +295,9 @@ class Lexer:
                             self.cursor += hex_len
                             self.column += hex_len
                         else:
-                            value += esc
+                            raise SyntaxError(
+                                f"InvalidUnicodeLiteral: invalid unicode escape '\\{esc}' at line {self.line}, col {self.column}"
+                            )
                     else:
                         value += {
                             'n': '\n', 't': '\t', 'r': '\r', 'b': '\b', 'f': '\f',
@@ -389,7 +391,11 @@ class Lexer:
                     hex_digits += self.source[self.cursor]
                     self.cursor += 1
                     self.column += 1
-                decimal_value = str(int(hex_digits, 16)) if hex_digits else "0"
+                if not hex_digits:
+                    raise SyntaxError(
+                        f"InvalidNumberLiteral: incomplete hexadecimal literal '0x' at line {self.line}, col {start_col}"
+                    )
+                decimal_value = str(int(hex_digits, 16))
                 self.tokens.append(Token(TokenType.INTEGER_LITERAL, decimal_value, start_pos, self.line, start_col))
                 return
             elif next_ch in ("o", "O"):
