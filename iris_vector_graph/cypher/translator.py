@@ -348,6 +348,12 @@ class TranslationContext:
         # suppressed for these so that nodes lacking the property produce a NULL val that
         # correctly satisfies "x IS NULL" even when OR'd with other predicates.
         self._null_guarded_props: set = set()
+        # Maps variable alias → Python list (of ast.Literal elements) for variables bound
+        # to literal list expressions in WITH clauses. Used for list-comprehension constant folding
+        # to preserve null slots (JSON_ARRAYAGG silently drops NULLs).
+        self.literal_list_vars: Dict[str, list] = (
+            {} if parent is None else parent.literal_list_vars.copy()
+        )
 
     def next_alias(self, prefix: str = "t") -> str:
         alias = f"{prefix}{self._alias_counter}"
@@ -8082,6 +8088,51 @@ def _expr_arith(expr, context, segment):
                 f"SELECT JSON_VALUE({right_arr}, '$[' || rn.n || ']') AS v FROM ({row_gen}) rn WHERE rn.n < SQLUser.JSON_ARRAYLENGTH({right_arr})"
                 f") x)"
             )
+        # Runtime-polymorphic +: when one or both operands are PropertyReferences
+        # the value type is unknown at compile time (could be list or number/string).
+        # Emit a CASE that detects JSON arrays at runtime and does concat vs. arithmetic.
+        # But: skip this if either side is provably numeric (arithmetic subexpr, numeric literal,
+        # or numeric-returning function) — in that case just fall through to numeric cast.
+        larg, rarg = expr.arguments[0], expr.arguments[1]
+        def _is_definitely_numeric(arg):
+            if isinstance(arg, ast.Literal):
+                return isinstance(arg.value, (int, float)) and not isinstance(arg.value, bool)
+            if isinstance(arg, ast.FunctionCall):
+                fn = arg.function_name
+                if fn in ("__arith_*", "__arith_-", "__arith_/", "__arith_%", "__arith_^"):
+                    return True  # arithmetic on numbers returns number
+                if fn in ("id", "size", "length", "toInteger", "toFloat", "abs", "sign", "round", "floor", "ceil"):
+                    return True
+            return False
+        def _is_definitely_string(arg):
+            return isinstance(arg, ast.Literal) and isinstance(arg.value, str)
+        # Only apply runtime polymorphism when neither side is a known string/numeric type,
+        # both operands are ambiguous property refs (could be list or scalar).
+        if (isinstance(larg, ast.PropertyReference) or isinstance(rarg, ast.PropertyReference)) and not (
+            _is_definitely_numeric(larg) or _is_definitely_numeric(rarg) or
+            _is_definitely_string(larg) or _is_definitely_string(rarg)
+        ):
+            # Evaluate left/right once in an __arrc subquery to avoid ? appearing multiple times.
+            # String-trim array concat: trim ] from left, [ from right, join with comma.
+            # Each of left/right may contain ? params; they must appear exactly once in the SQL.
+            def _rt_ensure_array_str(arg_expr, alias):
+                if isinstance(arg_expr, ast.PropertyReference) or _is_list(arg_expr):
+                    return alias
+                return f"('[' || {alias} || ']')"
+            la_str = _rt_ensure_array_str(larg, "__la")
+            ra_str = _rt_ensure_array_str(rarg, "__ra")
+            return (
+                f"(SELECT CASE"
+                f" WHEN SUBSTRING(__la, 1, 1) = '[' OR SUBSTRING(__ra, 1, 1) = '['"
+                f" THEN CASE"
+                f" WHEN CHAR_LENGTH({la_str}) > 2 AND CHAR_LENGTH({ra_str}) > 2"
+                f" THEN SUBSTRING({la_str}, 1, CHAR_LENGTH({la_str})-1) || ',' || SUBSTRING({ra_str}, 2)"
+                f" WHEN CHAR_LENGTH({la_str}) > 2 THEN {la_str}"
+                f" ELSE {ra_str} END"
+                f" ELSE (CAST(__la AS DOUBLE) + CAST(__ra AS DOUBLE)) END"
+                f" FROM (SELECT CAST({left} AS VARCHAR(4096)) AS __la,"
+                f" CAST({right} AS VARCHAR(4096)) AS __ra) __arrc)"
+            )
         # Numeric +: cast property references to DOUBLE
         left = _prop_ref_cast(expr.arguments[0], left)
         right = _prop_ref_cast(expr.arguments[1], right)
@@ -8383,6 +8434,58 @@ def _expr_list_comprehension(expr, context, segment):
         if pred_case:
             return f"JSON_ARRAYAGG({pred_case}{select_expr} ELSE NULL END)"
         return f"JSON_ARRAYAGG({select_expr})"
+    # Constant-fold: literal source + simple type-conversion projection with no predicate.
+    # JSON_ARRAYAGG silently drops NULLs; compute fully in Python to preserve null slots.
+    # Also handles when the source is a Variable known to hold a literal list (from literal_list_vars).
+    _lc_source_elems = None
+    if (
+        not expr.predicate
+        and isinstance(expr.projection, ast.FunctionCall)
+        and expr.projection.function_name.lower() in ("tofloat", "tointeger", "tostring", "toboolean")
+    ):
+        if isinstance(expr.source, ast.Literal) and isinstance(expr.source.value, list):
+            _lc_source_elems = expr.source.value
+        elif isinstance(expr.source, ast.Variable):
+            _llv = getattr(context, 'literal_list_vars', {})
+            _var_alias = context.variable_aliases.get(expr.source.name, expr.source.name)
+            if _var_alias in _llv:
+                _lc_source_elems = _llv[_var_alias]
+            elif expr.source.name in _llv:
+                _lc_source_elems = _llv[expr.source.name]
+
+    if _lc_source_elems is not None:
+        import json as _json
+        fn_lc = expr.projection.function_name.lower()
+        results = []
+        for elem in _lc_source_elems:
+            v = elem.value if isinstance(elem, ast.Literal) else None
+            if fn_lc == "tofloat":
+                try:
+                    results.append(float(str(v)) if isinstance(v, (int, float, str)) and not isinstance(v, bool) else None)
+                except (ValueError, TypeError):
+                    results.append(None)
+            elif fn_lc == "tointeger":
+                try:
+                    results.append(int(float(str(v))) if isinstance(v, (int, float, str)) and not isinstance(v, bool) else None)
+                except (ValueError, TypeError):
+                    results.append(None)
+            elif fn_lc == "tostring":
+                if isinstance(v, bool):
+                    results.append("true" if v else "false")
+                elif isinstance(v, (int, float, str)):
+                    results.append(str(v))
+                else:
+                    results.append(None)
+            elif fn_lc == "toboolean":
+                if isinstance(v, bool):
+                    results.append(v)
+                elif isinstance(v, str):
+                    results.append(True if v.lower() == "true" else (False if v.lower() == "false" else None))
+                else:
+                    results.append(None)
+        js = _json.dumps(results)
+        return f"CAST('{js.replace(chr(39), chr(39)+chr(39))}' AS VARCHAR({max(len(js)+1, 256)}))"
+
     source_sql = translate_expression(expr.source, context, segment="inline")
     var = sanitize_identifier(expr.variable)
     safe_var = _safe_alias(expr.variable)
@@ -14180,6 +14283,19 @@ def translate_with_clause(with_clause, context):
                 _pval = context.input_params[_param_name]
                 if isinstance(_pval, bool) or isinstance(_pval, float) or isinstance(_pval, str) or isinstance(_pval, (list, dict)):
                     context.non_integer_index_vars.add(alias)
+
+        # Track literal list variables for list-comprehension constant folding.
+        # When a WITH item binds a variable to a literal list, record the Python value so that
+        # downstream list comprehensions with type-conversion projections (toFloat, toInteger, etc.)
+        # can be constant-folded, preserving null slots that JSON_ARRAYAGG would silently drop.
+        if isinstance(item.expression, ast.Literal) and isinstance(item.expression.value, list):
+            _lit_elems = item.expression.value
+            if hasattr(context, 'literal_list_vars'):
+                context.literal_list_vars[alias] = _lit_elems
+        elif isinstance(item.expression, ast.Variable):
+            _pname = item.expression.name
+            if hasattr(context, 'literal_list_vars') and _pname in context.literal_list_vars:
+                context.literal_list_vars[alias] = context.literal_list_vars[_pname]
 
         # Track non-map variables for property access TypeError enforcement.
         # Scalars (int, float, bool, str) and lists cannot have properties accessed on them.
