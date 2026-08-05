@@ -298,6 +298,10 @@ class TranslationContext:
         # (e.g. WITH null AS a … OPTIONAL MATCH (a)-…) because the scalar is always
         # null so the match will never return rows.
         self.optional_null_row_unconditional: bool = False
+        # Set to True when the RETURN clause is pure aggregation (no group keys).
+        # In that case, the OPTIONAL MATCH null-row UNION ALL must be suppressed
+        # because COUNT/SUM/etc already return correct values (0/null) over empty sets.
+        self.return_is_pure_aggregation: bool = False
         # OPTIONAL MATCH intermediate-node null-gating: maps node_alias → edge_alias.
         # When the gating edge is null (second-hop path failed), the intermediate node
         # should appear as null in SELECT even though it was joined via the first hop.
@@ -2515,7 +2519,7 @@ def _tts_transactional_result(cypher_query, context, metadata, order_by_items):
     # OPTIONAL MATCH null-row fallback for RETURN clause in transactional queries.
     optional_union_sql = ""
     optional_extra_params: List[Any] = []
-    if sql is not None and context.optional_null_row_labels and context.optional_null_row_items:
+    if sql is not None and context.optional_null_row_labels and context.optional_null_row_items and not context.return_is_pure_aggregation:
         null_items = list(context.optional_null_row_items)
         while len(null_items) < len(context.select_items):
             null_items.append("NULL")
@@ -2723,7 +2727,7 @@ def _tts_select_result(cypher_query, context, metadata, order_by_items):
     # one null row instead of 0 rows.
     optional_union_sql = ""
     optional_extra_params: List[Any] = []
-    if context.optional_null_row_labels and context.optional_null_row_items:
+    if context.optional_null_row_labels and context.optional_null_row_items and not context.return_is_pure_aggregation:
         null_items = context.optional_null_row_items
         # Build the null-row SELECT: pad with NULLs if fewer items than select columns
         while len(null_items) < len(context.select_items):
@@ -5541,7 +5545,7 @@ def translate_node_pattern(node, context, metadata, optional=False):
 
 
 
-def _trp_variable_length(rel, source_node, target_node, context, metadata):
+def _trp_variable_length(rel, source_node, target_node, context, metadata, optional=False):
     """Handle variable-length path patterns. Writes to context.var_length_paths."""
     if rel.variable_length is not None:
         source_alias = context.variable_aliases.get(source_node.variable, "")
@@ -5598,6 +5602,7 @@ def _trp_variable_length(rel, source_node, target_node, context, metadata):
                 } if rel.properties else {},
                 "source_labels": list(source_node.labels) if source_node.labels else [],
                 "target_labels": list(target_node.labels) if target_node.labels else [],
+                "optional": optional,
             }
         )
         if not context.from_clauses:
@@ -6175,7 +6180,7 @@ def translate_relationship_pattern(
     rel, source_node, target_node, context, metadata, optional=False
 ):
     if rel.variable_length is not None:
-        _trp_variable_length(rel, source_node, target_node, context, metadata)
+        _trp_variable_length(rel, source_node, target_node, context, metadata, optional=optional)
         return
     source_alias, target_alias, edge_alias, is_anon_source, is_new_target, is_unbound_src = (
         _trp_setup_aliases(rel, source_node, target_node, context)
@@ -13109,8 +13114,18 @@ def _expr_boolean(expr, context, segment):
     # cond appears twice in the SQL string, so any ? placeholders inside cond must appear
     # twice. select_params and where_params embed ? inside cond; join_params embed ? in
     # JOIN clauses (structural, not in cond) — only duplicate the former two.
+    # Additionally, any params that translate_boolean_expression placed in where_params
+    # must be promoted to select_params, because the resulting CASE expression is
+    # emitted in the SELECT list — where_params are paired with WHERE conditions and
+    # would be dropped if no matching WHERE ? placeholder exists.
+    new_wp = context.where_params[_wp0:]
+    if new_wp:
+        # Promote new where_params to select_params: they belong in the SELECT CASE expression.
+        # The CASE has two copies of cond, so params must also be doubled.
+        del context.where_params[_wp0:]
+        context.select_params.extend(new_wp)
+    # Duplicate all newly-added select_params (cond appears twice in the CASE expression).
     context.select_params.extend(context.select_params[_sp0:])
-    context.where_params.extend(context.where_params[_wp0:])
     return f"CASE WHEN ({cond}) THEN 1 WHEN NOT ({cond}) THEN 0 ELSE NULL END"
 
 
@@ -13532,6 +13547,8 @@ def translate_return_clause(ret, context):
     if has_agg:
         # Collect grouping keys: standalone non-aggregate return items.
         non_agg_items = [i for i in ret.items if not _contains_aggregation(i.expression)]
+        if not non_agg_items:
+            context.return_is_pure_aggregation = True
         grouping_exprs = set()
         for gi in non_agg_items:
             grouping_exprs.add(_expr_to_cypher_text(gi.expression))

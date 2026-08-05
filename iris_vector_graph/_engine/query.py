@@ -634,7 +634,6 @@ class QueryMixin:
                     logger.debug("Source ID extraction query failed: %s", exc)
 
         if not source_ids:
-            # Return empty with correct columns
             columns = _build_path_func_columns(return_path_funcs, source_var, target_var, col_map, path_named_var)
             return IVGResult(columns=columns, rows=[], metadata=sql_query.query_metadata)
 
@@ -911,6 +910,7 @@ class QueryMixin:
         source_alias = vl0.get("source_alias") or ""
         target_alias = vl0.get("target_alias") or ""
         rel_var = vl0.get("rel_var")
+        is_optional = vl0.get("optional", False)
 
         sql_str = sql_query.sql if isinstance(sql_query.sql, str) else ""
 
@@ -1121,6 +1121,9 @@ class QueryMixin:
             return IVGResult(columns=[col_name], rows=[[len(target_ids)]], metadata=sql_query.query_metadata)
 
         if not target_ids:
+            if is_optional:
+                null_cols = [_id_col, _labels_col, _props_col] if _node_triple_in_sql else out_cols
+                return IVGResult(columns=null_cols, rows=[[None] * len(null_cols)], metadata=sql_query.query_metadata)
             return IVGResult(columns=out_cols, rows=[], metadata=sql_query.query_metadata)
 
         # Step 5: Handle RETURN r — return list of per-path edge-type lists
