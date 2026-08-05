@@ -131,11 +131,10 @@ _JSONPATH_RESERVED = frozenset({"null", "true", "false"})
 
 
 def _jsonpath_key(prop: str) -> str:
-    """Return a JSONPath key segment, quoting reserved words like null/true/false."""
-    safe = prop.replace("'", "''")
-    if prop.lower() in _JSONPATH_RESERVED:
-        return f'"{safe}"'
-    return safe
+    """Return a JSONPath key segment. IRIS handles reserved words (null/true/false) as
+    plain key names in unquoted form ($.null); quoting them causes JSON_VALUE to return
+    NULL in IRIS."""
+    return prop.replace("'", "''")
 
 
 def labels_subquery(node_expr: str, exclude_labels=None) -> str:
