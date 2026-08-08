@@ -1,5 +1,128 @@
 # Changelog
 
+### v2.6.0 (2026-08-08)
+
+**openCypher TCK compliance: 2930/3897 scenarios (75.2%)**
+
+174 translator and engine fixes since v2.5.1. Remaining failures are in 7 clusters
+with root causes and fix paths in spec 203.
+
+#### Cypher translator fixes
+
+**Three-value logic (3VL) and boolean handling**
+
+- Correct `null AND false → false`, `null OR true → true`, `null XOR null → null`
+  propagation through `AND`/`OR`/`XOR`/`NOT` operators
+- `NOT NOT` folding; `CASE WHEN` parens for equality predicates
+- Boolean variable coercion: string `'true'`/`'false'` coerced correctly in XOR/NOT
+- `AND`/`OR` short-circuit: literal boolean folds remove dead branches; context
+  params rolled back when branch is dropped
+- `WHERE NULL` → `(1=0)`, `NOT(NULL)` → `NULL`
+
+**Null semantics**
+
+- `IN` with null list RHS now returns null correctly
+- Null node comparison: all-None node triplet returns null
+- `OPTIONAL MATCH` null-row semantics: null rows propagated through subsequent
+  stages; pure-aggregation stages suppress phantom null rows
+- JSON_VALUE NULL guard in scalar property access prevents `SQLCODE=-400`
+- `COALESCE` wrapping for pattern comprehension subqueries returns `[]` not NULL
+
+**Pattern matching and path expressions**
+
+- `OPTIONAL MATCH` + WHERE: predicate pushed to JOIN ON instead of outer WHERE
+  to avoid filtering null rows
+- Variable-length paths (VLP): unbounded `*` max_hops raised from 10 → 100;
+  named path return from VLP; param order fix
+- Pattern comprehension: parse `[p = (n)-->() | p]` syntax; return path JSON;
+  list-of-paths comparison support
+- Pattern predicates: parser rejects expr-only tokens; unbound var handling;
+  disjunctive guard; stage label fix
+- `MATCH` after `UNWIND` + collected node; `MATCH` on Stage-bound node_id refs
+- Direction-symmetry for bound-target MATCH patterns
+
+**WITH / RETURN / ORDER BY pipeline**
+
+- `WITH ORDER BY` / `SKIP` / `LIMIT`: correct CTE ordering via `TOP` + `ORDER BY`
+  inside Stage CTE; function expressions in `SKIP`/`LIMIT` (`toInteger`, `ceil`, `rand`)
+- `RETURN *` after `WITH` stage; `RETURN *` path expansion; `DISTINCT` `WITH ORDER BY`
+  uses projected alias
+- `ORDER BY`: `ASCENDING`/`DESCENDING` keywords; numeric sort; bool/node property
+  sort; temporal CREATE props; `__sort` columns use TOP
+- Stage-bound relationship variable: type constraint added on re-use; relationship
+  triplet columns remapped `(var_s/var_p/var_o_id)` → `var`
+
+**Expressions and functions**
+
+- `head()` / `last()` via `JSON_ARRAYGET` (0-indexed and -1)
+- `reverse()` dispatched correctly for lists and strings
+- `range()` via `CypherFn_IVGRANGE` UDF (`RANGE` is reserved in IRIS SQL)
+- `size()` dispatched to `JSON_ARRAYLENGTH` for lists vs `CHAR_LENGTH` for strings
+- `percentileDisc` / `percentileCont`: sorted array, inlined param, corrected regex
+- `toInteger` / `toFloat`: param duplication fix; WHERE param order fix
+- `keys()` on literal map; case-insensitive column matching
+- `labels(n)` excludes removed labels after `REMOVE`
+- `collect()` → `[]` when result set is empty
+- List comprehension null-slot preservation: `[x IN list | toFloat(x)]` preserves
+  nulls via compile-time constant fold when source is a literal list
+- Runtime polymorphic `+` for `PropertyReference + PropertyReference`: detects
+  at runtime whether operand starts with `[` (JSON array) and does string-trim
+  array concat; falls back to numeric `DOUBLE + DOUBLE`; uses single `__arrc`
+  subquery so `?` params appear exactly once
+
+**Quantifiers**
+
+- `ANY` / `ALL` / `NONE` / `SINGLE`: `CASE WHEN` in SELECT, proper WHERE predicates
+- Quantifier `JSON_TABLE` column type inference: `INTEGER`/`DOUBLE` vs `VARCHAR`
+- Null-sentinel filter in quantifier body; VARCHAR boolean stringify for params
+
+**CREATE / MERGE / SET / REMOVE / DELETE**
+
+- `MERGE` relationship idempotency: `WHERE NOT EXISTS` check before INSERT
+- `MERGE` Stage1 column refs fixed
+- `UNWIND` + `MERGE` foreach literal; `UNWIND` + `CREATE` expansion
+- `SET` `UndefinedVariable` fix
+- `REMOVE` + `labels(n)` exclude removed labels
+- `DELETE` null-row propagation; `ConstraintVerificationFailed`; `UndefinedVariable`
+- `WITH`-prefix DML subqueries
+
+**Parser / lexer**
+
+- `InvalidNumberLiteral` / `UnicodeLiteral` error recovery
+- Pattern-in-expr `UnexpectedSyntax` handling
+- Map literal parsing fix
+- IS NULL / IS NOT NULL precedence
+- Hex / octal / float literals
+- Temporal map/string construction; lexer escape sequences; duration normalisation
+- Reserved-word ORDER BY alias quoting; INT/reserved SQL alias quoting
+
+**SQL generation**
+
+- CTE column-list syntax fix
+- CAST literal fix; null CAST
+- `JSON_VALUE` guard in scalar property access
+- `STR_SPLIT` WHILE loop fix
+- Reserved JSONPath keys (`null`/`true`/`false`) unquoted for IRIS compatibility
+- `RANGE` → `CypherFn_IVGRANGE` rename
+
+#### Test infrastructure
+
+- openCypher TCK harness (`tests/tck/`): behave + Gherkin against 3897 scenarios
+- `wip.txt` overlay: 43 scenarios deferred pending temporal support
+- Unit tests: `test_is_null_expression.py`, `test_keyword_as_label.py`,
+  `test_match_far_node_labels.py`, `test_translator_deep_coverage.py`,
+  `test_translator_gaps.py`, `test_create_validation.py` (700+ new unit assertions)
+- Fix `TestNativeVecProbe` mock setup: add `_schema_prefix` attribute introduced
+  in v2.5.1 schema-prefix isolation
+
+#### Bug fixes (non-TCK)
+
+- `NaN` comparison: `>=` / `<=` decomposed to `> OR =` to avoid IRIS silent wrong result
+- Graph5: null label → null propagation
+- Map1: JSONPath reserved key handling
+
+---
+
 ### v2.5.1 (2026-07-29)
 
 **Fix: schema_prefix process-global isolation**
