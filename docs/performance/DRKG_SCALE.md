@@ -3,7 +3,7 @@
 **Dataset**: [DRKG — Drug Repurposing Knowledge Graph](https://github.com/gnn4dr/DRKG) (Apache-2.0)
 **Scale**: 97,238 nodes (13 biomedical types) · 5,874,261 edges (107 relation types) · 400-dim TransE embeddings
 **Container**: `ivg-iris` (IRIS Community 2025.1), MacBook Pro M3 Ultra, 128 GB
-**Purpose**: move IVG's biomedical-scale story from *"designed for"* to *"validated at"*.
+**Purpose**: move IVG's biomedical-scale story from _"designed for"_ to _"validated at"_.
 
 This is the largest real-world graph IVG has been loaded with end-to-end (prior
 validated full-analytics scale was ER(2000); prior traversal/BuildKG scale was
@@ -33,12 +33,12 @@ per-batch path and loaded the **full** DRKG without dropping the connection.
 
 Loaded **97,238 nodes + 5,874,261 edges** (full DRKG) with **0 retries**:
 
-| Phase | Time | Notes |
-|---|---|---|
-| Edge ingest (5.87M, `bulk_ingest_edges` via session) | **511 s** (~11.5K edges/s) | **constant rate, no decay** — indexes disabled once up front |
-| Index rebuild (11 indexes, **once**) | **50 s** | vs ~5,870 per-batch rebuilds on the old path |
-| `sync()` = BuildKG + BuildNKG (5.87M edges) | **550 s** | inherent index construction (BuildKG ~46s + BuildNKG ~180s + 2-hop stats) |
-| **Total** | **~1,115 s (18.6 min)** | full graph, ^KG + ^NKG built, 0 retries |
+| Phase                                                | Time                       | Notes                                                                     |
+| ---------------------------------------------------- | -------------------------- | ------------------------------------------------------------------------- |
+| Edge ingest (5.87M, `bulk_ingest_edges` via session) | **511 s** (~11.5K edges/s) | **constant rate, no decay** — indexes disabled once up front              |
+| Index rebuild (11 indexes, **once**)                 | **50 s**                   | vs ~5,870 per-batch rebuilds on the old path                              |
+| `sync()` = BuildKG + BuildNKG (5.87M edges)          | **550 s**                  | inherent index construction (BuildKG ~46s + BuildNKG ~180s + 2-hop stats) |
+| **Total**                                            | **~1,115 s (18.6 min)**    | full graph, ^KG + ^NKG built, 0 retries                                   |
 
 ### Old path — `bulk_create_edges(disable_indexes=True)` (deprecated for large loads)
 
@@ -56,19 +56,19 @@ held constant from first to last increment.
 **Honest note on SC-001**: the 8-minute target was an estimate; the **measured**
 full-load total is **18.6 min**, dominated by `sync()` (550s = BuildKG +
 BuildNKG, inherent index construction over 5.87M edges), not by load churn. The
-load *itself* is now smooth and resilient (findings 1 & 2 RESOLVED). Further
+load _itself_ is now smooth and resilient (findings 1 & 2 RESOLVED). Further
 total-time reduction would require accelerating `BuildNKG` (arno, or incremental
 ^NKG maintenance) — tracked separately, not a load-smoothness issue.
 
 ### Algorithm timing (5.5M–5.87M edge graph)
 
-| Algorithm | Path | Median time |
-|---|---|---|
-| `degree_centrality` | ^KG `$Order` walk | **0.89 s** ✅ |
-| `ClosenessGlobal` (harmonic, maxHops=2) | ^NKG server-side ObjectScript | **6.13 s** ✅ |
-| `EigenvectorGlobal` | ^NKG server-side | ❌ `<MAXSTRING>` — finding 5 |
-| `TriangleCountJson` | ^NKG + ^||ccAdj | CPU-bound >15 min (100% CPU) — finding 6 |
-| k-core / scc / leiden | ^NKG + ^||ccAdj | not measured (gated behind triangle on shared CPU) |
+| Algorithm                               | Path                          | Median time                  |
+| --------------------------------------- | ----------------------------- | ---------------------------- | ----- | -------------------------------------------------- |
+| `degree_centrality`                     | ^KG `$Order` walk             | **0.89 s** ✅                |
+| `ClosenessGlobal` (harmonic, maxHops=2) | ^NKG server-side ObjectScript | **6.13 s** ✅                |
+| `EigenvectorGlobal`                     | ^NKG server-side              | ❌ `<MAXSTRING>` — finding 5 |
+| `TriangleCountJson`                     | ^NKG + ^                      |                              | ccAdj | CPU-bound >15 min (100% CPU) — finding 6           |
+| k-core / scc / leiden                   | ^NKG + ^                      |                              | ccAdj | not measured (gated behind triangle on shared CPU) |
 
 `degree_centrality` (single `$Order` pass) and `ClosenessGlobal` (BFS bounded to
 maxHops=2) are tractable server-side at 5.5M edges. The full-graph
@@ -113,7 +113,7 @@ these use the server-side ObjectScript path instead — see findings 5 & 6.
 97K nodes the string exceeds IRIS's ~3.6 MB long-string limit → `<MAXSTRING>`.
 **Action (candidate spec)**: stream results to a `^||` global or chunk the JSON
 (the `StoreLargeOut`/`ReadLargeOutChunk` pattern already used by `KHopNeighbors`),
-or always honor `topK` truncation *before* building the string. (The Cypher path
+or always honor `topK` truncation _before_ building the string. (The Cypher path
 passes `topK`, so it is less exposed; the raw classmethod with large `topK` is.)
 
 **Finding 6 — triangle/community are CPU-bound on dense biomedical hubs.**
@@ -133,29 +133,30 @@ or a degree-capped/approximate variant for production scale.
 - **Known limits at 5.5M edges**: `EigenvectorGlobal` `<MAXSTRING>` (finding 5),
   triangle/community CPU-bound without arno (finding 6), bulk-load index strategy
   (finding 1, fixed), connection longevity (finding 2).
-- **Honest claim today**: *"IVG loads, indexes (^KG + ^NKG), and runs degree +
+- **Honest claim today**: _"IVG loads, indexes (^KG + ^NKG), and runs degree +
   closeness centrality on a 5.5M-edge biomedical KG server-side on a stock
   container. Eigenvector needs a large-result fix (finding 5); triangle/community
-  need the arno accelerator for dense-hub graphs (finding 6)."*
+  need the arno accelerator for dense-hub graphs (finding 6)."_
 - **Not yet validated**: full community/eigenvector timings at 5.5M edges (gated
   on findings 5 & 6); graphs beyond DRKG; arno-accelerated runs at this scale.
 
 ## Spec 185 — Incremental adjacency (toward Neo4j write-time-adjacency)
 
 **Goal**: eliminate the post-load `sync()` rebuild (BuildKG 213s + BuildNKG 187s)
-by maintaining `^KG`/`^NKG` *during* ingest, matching Neo4j's index-free
+by maintaining `^KG`/`^NKG` _during_ ingest, matching Neo4j's index-free
 adjacency model (storage IS the adjacency; no batch build phase).
 
 **Measured `sync()` breakdown (5.87M edges)** that motivated this:
 
-| sync sub-step | time | disposition |
-|---|---|---|
-| BuildKG (rebuild ^KG) | 213 s | redundant — WriteAdjacency writes ^KG inline per edge |
-| BuildNKG (rebuild ^NKG) | 187 s | avoidable — WriteAdjacency writes ^NKG inline when skeleton pre-initialized |
-| Build2HopStats | 2.9 s | cheap, kept |
-| Build2HopExactStats | >120 s | deferred (lazy fallback exists) |
+| sync sub-step           | time   | disposition                                                                 |
+| ----------------------- | ------ | --------------------------------------------------------------------------- |
+| BuildKG (rebuild ^KG)   | 213 s  | redundant — WriteAdjacency writes ^KG inline per edge                       |
+| BuildNKG (rebuild ^NKG) | 187 s  | avoidable — WriteAdjacency writes ^NKG inline when skeleton pre-initialized |
+| Build2HopStats          | 2.9 s  | cheap, kept                                                                 |
+| Build2HopExactStats     | >120 s | deferred (lazy fallback exists)                                             |
 
 **Mechanism — validated:**
+
 - `Graph.KG.Traversal.InitNKGSkeleton()` pre-creates `^NKG("$meta")` so
   `EdgeScan.WriteAdjacency`'s inline `^NKG` branch fires for every edge during
   ingest. **3-node parity test: incremental `^NKG` == batch `BuildNKG` exactly**
@@ -174,12 +175,12 @@ adjacency model (storage IS the adjacency; no batch build phase).
 session loaded the **full DRKG (97,238 nodes / 5,874,261 edges)** in
 **554.5 s (9.2 min)**, with **0 retries**:
 
-| Phase | spec 184 (rebuild) | spec 185 (incremental) |
-|---|---|---|
-| Edge ingest | 511 s | **510 s** (flat ~11.5K/s) |
-| SQL index rebuild (once) | 50 s | **37 s** |
-| `sync()` (BuildKG + BuildNKG + 2hop) | **550 s** | **2.85 s** (Build2HopStats only — BuildKG/BuildNKG SKIPPED) |
-| **Total** | **18.6 min** | **9.2 min** |
+| Phase                                | spec 184 (rebuild) | spec 185 (incremental)                                      |
+| ------------------------------------ | ------------------ | ----------------------------------------------------------- |
+| Edge ingest                          | 511 s              | **510 s** (flat ~11.5K/s)                                   |
+| SQL index rebuild (once)             | 50 s               | **37 s**                                                    |
+| `sync()` (BuildKG + BuildNKG + 2hop) | **550 s**          | **2.85 s** (Build2HopStats only — BuildKG/BuildNKG SKIPPED) |
+| **Total**                            | **18.6 min**       | **9.2 min**                                                 |
 
 The session's drift check confirmed `^NKG` was built inline (nodeCount 97,238 ==
 SQL distinct nodes 97,238) and skipped both batch rebuilds. **Parity verified**:
@@ -189,9 +190,9 @@ overhead dropped from 550s to 2.85s — IVG now pays adjacency cost per write, l
 Neo4j, not in a batch phase.
 
 **Neo4j comparison (corrected approach)**: with incremental adjacency, IVG now
-pays adjacency cost *per write* (like Neo4j's index-free adjacency) instead of in
+pays adjacency cost _per write_ (like Neo4j's index-free adjacency) instead of in
 a 400s post-load batch. The architectural gap to Neo4j on this axis is closed in
-*approach*; absolute per-edge cost (IVG ~11.5K edges/s incl. inline ^NKG vs
+_approach_; absolute per-edge cost (IVG ~11.5K edges/s incl. inline ^NKG vs
 Neo4j Bolt+UNWIND 10–60K rels/s) remains the tuning frontier.
 
 ## Head-to-head: IVG vs Neo4j GDS vs networkx
@@ -203,13 +204,13 @@ Correctness cross-checked via Pearson vs networkx. Neo4j 5.24.2 + GDS 2.12.0
 
 **Algorithm latency, ER(2000) = 2000 nodes / 9941 edges (ms):**
 
-| metric | networkx | IVG | Neo4j GDS | winner |
-|---|---|---|---|---|
-| degree | 0.2 | **8.6** | 26.7 | **IVG 3x** |
-| betweenness (k=200) | 441 | **55.7** | 184.4 | **IVG 3.3x** |
-| closeness | 1012 | 112.8 | **26.9** | GDS (IVG now 4.2x, was 25x) |
-| leiden | 141 | **132.8** | 281 | **IVG 2.1x** |
-| load | 0 (in-mem) | 12,065 | 3,126 | GDS (small-graph overhead) |
+| metric              | networkx   | IVG       | Neo4j GDS | winner                      |
+| ------------------- | ---------- | --------- | --------- | --------------------------- |
+| degree              | 0.2        | **8.6**   | 26.7      | **IVG 3x**                  |
+| betweenness (k=200) | 441        | **55.7**  | 184.4     | **IVG 3.3x**                |
+| closeness           | 1012       | 112.8     | **26.9**  | GDS (IVG now 4.2x, was 25x) |
+| leiden              | 141        | **132.8** | 281       | **IVG 2.1x**                |
+| load                | 0 (in-mem) | 12,065    | 3,126     | GDS (small-graph overhead)  |
 
 All IVG centrality results Pearson 1.000 vs networkx. IVG wins 3 of 5 metrics;
 closeness now within the 10x target; only small-graph load remains a clear loss.
@@ -219,6 +220,7 @@ networkx** — identical results to the reference and to GDS. IVG is fast AND
 correct on the centrality metrics it wins.
 
 **Honest read:**
+
 - **IVG wins degree + betweenness** vs GDS (8.5ms vs 49ms; 73ms vs 245ms) — the
   server-side `^NKG` path is genuinely fast, with identical answers.
 - **Closeness closed to 4.2x** (112ms vs GDS 27ms; was 855ms/25x) by routing
@@ -257,6 +259,7 @@ Leiden 3310ms → 154ms — from losing 6× to GDS to winning. The same pattern 
 server-side igraph harmonic_centrality took it 855ms -> 112ms (25x -> 4.2x vs GDS).
 
 **CPF flags worth setting (DRKG-scale, less impactful at 2K-node test scale):**
+
 - `[config] globals=0,0,0,0,0,0` — let IRIS auto-size the global buffer pool to
   25% of container RAM (the deploy `merge.conf` currently caps it at 256 MB,
   which starves the ^NKG working set on large graphs). Biggest CPF win for

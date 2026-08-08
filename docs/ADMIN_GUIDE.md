@@ -8,12 +8,12 @@ For the developer API reference, see [USER_GUIDE.md](USER_GUIDE.md).
 
 ## 1. Prerequisites
 
-| Requirement | Minimum | Recommended |
-|-------------|---------|-------------|
-| InterSystems IRIS | 2025.1 Community | 2026.1 Enterprise |
-| Python | 3.10 | 3.11+ |
-| Docker | 24+ | latest |
-| RAM | 4GB | 16GB+ (large graphs) |
+| Requirement       | Minimum          | Recommended          |
+| ----------------- | ---------------- | -------------------- |
+| InterSystems IRIS | 2025.1 Community | 2026.1 Enterprise    |
+| Python            | 3.10             | 3.11+                |
+| Docker            | 24+              | latest               |
+| RAM               | 4GB              | 16GB+ (large graphs) |
 
 Install the library:
 
@@ -72,22 +72,23 @@ engine.initialize_schema()
 
 **What it creates:**
 
-| Object | Purpose |
-|--------|---------|
-| `Graph_KG.nodes` | Node registry |
-| `Graph_KG.rdf_edges` | Edge store |
-| `Graph_KG.rdf_labels` | Node labels |
-| `Graph_KG.rdf_props` | Node properties |
-| `Graph_KG.kg_NodeEmbeddings` | HNSW vector index |
-| `Graph_KG.kg_EdgeEmbeddings` | Edge embeddings |
-| SQL stored procedures | `kg_KNN_VEC`, `kg_NEIGHBORS`, `kg_PPR`, etc. |
+| Object                       | Purpose                                      |
+| ---------------------------- | -------------------------------------------- |
+| `Graph_KG.nodes`             | Node registry                                |
+| `Graph_KG.rdf_edges`         | Edge store                                   |
+| `Graph_KG.rdf_labels`        | Node labels                                  |
+| `Graph_KG.rdf_props`         | Node properties                              |
+| `Graph_KG.kg_NodeEmbeddings` | HNSW vector index                            |
+| `Graph_KG.kg_EdgeEmbeddings` | Edge embeddings                              |
+| SQL stored procedures        | `kg_KNN_VEC`, `kg_NEIGHBORS`, `kg_PPR`, etc. |
 
 `initialize_schema()` is **idempotent** — safe to call on an existing deployment. It checks for each object before creating it.
 
 Re-run when:
+
 - Upgrading IVG to a new minor version
 - After restoring from a backup
-- If stored procedures are missing (symptom: Cypher CALL ivg.* returns errors)
+- If stored procedures are missing (symptom: Cypher CALL ivg.\* returns errors)
 
 ---
 
@@ -104,11 +105,13 @@ engine.rebuild_kg()    # ~8s for 500K edges
 ```
 
 Or from ObjectScript:
+
 ```objectscript
 Do ##class(Graph.KG.Traversal).BuildKG()
 ```
 
 Rebuild when:
+
 - After bulk-loading edges via `executemany` or direct SQL
 - After importing from NDJSON or RDF
 - After restoring `rdf_edges` from backup
@@ -122,11 +125,13 @@ engine.rebuild_nkg()   # ~15s for 500K edges
 ```
 
 Or from ObjectScript:
+
 ```objectscript
 Do ##class(Graph.KG.Traversal).BuildNKG()
 ```
 
 Rebuild when:
+
 - After `rebuild_kg()` (NKG is derived from KG)
 - If algorithm methods return `[]` unexpectedly
 
@@ -178,25 +183,25 @@ IVG_DISABLE_ARNO=1 python3 my_script.py
 
 ### Performance without accelerator
 
-| Algorithm | With accelerator | Without (OS parallel) |
-|-----------|-----------------|----------------------|
-| Betweenness sampled | ~8ms | ~500ms |
-| Leiden | ~60ms | ~2s |
-| Betweenness exact | ~43ms | ~5s |
+| Algorithm           | With accelerator | Without (OS parallel) |
+| ------------------- | ---------------- | --------------------- |
+| Betweenness sampled | ~8ms             | ~500ms                |
+| Leiden              | ~60ms            | ~2s                   |
+| Betweenness exact   | ~43ms            | ~5s                   |
 
 ---
 
 ## 6. Environment Variables
 
-| Variable | Type | Default | Purpose |
-|----------|------|---------|---------|
-| `IVG_TEST_PORT` | int | `1972` | IRIS superserver port for tests |
-| `IVG_DISABLE_ARNO` | `1`/unset | unset | Force ObjectScript fallback (no Rust accelerator) |
-| `IVG_ARNO_LIB` | path | `/usr/irissys/mgr/libarno_callout.so` | Path to accelerator library |
-| `IVG_SNAPSHOT_DIR` | path | `/tmp/ivg_snapshots` | Directory for `save_snapshot()` / `restore_snapshot()` |
-| `IVG_API_KEY` | string | unset | Bearer token for IVG HTTP server (spec 160) |
-| `IVG_URL` | URL | unset | Remote IVG server URL for SDK client mode |
-| `IVG_KEEP_CONTAINER` | `1`/unset | unset | Prevent test teardown from removing container |
+| Variable             | Type      | Default                               | Purpose                                                |
+| -------------------- | --------- | ------------------------------------- | ------------------------------------------------------ |
+| `IVG_TEST_PORT`      | int       | `1972`                                | IRIS superserver port for tests                        |
+| `IVG_DISABLE_ARNO`   | `1`/unset | unset                                 | Force ObjectScript fallback (no Rust accelerator)      |
+| `IVG_ARNO_LIB`       | path      | `/usr/irissys/mgr/libarno_callout.so` | Path to accelerator library                            |
+| `IVG_SNAPSHOT_DIR`   | path      | `/tmp/ivg_snapshots`                  | Directory for `save_snapshot()` / `restore_snapshot()` |
+| `IVG_API_KEY`        | string    | unset                                 | Bearer token for IVG HTTP server (spec 160)            |
+| `IVG_URL`            | URL       | unset                                 | Remote IVG server URL for SDK client mode              |
+| `IVG_KEEP_CONTAINER` | `1`/unset | unset                                 | Prevent test teardown from removing container          |
 
 ---
 
@@ -209,14 +214,14 @@ print(status)
 
 Key fields in the returned `EngineStatus` object:
 
-| Field | What it means |
-|-------|---------------|
-| `ready_for_bfs` | `^NKG` is built — algorithms will work |
-| `ready_for_vector_search` | HNSW index has embeddings |
-| `ready_for_full_text` | BM25 index is built |
-| `kg_edge_count` | Edges in `^KG` (should match SQL `rdf_edges` count) |
-| `nkg_node_count` | Nodes indexed in `^NKG` |
-| `adjacency.bfs_path` | `"arno"` = Rust accelerator active, `"objectscript"` = fallback |
+| Field                     | What it means                                                   |
+| ------------------------- | --------------------------------------------------------------- |
+| `ready_for_bfs`           | `^NKG` is built — algorithms will work                          |
+| `ready_for_vector_search` | HNSW index has embeddings                                       |
+| `ready_for_full_text`     | BM25 index is built                                             |
+| `kg_edge_count`           | Edges in `^KG` (should match SQL `rdf_edges` count)             |
+| `nkg_node_count`          | Nodes indexed in `^NKG`                                         |
+| `adjacency.bfs_path`      | `"arno"` = Rust accelerator active, `"objectscript"` = fallback |
 
 **Common problem**: `ready_for_bfs = False` means `rebuild_nkg()` was never called or failed silently (see Troubleshooting #4).
 
@@ -227,11 +232,13 @@ Key fields in the returned `EngineStatus` object:
 IVG data lives in two places:
 
 **SQL tables** (backed up by IRIS backup):
+
 - `Graph_KG.nodes`, `rdf_edges`, `rdf_labels`, `rdf_props`, `kg_NodeEmbeddings`
 
 **IRIS globals** (require global backup or export):
+
 - `^KG` — string adjacency index
-- `^NKG` — integer adjacency index  
+- `^NKG` — integer adjacency index
 - `^VecIdx` — VecIndex RP-tree
 - `^BM25Idx` — BM25 lexical index
 - `^PLAID` — PLAID multi-vector index

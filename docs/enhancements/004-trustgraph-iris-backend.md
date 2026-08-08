@@ -48,16 +48,16 @@ to IRIS via `IRISGraphEngine.create_node()` / `create_edge()`.
 **trustgraph_query.py** — Pulsar responder that handles SPO (Subject-Predicate-Object)
 triple queries against `Graph_KG.rdf_edges` with 8 wildcard combinations:
 
-| Pattern | SQL |
-|---------|-----|
+| Pattern     | SQL                            |
+| ----------- | ------------------------------ |
 | `(S, P, O)` | `WHERE s=? AND p=? AND o_id=?` |
-| `(S, P, *)` | `WHERE s=? AND p=?` |
-| `(S, *, O)` | `WHERE s=? AND o_id=?` |
-| `(*, P, O)` | `WHERE p=? AND o_id=?` |
-| `(S, *, *)` | `WHERE s=?` |
-| `(*, P, *)` | `WHERE p=?` |
-| `(*, *, O)` | `WHERE o_id=?` |
-| `(*, *, *)` | `SELECT * FROM rdf_edges` |
+| `(S, P, *)` | `WHERE s=? AND p=?`            |
+| `(S, *, O)` | `WHERE s=? AND o_id=?`         |
+| `(*, P, O)` | `WHERE p=? AND o_id=?`         |
+| `(S, *, *)` | `WHERE s=?`                    |
+| `(*, P, *)` | `WHERE p=?`                    |
+| `(*, *, O)` | `WHERE o_id=?`                 |
+| `(*, *, *)` | `SELECT * FROM rdf_edges`      |
 
 ### Dependencies
 
@@ -69,13 +69,13 @@ triple queries against `Graph_KG.rdf_edges` with 8 wildcard combinations:
 
 TrustGraph uses a scoped property graph model:
 
-| TrustGraph concept | IVG mapping |
-|-------------------|-------------|
+| TrustGraph concept                     | IVG mapping                                          |
+| -------------------------------------- | ---------------------------------------------------- |
 | Entity (user, collection, name, value) | `Graph_KG.nodes` with properties for user/collection |
-| Triple (s, p, o) | `Graph_KG.rdf_edges` (s, p, o_id) |
-| Entity class/type | `Graph_KG.rdf_labels` |
-| Entity value/description | `Graph_KG.rdf_props` |
-| Embeddings | `Graph_KG.kg_NodeEmbeddings` via `kg_KNN_VEC` |
+| Triple (s, p, o)                       | `Graph_KG.rdf_edges` (s, p, o_id)                    |
+| Entity class/type                      | `Graph_KG.rdf_labels`                                |
+| Entity value/description               | `Graph_KG.rdf_props`                                 |
+| Embeddings                             | `Graph_KG.kg_NodeEmbeddings` via `kg_KNN_VEC`        |
 
 The `user` and `collection` scoping from TrustGraph maps to node properties.
 This enables multi-tenant KG storage in a single IRIS namespace.
@@ -84,24 +84,24 @@ This enables multi-tenant KG storage in a single IRIS namespace.
 
 ## Implementation Estimate
 
-| Component | Lines | Time |
-|-----------|-------|------|
-| trustgraph_write.py | ~150 | 1h |
-| trustgraph_query.py (8 SPO patterns) | ~200 | 1.5h |
-| Docker compose (Pulsar + IVG services) | ~50 | 30min |
-| Testing (manual + integration) | — | 1h |
-| **Total** | ~400 | **4h** |
+| Component                              | Lines | Time   |
+| -------------------------------------- | ----- | ------ |
+| trustgraph_write.py                    | ~150  | 1h     |
+| trustgraph_query.py (8 SPO patterns)   | ~200  | 1.5h   |
+| Docker compose (Pulsar + IVG services) | ~50   | 30min  |
+| Testing (manual + integration)         | —     | 1h     |
+| **Total**                              | ~400  | **4h** |
 
 ---
 
 ## Where It Fits
 
-| Venue | Fit | Notes |
-|-------|-----|-------|
-| AIML75 Beat 4 (READY demo) | No | 12 min too tight, dilutes the coordination story |
-| Tech Exchange table | Yes | Short visual demo, 3D graph spinning, no time pressure |
-| AIML71 (Petrocelli RAG session) | Yes | GraphRAG + visualization fits naturally |
-| Community contribution | Yes | PR to trustgraph repo with IRIS backend |
+| Venue                           | Fit | Notes                                                  |
+| ------------------------------- | --- | ------------------------------------------------------ |
+| AIML75 Beat 4 (READY demo)      | No  | 12 min too tight, dilutes the coordination story       |
+| Tech Exchange table             | Yes | Short visual demo, 3D graph spinning, no time pressure |
+| AIML71 (Petrocelli RAG session) | Yes | GraphRAG + visualization fits naturally                |
+| Community contribution          | Yes | PR to trustgraph repo with IRIS backend                |
 
 ---
 

@@ -73,11 +73,11 @@ class VariableLength:
     all_shortest: bool = False
 
     def __post_init__(self):
-        if self.min_hops < 1:
-            raise ValueError("min_hops must be >= 1")
+        if self.min_hops < 0:
+            raise ValueError("min_hops must be >= 0")
         if self.max_hops < self.min_hops:
             raise ValueError("max_hops must be >= min_hops")
-        limit = 15 if (self.shortest or self.all_shortest) else 10
+        limit = 15 if (self.shortest or self.all_shortest) else 100
         if self.max_hops > limit:
             raise ValueError(f"max_hops must be <= {limit} (complexity limit)")
 
@@ -267,6 +267,9 @@ class WithClause:
     distinct: bool = False
     where_clause: Optional[WhereClause] = None
     star: bool = False
+    order_by_clause: Optional['OrderByClause'] = None
+    skip: Optional[Union[int, 'Variable']] = None
+    limit: Optional[Union[int, 'Variable']] = None
 
 
 @dataclass(slots=True)
@@ -406,7 +409,10 @@ class CypherProcedureCall:
 
     procedure_name: str
     arguments: List[Union[Literal, Variable, PropertyReference]]
-    yield_items: List[str] = field(default_factory=list)
+    # Each yield item is either a plain string (no alias) or a (original, alias) tuple.
+    yield_items: List[Union[str, tuple]] = field(default_factory=list)
+    yield_star: bool = False  # YIELD * — expand all output columns
+    implicit_args: bool = False  # Called without parentheses (implicit arg passing)
     options: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -430,6 +436,7 @@ class PatternComprehension:
     pattern: Any
     predicate: Optional[Any] = None
     projection: Optional[Any] = None
+    path_variable: Optional[str] = None
 
 
 @dataclass(slots=True)
@@ -454,6 +461,8 @@ class ExistsExpression:
     pattern: "GraphPattern"
     negated: bool = False
     where_condition: Optional[Any] = None
+    with_clause: Optional[Any] = None  # WithClause for full exists with aggregation
+    is_pattern_predicate: bool = False  # True when parsed as WHERE (n)-[r]->() predicate
 
 
 @dataclass(slots=True)

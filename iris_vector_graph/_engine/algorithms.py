@@ -2,7 +2,6 @@ import json
 import logging
 from typing import Dict, Any, List, Optional, Tuple, Callable
 
-from iris_vector_graph.cypher.translator import _table
 
 logger = logging.getLogger(__name__)
 
@@ -394,7 +393,7 @@ class AlgorithmsMixin:
             node_labels = parsed.get("labels", {})
             node_embeddings: Dict[str, Any] = {}
             if include_embeddings and nodes:
-                emb_table = _table("kg_NodeEmbeddings")
+                emb_table = self._t("kg_NodeEmbeddings")
                 cursor = self.conn.cursor()
                 phs = ",".join(["?"] * len(nodes))
                 cursor.execute(

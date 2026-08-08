@@ -134,12 +134,12 @@ twine upload dist/*
 
 ## Sign-off
 
-| Gate | Status | Notes |
-|------|--------|-------|
-| Tests pass | | |
-| Coverage ≥ 90% | | |
-| No benchmark regressions | | |
-| Lint clean | | |
-| ObjectScript compiles | | |
+| Gate                     | Status | Notes |
+| ------------------------ | ------ | ----- |
+| Tests pass               |        |       |
+| Coverage ≥ 90%           |        |       |
+| No benchmark regressions |        |       |
+| Lint clean               |        |       |
+| ObjectScript compiles    |        |       |
 
-Date: ___________  Release: v___________
+Date: ****\_\_\_**** Release: v****\_\_\_****

@@ -24,6 +24,7 @@ class TestNativeVecProbe:
         eng.embedding_dimension = 4
         eng._arno_available = None
         eng._arno_capabilities = {}
+        eng._schema_prefix = "Graph_KG"
         return eng
 
     def test_probe_returns_true_when_vector_cosine_works(self):

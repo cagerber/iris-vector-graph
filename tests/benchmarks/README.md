@@ -1,6 +1,7 @@
 # IVG Benchmark Suite (Spec 093)
 
 Repeatable benchmark harness measuring IVG traversal performance:
+
 - `ivg-os`: ObjectScript `BFSFastJson` over `^KG` globals
 - `ivg-arno`: Rust `NKGAccel.BFSJson` over `^NKG` integer adjacency (enterprise IRIS only)
 
@@ -41,9 +42,11 @@ Arno (Rust BFS via `NKGAccel.BFSJson`) requires enterprise IRIS with `libarno_ca
 deployed to the IRIS manager directory. Community IRIS reports `arno BFS not available`.
 
 To run with arno:
+
 ```bash
 IRIS_PORT=64780 conda run -n py312 python bench.py --datasets M --skip-load
 ```
+
 (assumes IVG classes and graph data already loaded in enterprise container)
 
 ## Output
@@ -54,14 +57,14 @@ JSON result files are gitignored.
 
 ## Query catalog
 
-| ID | Pattern | Engine path |
-|----|---------|-------------|
-| Q1 | 1-hop count (SQL MATCH) | IRISGraphEngine.execute_cypher |
-| Q2 | 2-hop BFS, DISTINCT nodes | BFSFastJson / NKGAccel.BFSJson |
-| Q3 | 3-hop BFS | same |
-| Q4 | 4-hop BFS | same (MAXSTRING risk on M+) |
-| Q5 | shortestPath (unweighted BFS) | ShortestPathJson |
-| Q6 | weighted shortestPath (Dijkstra) | ivg.shortestPath.weighted |
+| ID  | Pattern                          | Engine path                    |
+| --- | -------------------------------- | ------------------------------ |
+| Q1  | 1-hop count (SQL MATCH)          | IRISGraphEngine.execute_cypher |
+| Q2  | 2-hop BFS, DISTINCT nodes        | BFSFastJson / NKGAccel.BFSJson |
+| Q3  | 3-hop BFS                        | same                           |
+| Q4  | 4-hop BFS                        | same (MAXSTRING risk on M+)    |
+| Q5  | shortestPath (unweighted BFS)    | ShortestPathJson               |
+| Q6  | weighted shortestPath (Dijkstra) | ivg.shortestPath.weighted      |
 
 ## Known limitations
 

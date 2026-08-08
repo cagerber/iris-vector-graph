@@ -11,9 +11,14 @@
 #
 # Constitution Principle IV grounding:
 #   Container: ivg-iris-enterprise  (Registry: iris-vector-graph-enterprise entry)
-#   Port:      31972 host → 1972 container
+#   Port:      31972 host → 1972 container (direct, not used from macOS)
+#   Proxy:     31971 host → 19721 container → socat → 127.0.0.1:1972 (use this from macOS)
 #   .so:       docker/enterprise/libarno_callout.so → /tmp/libarno_callout.so inside container
 #   Verified against docker/enterprise/docker-compose.yml and lab_manager registry.
+#
+# macOS Docker Desktop NAT: IRIS 2026.3.0AI RSTs connections from non-loopback source IPs.
+# Docker Desktop NAT changes source IP from 127.0.0.1 to a bridge IP, so direct port 31972
+# connections get RST. The socat proxy inside the container forwards from 127.0.0.1 (trusted).
 
 set -euo pipefail
 
@@ -40,26 +45,29 @@ case "$cmd" in
       sleep 5
     done
     "$0" deploy
+    echo "Installing and starting socat proxy (macOS Docker Desktop NAT workaround)..."
+    docker exec -u root "$CONTAINER" bash -c 'apt-get update -qq && apt-get install -y socat -q 2>&1 | tail -1'
+    docker exec -u root -d "$CONTAINER" socat TCP-LISTEN:19721,fork,reuseaddr,bind=0.0.0.0 TCP4:127.0.0.1:1972
+    sleep 1
+    echo "  Fixing %Service_Bindings auth (AutheEnabled=48)..."
+    docker exec "$CONTAINER" /usr/irissys/bin/irispython - << 'PYEOF' 2>/dev/null
+import iris
+obj = iris.cls("Security.Services")._OpenId("%service_bindings")
+obj.AutheEnabledCapabilities = 141429
+obj.AutheEnabled = 48
+obj._Save()
+print(f"  AutheEnabled={obj.AutheEnabled} Cap={obj.AutheEnabledCapabilities}")
+PYEOF
     echo "Initializing schema..."
     python3 -c "
-import subprocess, iris
-ip = subprocess.run(['docker','inspect','$CONTAINER','--format',
-    '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'],
-    capture_output=True, text=True).stdout.strip()
-conn = None
-if ip:
-    try:
-        conn = iris.connect(hostname=ip, port=1972, namespace='USER', username='_SYSTEM', password='SYS')
-    except Exception:
-        conn = None
-if conn is None:
-    # Container IP not routable from host (macOS Docker Desktop/OrbStack) —
-    # fall back to the published port on localhost, same as tests/conftest.py.
-    try:
-        conn = iris.connect(hostname='localhost', port=31972, namespace='USER', username='_SYSTEM', password='SYS')
-    except Exception:
-        from iris_devtester import IRISContainer as C
-        c = C.attach('$CONTAINER'); c._connection = None; conn = c.get_connection()
+import iris, socket
+# OrbStack: {container}.orb.local gives a host-routable IP for direct :1972 access.
+# Fallback: socat proxy port 31971 (legacy macOS Docker Desktop NAT workaround).
+try:
+    _orb_ip = socket.gethostbyname('$CONTAINER.orb.local')
+    conn = iris.connect(hostname=_orb_ip, port=1972, namespace='USER', username='_SYSTEM', password='SYS')
+except Exception:
+    conn = iris.connect(hostname='localhost', port=31971, namespace='USER', username='_SYSTEM', password='SYS')
 from iris_vector_graph import IRISGraphEngine
 # 768 matches schema.py's own default (get_base_schema_sql) and what most of
 # the e2e/integration suite assumes for kg_NodeEmbeddings' VECTOR dimension.
@@ -69,7 +77,7 @@ print('✓ schema initialized')
     echo "Deploying and compiling ObjectScript via TCP..."
     # The HealthShare enterprise image has a dual-database split: iris session -U USER
     # routes ^%Dictionary* globals to IRISSYS while TCP connections use the USER IRIS.DAT.
-    # Classes must be deployed via TCP to be visible to test connections on port 31972.
+    # Classes must be deployed via TCP to be visible to test connections (via socat proxy).
     "$0" tcp-deploy 2>&1 | grep -iE 'ERROR|deployed|failed'
     echo "Loading libarno_callout.so via TCP..."
     "$0" tcp-load-arno 2>&1 | grep -iE 'ERROR|loaded|failed'
@@ -87,16 +95,13 @@ print('✓ schema initialized')
     if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
       echo "$CONTAINER	$(docker ps --filter "name=$CONTAINER" --format '{{.Status}}')"
       python3 -c "
-import subprocess, iris, json
-ip = subprocess.run(['docker','inspect','$CONTAINER','--format',
-    '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'],
-    capture_output=True, text=True).stdout.strip()
+import subprocess, iris, json, socket
 try:
-    if ip:
-        conn = iris.connect(hostname=ip, port=1972, namespace='USER', username='_SYSTEM', password='SYS')
-    else:
-        from iris_devtester import IRISContainer as C
-        c = C.attach('$CONTAINER'); c._connection = None; conn = c.get_connection()
+    try:
+        _orb_ip = socket.gethostbyname('$CONTAINER.orb.local')
+        conn = iris.connect(hostname=_orb_ip, port=1972, namespace='USER', username='_SYSTEM', password='SYS')
+    except Exception:
+        conn = iris.connect(hostname='localhost', port=31971, namespace='USER', username='_SYSTEM', password='SYS')
     irisobj = iris.createIRIS(conn)
     # Load arno to get accurate rust_callout status
     try: irisobj.classMethodValue('Graph.KG.ArnoAccel', 'Load', '/tmp/libarno_callout.so')
@@ -147,21 +152,27 @@ PYEOF
 
   tcp-deploy)
     # Deploy all ObjectScript classes via TCP connection so they are visible to
-    # TCP test connections (port 31972). The HealthShare enterprise image routes
-    # ^%Dictionary* globals differently for iris session vs TCP, so classes must
-    # be compiled via TCP to be seen by external iris.connect() calls.
+    # TCP test connections. The HealthShare enterprise image routes ^%Dictionary*
+    # globals differently for iris session vs TCP, so classes must be compiled
+    # via TCP to be seen by external iris.connect() calls.
     python3 - << 'PYEOF'
-import iris, os, glob, sys
+import iris, os, glob, sys, socket
 
-port = int(os.environ.get("IVG_PORT", "31972"))
+port = int(os.environ.get("IVG_PORT", "31971"))
 container = os.environ.get("IVG_ARNO_CONTAINER", "ivg-iris-enterprise")
 
+# OrbStack: use direct :1972 via {container}.orb.local
 try:
-    conn = iris.connect(hostname="localhost", port=port, namespace="USER",
+    _orb_ip = socket.gethostbyname(f"{container}.orb.local")
+    conn = iris.connect(hostname=_orb_ip, port=1972, namespace="USER",
                         username="_SYSTEM", password="SYS")
-except Exception as e:
-    print(f"TCP connect failed (port {port}): {e}", file=sys.stderr)
-    sys.exit(1)
+except Exception:
+    try:
+        conn = iris.connect(hostname="localhost", port=port, namespace="USER",
+                            username="_SYSTEM", password="SYS")
+    except Exception as e:
+        print(f"TCP connect failed (port {port}): {e}", file=sys.stderr)
+        sys.exit(1)
 
 irisobj = iris.createIRIS(conn)
 cls_files = sorted(glob.glob("iris_src/src/**/*.cls", recursive=True))
@@ -198,17 +209,23 @@ PYEOF
     # Load libarno_callout.so via TCP — the .so is a Docker volume mount not
     # visible to TCP IRIS sessions, so we write it via TCP's %Stream.FileBinary.
     python3 - << 'PYEOF'
-import iris, os, json, sys
+import iris, os, json, sys, socket
 
-port = int(os.environ.get("IVG_PORT", "31972"))
+port = int(os.environ.get("IVG_PORT", "31971"))
 so_path = "docker/enterprise/libarno_callout.so"
 
 if not os.path.exists(so_path):
     print(f"tcp-load-arno: {so_path} not found", file=sys.stderr)
     sys.exit(1)
 
-conn = iris.connect(hostname="localhost", port=port, namespace="USER",
-                    username="_SYSTEM", password="SYS")
+container = os.environ.get("IVG_ARNO_CONTAINER", "ivg-iris-enterprise")
+try:
+    _orb_ip = socket.gethostbyname(f"{container}.orb.local")
+    conn = iris.connect(hostname=_orb_ip, port=1972, namespace="USER",
+                        username="_SYSTEM", password="SYS")
+except Exception:
+    conn = iris.connect(hostname="localhost", port=port, namespace="USER",
+                        username="_SYSTEM", password="SYS")
 irisobj = iris.createIRIS(conn)
 
 with open(so_path, "rb") as f:

@@ -300,6 +300,7 @@ Sample items:
 **STOP AFTER THIS COMMAND COMPLETES.**
 
 Do NOT proceed to:
+
 - Running other speckit commands
 - Implementation or code changes
 - Any follow-up actions or "next steps"

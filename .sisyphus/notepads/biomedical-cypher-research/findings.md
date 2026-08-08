@@ -1,9 +1,11 @@
 # Biomedical Cypher Query Patterns — Research Findings
 
 ## Research Date
+
 March 31, 2026
 
 ## Sources Reviewed
+
 1. **HetioNet v1.0** — Neo4j database with 47,031 nodes (11 types) and 2.25M edges (24 types)
 2. **SPOKE** (Scalable Precision Medicine Open Knowledge Engine) — 27M nodes, 53M edges, 21 node types
 3. **Project Rephetio** — Drug repurposing metapath analysis
@@ -16,9 +18,11 @@ March 31, 2026
 ## 1. COMMON CYPHER PATTERNS BEYOND BASIC MATCH/WHERE/RETURN
 
 ### 1.1 Metapath Queries (Multi-hop, Typed Relationships)
+
 **Pattern**: Multi-relationship paths with semantic meaning in biomedical context.
 
 **Example — Drug-Gene-Disease path** (HetioNet):
+
 ```cypher
 // Find drugs targeting genes associated with a disease
 MATCH path = (d:Drug)-[:TARGETS]-(g:Gene)-[:ASSOCIATES]-(dis:Disease)
@@ -27,6 +31,7 @@ RETURN path
 ```
 
 **Example — Extended metapath with gene interactions** (HetioNet, MS genes):
+
 ```cypher
 // Disease → GWAS Gene → Protein Interaction → Gene → BiologicalProcess
 MATCH path = (n0:Disease)-[e1:ASSOCIATES_DaG]-(n1)-[:INTERACTS_GiG]-(n2)-[:PARTICIPATES_GpBP]-(n3:BiologicalProcess)
@@ -36,12 +41,14 @@ WHERE n0.name = 'multiple sclerosis'
 RETURN path
 ```
 
-**Evidence**: https://think-lab.github.io/d/220/ (Himmelstein, HetioNet Cypher depot, 2016)
+**Evidence**: <https://think-lab.github.io/d/220/> (Himmelstein, HetioNet Cypher depot, 2016)
 
 ### 1.2 Degree-Weighted Path Count (DWPC) — Path Scoring with Node Normalization
+
 **Pattern**: Aggregate paths with degree weighting to reduce bias from hub nodes.
 
 **Core technique**:
+
 ```cypher
 WITH
   [
@@ -56,6 +63,7 @@ WITH
 ```
 
 **Full example — GO Process enrichment for migraine**:
+
 ```cypher
 MATCH path = (n0:Disease)-[:ASSOCIATES_DaG]-(n1)-[:PARTICIPATES_GpBP]-(n2:BiologicalProcess)
 WHERE n0.name = 'migraine'
@@ -76,10 +84,11 @@ RETURN go_id, go_name, PC, DWPC, n_genes ORDER BY DWPC DESC LIMIT 5
 
 **Why used**: Raw path counts bias toward highly-connected nodes; DWPC downweights popular nodes and rewards specificity.
 
-**Evidence**: https://neo4j.graphgists.com/drug-repurposing-by-hetnet-relationship-prediction-a-new-hope/ 
+**Evidence**: <https://neo4j.graphgists.com/drug-repurposing-by-hetnet-relationship-prediction-a-new-hope/>
 Source: Himmelstein et al. (eLife 2017) "Systematic integration of biomedical knowledge prioritizes drugs for repurposing"
 
 ### 1.3 EXISTS Pattern Predicates — Conditional Path Existence
+
 **Pattern**: Filter paths based on whether related patterns exist (not necessarily on the main path).
 
 ```cypher
@@ -89,6 +98,7 @@ WHERE exists((n0)-[:LOCALIZES_DlA]-()-[:UPREGULATES_AuG]-(n2))
 This checks if the disease localizes to anatomy that upregulates the intermediate gene — without including those nodes in the main result.
 
 **Another example — Drug-side effect relationship**:
+
 ```cypher
 WHERE exists((n1:Compound)-[:CAUSES]-(n3:SideEffect)-[:CAUSES]-(n2:Compound))
   AND n1 <> n2
@@ -97,6 +107,7 @@ WHERE exists((n1:Compound)-[:CAUSES]-(n3:SideEffect)-[:CAUSES]-(n2:Compound))
 **Evidence**: Used throughout HetioNet queries; now standard Cypher 5.0+ syntax.
 
 ### 1.4 OPTIONAL MATCH with Cardinality Counting
+
 **Pattern**: Left-outer-join style queries; count relationships even when zero.
 
 ```cypher
@@ -112,12 +123,14 @@ ORDER BY path_count DESC, treatment DESC
 
 **Use**: Compare drug-disease pairs with and without supporting paths (drug repurposing candidates).
 
-**Evidence**: Neo4j GraphGist - Drug Repurposing (https://neo4j.graphgists.com)
+**Evidence**: Neo4j GraphGist - Drug Repurposing (<https://neo4j.graphgists.com>)
 
 ### 1.5 UNION Queries — Multi-Source Integration
+
 **Pattern**: Combine results from different relationship types or node categories.
 
 **Biomedical example** (Clinical genome resource / SPOKE integration):
+
 ```cypher
 MATCH (c:Compound)-[:BINDS_CbG]-(g:Gene)
 WHERE c.name = 'aspirin'
@@ -131,6 +144,7 @@ RETURN g.name AS target, 'transcriptional_upregulation' AS mechanism
 **Use**: Combine multiple types of evidence (protein binding, gene regulation, pathway participation).
 
 ### 1.6 COLLECT / UNWIND for Aggregation
+
 **Pattern**: Group multiple results and then expand them.
 
 ```cypher
@@ -147,7 +161,7 @@ RETURN d.name AS disease, gp.gene, gp.process
 
 ## 2. CYPHER FEATURES MOST USED IN BIOMEDICAL COMMUNITY
 
-### Ranked by frequency in published queries (2016–2026):
+### Ranked by frequency in published queries (2016–2026)
 
 1. **Variable-length paths** — `[:TYPE*1..5]` or `[:TYPE*]`
    - Finding multi-hop disease mechanisms
@@ -178,12 +192,15 @@ RETURN d.name AS disease, gp.gene, gp.process
 ## 3. GRAPH ALGORITHMS COMMONLY APPLIED TO BIOMEDICAL KGs
 
 ### 3.1 Shortest Path & All-Shortest-Paths
+
 **Use cases**:
+
 - Drug-disease connectivity (minimum hops)
 - Mechanism of action via gene networks
 - Patient similarity paths
 
 **Cypher**:
+
 ```cypher
 MATCH (start:Drug {name: 'Aspirin'}), (end:Disease {name: 'arthritis'})
 MATCH path = shortestPath((start)-[*..6]-(end))
@@ -193,12 +210,15 @@ RETURN path
 **Why**: Shortest metapaths often encode primary mechanisms; longer paths = indirect/secondary effects.
 
 ### 3.2 K-Shortest Paths (Yen's Algorithm)
+
 **Use cases**:
+
 - Diverse mechanisms (top-K pathways)
 - Explainability (show multiple reasoning chains)
 - Multi-path drug efficacy scoring
 
 **APOC procedure**:
+
 ```cypher
 CALL apoc.algo.allShortestPaths(startNode, endNode, 'RELATIONSHIP', 3)
 YIELD path
@@ -206,24 +226,29 @@ RETURN path
 ```
 
 **Recent innovation (Feb 2025)**: **K-Paths framework** (arXiv:2502.13344)
+
 - Uses diversity-aware Yen's algorithm
 - Generates K diverse (not just K similar-length) shortest paths
 - Feeds paths to LLMs for explainable predictions
 - Reduces computation by 90% vs. full KG traversal
 
 **Results**: Llama 70B F1 scores:
+
 - Drug repurposing: +6.2 points
 - Drug-drug interaction: +8.5 points
 
-**Source**: https://arxiv.org/pdf/2502.13344v2.pdf
+**Source**: <https://arxiv.org/pdf/2502.13344v2.pdf>
 
 ### 3.3 Community Detection (Louvain, Label Propagation)
+
 **Use cases**:
+
 - Disease gene modules (subgraph clustering)
 - Drug similarity clusters (side effect grouping)
 - Tissue-specific network communities
 
 **GDS procedure** (Neo4j Graph Data Science):
+
 ```cypher
 CALL gds.louvain.stream(graphName, {
   includeIntermediateCommunities: false
@@ -235,17 +260,21 @@ RETURN nodeId, communityId
 **Biomedical example**: Identify genes co-regulated in same disease subtype.
 
 **APOC alternative** (Community Edition):
+
 ```cypher
 CALL apoc.algo.community(numIterations, null, 'partition', 'RELATIONSHIP', 'OUTGOING', 'weight')
 ```
 
 ### 3.4 Centrality Algorithms (Betweenness, Pagerank, Closeness)
+
 **Use cases**:
+
 - **Betweenness centrality**: Identify "hub" genes / drugs (high influence on pathways)
 - **PageRank**: Drug target prioritization (importance in gene network)
 - **Closeness**: Genes central to disease mechanism
 
 **GDS Betweenness**:
+
 ```cypher
 CALL gds.betweenness.stream(graphName)
 YIELD nodeId, score
@@ -255,14 +284,17 @@ RETURN nodeId, score ORDER BY score DESC
 **Biomedical application**: Top betweenness nodes in protein-interaction networks often encode known drug targets.
 
 ### 3.5 Link Prediction (Similarity Algorithms)
+
 **Biomedical use**: Predict missing drug-disease relationships.
 
 **Common similarity metrics**:
+
 - **Jaccard**: Common neighbors / (union of neighbors)
 - **Adamic-Adar**: Weighted common neighbors (favor rare neighbors)
 - **Common Neighbors**: Direct overlap in 1-hop neighborhoods
 
 **Cypher example (Jaccard)**:
+
 ```cypher
 MATCH (d1:Drug)-[:BINDS]-(g1:Gene)
 MATCH (d2:Drug)-[:BINDS]-(g2:Gene)
@@ -277,14 +309,17 @@ ORDER BY jaccard_similarity DESC
 **Newer approach**: Graph embeddings (TransE, DistMul, RotatE) trained on KG triples, then use embedding similarity for link prediction.
 
 ### 3.6 Metapath-Based Reasoning
+
 **Pattern**: Learn which metapath types predict relationships (e.g., drug treatment).
 
 **Principle**:
+
 - Count path types between known drug-disease treatment pairs
 - Identify which metapath types occur more in true treatments vs. random pairs
 - Use top-scoring metapaths for new predictions
 
 **Example metapaths** (HetioNet):
+
 - `DrugTargetsGeneCausesDisease` — Direct target mechanism
 - `DrugRegulatesGeneInteractsGeneAssociatesDisease` — Network neighborhood
 - `DrugCausesSideEffectCausesCompoundTreatsDisease` — Side effect similarity
@@ -298,6 +333,7 @@ ORDER BY jaccard_similarity DESC
 ## 4. SPECIFIC QUERY PATTERNS FOR BIOMEDICAL APPLICATIONS
 
 ### 4.1 Drug Repurposing — Finding New Indications
+
 **Goal**: Predict drugs that could treat disease X (beyond known treatment).
 
 **Approach**: Find drugs whose target genes / side-effect profiles match disease:
@@ -322,6 +358,7 @@ RETURN candidate_drug.name, target_disease.name
 **Evidence**: Neo4j GraphGist - Rephetio; SPOKE neighborhood explorer.
 
 ### 4.2 Disease Mechanism Analysis — Tissue-Specific Gene Networks
+
 **Goal**: Identify biological processes driving disease in relevant tissue.
 
 ```cypher
@@ -341,6 +378,7 @@ ORDER BY process.name
 **Evidence**: HetioNet query depot; Thinklab discussion d/220
 
 ### 4.3 Patient Similarity — Genomic / Phenotypic Paths
+
 **Goal**: Find similar patients for cohort studies / personalized medicine.
 
 ```cypher
@@ -356,6 +394,7 @@ ORDER BY similarity_score DESC
 (Note: Clinical genome resource / SPOKE variants not yet fully deployed in public instances; pattern from publications.)
 
 ### 4.4 Drug-Target Network — Finding Off-Targets (Safety Concern)
+
 **Goal**: Identify unintended protein targets (could cause side effects).
 
 ```cypher
@@ -372,6 +411,7 @@ RETURN drug.name, gene.name, process.name, other_gene.name, side_effect_disease.
 ## 5. CONCRETE EXAMPLES FROM MAJOR BIOMEDICAL KGs
 
 ### 5.1 HetioNet (Neo4j.het.io)
+
 **Graph**: 47K nodes, 2.25M edges, 11 node types, 24 edge types
 
 **Sample queries from published results**:
@@ -386,14 +426,16 @@ RETURN drug.name, gene.name, process.name, other_gene.name, side_effect_disease.
    - Result: Identified NR3C1 (glucocorticoid receptor) as cause of Cushingoid
    - Confirmed in 2012 study as top predicted target
 
-**Source**: https://think-lab.github.io/d/220/
+**Source**: <https://think-lab.github.io/d/220/>
 
 ### 5.2 SPOKE (spoke.ucsf.edu)
+
 **Graph**: 27M nodes, 53M edges, 21 node types, 55 edge types, from 41 databases
 
 **Query interface**: REST API (not direct Cypher, but supports pathway queries)
 
 **Sample applications**:
+
 - Drug repurposing (compound → protein → disease)
 - Gene function annotation (gene → pathway → function)
 - Synthetic lethality prediction
@@ -402,9 +444,11 @@ RETURN drug.name, gene.name, process.name, other_gene.name, side_effect_disease.
 **Notable paper**: Morris et al., Bioinformatics 2023 — SPOKE metagraph design; real-world applications.
 
 ### 5.3 K-Paths Framework (2025)
+
 **Algorithm**: Diversity-aware Yen's K-shortest paths + LLM reasoning
 
 **Example (drug repurposing)**:
+
 ```
 Query: Connect Drug(imatinib) → Disease(acute lymphoblastic leukemia)
 K-Paths output: [
@@ -417,7 +461,7 @@ LLM: "Imatinib treats ALL via tyrosine kinase inhibition (ABL1, SRC)"
 
 **Performance**: 90% reduction in KG size while maintaining prediction accuracy.
 
-**Source**: https://arxiv.org/abs/2502.13344
+**Source**: <https://arxiv.org/abs/2502.13344>
 
 ---
 
@@ -468,15 +512,14 @@ LLM: "Imatinib treats ALL via tyrosine kinase inhibition (ABL1, SRC)"
    - Diversity-aware Yen's algorithm; LLM integration; 90% KG reduction.
 
 4. Neo4j GraphGists — Drug Repurposing (Himmelstein, 2016)
-   - https://neo4j.graphgists.com/drug-repurposing-by-hetnet-relationship-prediction-a-new-hope/
+   - <https://neo4j.graphgists.com/drug-repurposing-by-hetnet-relationship-prediction-a-new-hope/>
 
 5. Thinklab Cypher Query Depot (Himmelstein, 2016)
-   - https://think-lab.github.io/d/220/
+   - <https://think-lab.github.io/d/220/>
    - HetioNet Cypher examples; GO enrichment; MS gene networks.
 
 6. K-Paths arxiv (full paper)
-   - https://www.arxiv.org/pdf/2502.13344v2.pdf
+   - <https://www.arxiv.org/pdf/2502.13344v2.pdf>
 
 7. Neo4j APOC Documentation
-   - https://neo4j-contrib.github.io/neo4j-apoc-procedures/
-
+   - <https://neo4j-contrib.github.io/neo4j-apoc-procedures/>

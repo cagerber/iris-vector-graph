@@ -48,7 +48,7 @@ result = engine.leiden_communities(
   `Q = Σ_c [e_c/m - γ*(Σ_c/(2m))²]`. Hits the well-known modularity
   resolution limit on small graphs.
 - `gamma != 1.0`: **CPM** (Constant Potts Model) quality. `H = Σ_c [e_c -
-  γ*n_c*(n_c-1)/2]`. Avoids resolution limit; lower γ → larger communities,
+γ*n_c*(n_c-1)/2]`. Avoids resolution limit; lower γ → larger communities,
   higher γ → smaller communities.
 
 #### Reproducibility
@@ -150,12 +150,12 @@ extensions.
 The CI suite enforces algorithmic agreement with `networkx` reference
 implementations on a 100-node Erdős-Rényi fixture (seed=42):
 
-| Algorithm | Threshold | Reference |
-|---|---|---|
-| Leiden | ARI > 0.30 vs `nx.community.louvain_communities` | (Louvain, not Leiden — looser threshold) |
-| Triangle Count | Pearson > 0.95 with `nx.triangles` | exact algorithm match expected |
-| SCC | exact set-equality with `nx.strongly_connected_components` | both Tarjan-equivalent |
-| K-Core | exact per-node match with `nx.core_number` | both Batagelj-Zaversnik |
+| Algorithm      | Threshold                                                  | Reference                                |
+| -------------- | ---------------------------------------------------------- | ---------------------------------------- |
+| Leiden         | ARI > 0.30 vs `nx.community.louvain_communities`           | (Louvain, not Leiden — looser threshold) |
+| Triangle Count | Pearson > 0.95 with `nx.triangles`                         | exact algorithm match expected           |
+| SCC            | exact set-equality with `nx.strongly_connected_components` | both Tarjan-equivalent                   |
+| K-Core         | exact per-node match with `nx.core_number`                 | both Batagelj-Zaversnik                  |
 
 Plus: **Leiden ARI=1.0 on Zachary's karate club** vs `leidenalg` direct
 (identical 4-community partition at γ=1.0). The arno path's `leiden-rs`
@@ -180,22 +180,22 @@ assertion** in v1.99.0:
 
 ### Apples-to-apples Modularity Leiden (γ=1.0) — head-to-head with Neo4j GDS
 
-| Fixture | IVG total | IVG kernel-only | networkx Louvain | igraph Leiden | Neo4j GDS |
-|---|---|---|---|---|---|
-| Karate (34n, 78e) | **96ms** | <1ms | 1ms | 3ms | 115ms |
-| ER(500, 2437e) | **6ms** | 3ms | 24ms | 79ms | 206ms |
-| ER(2000, 9941e) | **60ms** | 55ms | 152ms | 369ms | 60ms |
+| Fixture           | IVG total | IVG kernel-only | networkx Louvain | igraph Leiden | Neo4j GDS |
+| ----------------- | --------- | --------------- | ---------------- | ------------- | --------- |
+| Karate (34n, 78e) | **96ms**  | <1ms            | 1ms              | 3ms           | 115ms     |
+| ER(500, 2437e)    | **6ms**   | 3ms             | 24ms             | 79ms          | 206ms     |
+| ER(2000, 9941e)   | **60ms**  | 55ms            | 152ms            | 369ms         | 60ms      |
 
 Quality: IVG ≡ leidenalg/igraph direct (ARI=1.0); IVG ≡ Neo4j GDS (ARI=0.898).
 
 ### NFR upper-bound gates (per spec.md)
 
-| NFR | Gate | Actual |
-|---|---|---|
+| NFR     | Gate                        | Actual                   |
+| ------- | --------------------------- | ------------------------ |
 | NFR-001 | Triangle Count <30s on 100K | 351ms on 10K (40K edges) |
-| NFR-002 | SCC <60s on 1M | 88ms on 10K |
-| NFR-003 | K-Core <60s on 1M | 65ms on 10K |
-| NFR-004 | Leiden <60s on 100K | 346ms on 10K |
+| NFR-002 | SCC <60s on 1M              | 88ms on 10K              |
+| NFR-003 | K-Core <60s on 1M           | 65ms on 10K              |
+| NFR-004 | Leiden <60s on 100K         | 346ms on 10K             |
 
 The actual fixture in `tests/e2e/test_communities_perf.py` is downscaled to
 10K nodes for CI feasibility; the production gate is 100× headroom.

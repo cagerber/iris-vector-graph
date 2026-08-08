@@ -1049,3 +1049,74 @@ class TestMultiLabelNodes:
     def test_label_in_where(self):
         sql = _sql("MATCH (n) WHERE n:Person RETURN n.node_id")
         assert sql
+
+
+# ===========================================================================
+# MERGE SELECT semantics — label/property-based lookup, not UUID-based
+# ===========================================================================
+
+class TestMergeSelectSemantics:
+    """translate_merge_clause must generate a SELECT that finds the matching
+    node by label/property rather than by the freshly-generated UUID used in
+    the idempotent INSERT.  If it used the UUID, an existing node would never
+    be found and RETURN clauses would produce NULL.
+    """
+
+    def _full_result(self, cypher, params=None):
+        ast = parse_query(cypher)
+        from iris_vector_graph.cypher.translator import translate_to_sql
+        return translate_to_sql(ast, params or {})
+
+    def test_merge_label_only_select_uses_label_join_not_uuid(self):
+        """MERGE (a:TheLabel) — SELECT must JOIN rdf_labels, not WHERE node_id=<uuid>."""
+        import re
+        r = self._full_result("MERGE (a:TheLabel) RETURN a.node_id")
+        # Find the SELECT statement (last entry in the sql list)
+        sqls = r.sql if isinstance(r.sql, list) else [r.sql]
+        select_sql = next((s for s in sqls if s.strip().upper().startswith("SELECT")), None)
+        assert select_sql is not None, "No SELECT statement generated"
+        # Must contain a rdf_labels JOIN
+        assert "rdf_labels" in select_sql, "SELECT should JOIN rdf_labels for label-based MERGE"
+        # Must NOT contain a raw UUID WHERE clause (UUID pattern in SELECT SQL)
+        uuid_re = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+        assert not uuid_re.search(select_sql), \
+            "SELECT must not hard-code the generated UUID; it must find existing nodes"
+
+    def test_merge_with_property_select_uses_label_and_prop_join(self):
+        """MERGE (n:Gene {name: 'TP53'}) — SELECT must JOIN both rdf_labels and rdf_props."""
+        r = self._full_result("MERGE (n:Gene {name: 'TP53'}) RETURN n.node_id")
+        sqls = r.sql if isinstance(r.sql, list) else [r.sql]
+        select_sql = next((s for s in sqls if s.strip().upper().startswith("SELECT")), None)
+        assert select_sql is not None
+        assert "rdf_labels" in select_sql, "SELECT should JOIN rdf_labels"
+        assert "rdf_props" in select_sql, "SELECT should JOIN rdf_props for property filter"
+        # Label value and property key/value must appear in SELECT params (not DML params)
+        select_params = r.parameters[-1] if isinstance(r.parameters, list) and r.parameters else []
+        assert "Gene" in select_params, "Label param must be in SELECT params"
+        assert "name" in select_params, "Property key must be in SELECT params"
+        assert "TP53" in select_params, "Property value must be in SELECT params"
+
+    def test_merge_dml_still_uses_uuid_for_idempotent_insert(self):
+        """The DML INSERT statements must still use the generated UUID."""
+        import re
+        r = self._full_result("MERGE (a:TheLabel) RETURN a.node_id")
+        sqls = r.sql if isinstance(r.sql, list) else [r.sql]
+        params = r.parameters if isinstance(r.parameters, list) else []
+        # At least the INSERT INTO nodes DML must exist
+        insert_sqls = [s for s in sqls if "INSERT INTO nodes" in s]
+        assert insert_sqls, "Expected INSERT INTO nodes DML statement"
+        # DML params (all but the last SELECT params) must contain a UUID
+        dml_params = params[:-1] if len(params) > 1 else params
+        all_dml_values = [str(v) for group in dml_params for v in group]
+        uuid_re = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+        assert any(uuid_re.match(v) for v in all_dml_values), \
+            "DML statements must still use the generated UUID for idempotent insert"
+
+    def test_merge_on_create_set_still_works(self):
+        """MERGE ... ON CREATE SET must still generate the SET DML."""
+        r = self._full_result(
+            "MERGE (n:Gene) ON CREATE SET n.source = 'test' RETURN n.node_id"
+        )
+        sqls = r.sql if isinstance(r.sql, list) else [r.sql]
+        insert_props = [s for s in sqls if "INSERT INTO rdf_props" in s]
+        assert insert_props, "ON CREATE SET must generate INSERT INTO rdf_props"

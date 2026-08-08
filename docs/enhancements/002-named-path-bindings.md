@@ -59,6 +59,7 @@ class MatchClause:
 ```
 
 Add path functions to `FunctionCall` resolution in translator:
+
 - `length(p)` → hop count of the path
 - `nodes(p)` → list of node IDs in traversal order
 - `relationships(p)` → list of relationship IDs in traversal order
@@ -102,13 +103,13 @@ return `path_nodes` and `path_relationships` JSON arrays alongside the path stri
 
 ## Files to Change
 
-| File | Change |
-|------|--------|
-| `iris_vector_graph/cypher/ast.py` | Add `NamedPath` dataclass; extend `MatchClause` |
-| `iris_vector_graph/cypher/parser.py` | Parse `var =` prefix before pattern in MATCH |
-| `iris_vector_graph/cypher/translator.py` | Render named path as JSON array columns; handle `length()`, `nodes()`, `relationships()` |
-| `tests/unit/test_named_paths.py` | Unit tests (parse, translate, function calls) |
-| `tests/integration/test_named_paths_e2e.py` | E2E: fixed path, variable-length path, path functions |
+| File                                        | Change                                                                                   |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `iris_vector_graph/cypher/ast.py`           | Add `NamedPath` dataclass; extend `MatchClause`                                          |
+| `iris_vector_graph/cypher/parser.py`        | Parse `var =` prefix before pattern in MATCH                                             |
+| `iris_vector_graph/cypher/translator.py`    | Render named path as JSON array columns; handle `length()`, `nodes()`, `relationships()` |
+| `tests/unit/test_named_paths.py`            | Unit tests (parse, translate, function calls)                                            |
+| `tests/integration/test_named_paths_e2e.py` | E2E: fixed path, variable-length path, path functions                                    |
 
 ---
 

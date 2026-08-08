@@ -1,6 +1,6 @@
 # Rust Accelerator Architecture
 
-*iris-vector-graph + Arno — rzf use cases and integration patterns*
+_iris-vector-graph + Arno — rzf use cases and integration patterns_
 
 ---
 
@@ -52,6 +52,7 @@ The key enabling insight: IRIS globals are a sorted key-value store. We maintain
 No SQL. No ObjectScript loop overhead. Rust sees a dense integer adjacency structure.
 
 **Encoding rules:**
+
 - Label indices: stored as `-(N+1)` (negative)
 - Node indices: positive integers
 - Dictionaries in `^NKG("$NI", nodeId)`, `^NKG("$ND", idx)`, `^NKG("$LI", label)`, `^NKG("$LS", idx)`
@@ -73,11 +74,11 @@ The Python layer (`IRISGraphEngine._detect_arno()`) checks availability at start
 
 ClickBench runs against IRIS (from `arno/docs/BENCHMARKS.md`):
 
-| Operation | Pure IRIS SQL | Arno/Rust | Speedup |
-|-----------|--------------|-----------|---------|
-| COUNT(*) aggregation | 0.46ms | 0.021μs | ~22,000× |
-| COUNT with WHERE filter | 69.42ms | 0.001μs | ~69M× |
-| SUM/AVG aggregates | 67.89ms | 0.021μs | ~3.2M× |
+| Operation               | Pure IRIS SQL | Arno/Rust | Speedup  |
+| ----------------------- | ------------- | --------- | -------- |
+| COUNT(\*) aggregation   | 0.46ms        | 0.021μs   | ~22,000× |
+| COUNT with WHERE filter | 69.42ms       | 0.001μs   | ~69M×    |
+| SUM/AVG aggregates      | 67.89ms       | 0.021μs   | ~3.2M×   |
 
 Graph-specific operations (k-hop, PPR) are in the **10–100× range** depending on graph density — ObjectScript BFS on `^KG` is already fast; Rust wins on larger graphs and higher hop counts where `$Order` loop overhead compounds.
 
@@ -87,13 +88,13 @@ Graph-specific operations (k-hop, PPR) are in the **10–100× range** depending
 
 Most IRIS + Rust integration stories are about replacing IRIS with Rust. This is the opposite: **Rust augments IRIS without displacing it.**
 
-| Property | Detail |
-|----------|--------|
-| Source of truth | IRIS (globals, SQL, persistence) — unchanged |
-| Rust's role | Reads data IRIS already has; returns JSON results |
-| FFI surface | 14 exported functions, each a single `#[rzf]` annotation |
-| Graceful degradation | Remove the `.so` and nothing breaks — just slower |
-| Deployment | Copy `libarno_callout.so` to `/tmp/`; call `ArnoAccel.Load()` once |
+| Property             | Detail                                                             |
+| -------------------- | ------------------------------------------------------------------ |
+| Source of truth      | IRIS (globals, SQL, persistence) — unchanged                       |
+| Rust's role          | Reads data IRIS already has; returns JSON results                  |
+| FFI surface          | 14 exported functions, each a single `#[rzf]` annotation           |
+| Graceful degradation | Remove the `.so` and nothing breaks — just slower                  |
+| Deployment           | Copy `libarno_callout.so` to `/tmp/`; call `ArnoAccel.Load()` once |
 
 The pattern generalizes: any IRIS application with a compute-heavy inner loop (graph traversal, vector scoring, aggregation, inference) can adopt this architecture — maintain a Rust-friendly data representation in globals, use rzf to expose native functions, wrap in ObjectScript with fallback.
 
@@ -101,13 +102,13 @@ The pattern generalizes: any IRIS application with a compute-heavy inner loop (g
 
 ## What's Shipping
 
-| Feature | Version | Notes |
-|---------|---------|-------|
-| `^NKG` integer index | v1.19.0 | Foundation for Rust data access |
-| `khop()`, `ppr()`, `random_walk()` | v1.20.0 | Live with Arno acceleration when available |
-| `embed_edges()`, `edge_vector_search()` | v1.59.0 | Pure Python/ObjectScript; Arno acceleration path natural next step |
-| `KHop2Count`, `KHop2NeighborIds` | v1.83.0 | Pure ObjectScript 2-hop fast paths; Arno Rust acceleration would give another 10-50x for large graphs |
-| `ffi_kg_build_nkg` Rust impl | in arno workspace | Rust bulk ^NKG rebuild; requires Linux build of `libarno_callout.so` |
+| Feature                                 | Version           | Notes                                                                                                 |
+| --------------------------------------- | ----------------- | ----------------------------------------------------------------------------------------------------- |
+| `^NKG` integer index                    | v1.19.0           | Foundation for Rust data access                                                                       |
+| `khop()`, `ppr()`, `random_walk()`      | v1.20.0           | Live with Arno acceleration when available                                                            |
+| `embed_edges()`, `edge_vector_search()` | v1.59.0           | Pure Python/ObjectScript; Arno acceleration path natural next step                                    |
+| `KHop2Count`, `KHop2NeighborIds`        | v1.83.0           | Pure ObjectScript 2-hop fast paths; Arno Rust acceleration would give another 10-50x for large graphs |
+| `ffi_kg_build_nkg` Rust impl            | in arno workspace | Rust bulk ^NKG rebuild; requires Linux build of `libarno_callout.so`                                  |
 
 The `rzf` crate and `arno-callout` library are in active development in a separate private `arno` repository.
 

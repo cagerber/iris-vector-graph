@@ -2,7 +2,6 @@ import json
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 
-from iris_vector_graph.cypher.translator import _table
 from iris_vector_graph.result import IVGResult
 from iris_vector_graph.security import validate_table_name
 from iris_vector_graph._validate import (
@@ -17,7 +16,7 @@ class VectorMixin:
         try:
             cursor = self.conn.cursor()
             cursor.execute(
-                f"SELECT TOP 1 emb FROM {_table('kg_NodeEmbeddings')} WHERE emb IS NOT NULL"
+                f"SELECT TOP 1 emb FROM {self._t('kg_NodeEmbeddings')} WHERE emb IS NOT NULL"
             )
             row = cursor.fetchone()
             cursor.close()
@@ -29,7 +28,7 @@ class VectorMixin:
                 try:
                     c2 = self.conn.cursor()
                     c2.execute(
-                        f"SELECT VECTOR_COSINE(emb, TO_VECTOR(?, {dtype})) FROM {_table('kg_NodeEmbeddings')} WHERE emb IS NOT NULL LIMIT 1",
+                        f"SELECT VECTOR_COSINE(emb, TO_VECTOR(?, {dtype})) FROM {self._t('kg_NodeEmbeddings')} WHERE emb IS NOT NULL LIMIT 1",
                         [sample],
                     )
                     c2.fetchone()
@@ -200,7 +199,7 @@ class VectorMixin:
         sql = (
             f"SELECT TOP {int(top_k)} s, p, o_id, "
             f"VECTOR_COSINE(emb, {query_cast}) AS score "
-            f"FROM {_table('kg_EdgeEmbeddings')} "
+            f"FROM {self._t('kg_EdgeEmbeddings')} "
             f"ORDER BY score DESC "
             f"{having}"
         )
@@ -237,8 +236,8 @@ class VectorMixin:
         _dtype = (dtype or self.vector_dtype).upper()
         cursor = self.conn.cursor()
         try:
-            emb_table = _table("kg_NodeEmbeddings")
-            labels_table = _table("rdf_labels")
+            emb_table = self._t("kg_NodeEmbeddings")
+            labels_table = self._t("rdf_labels")
 
             qv = query_vector.strip() if isinstance(query_vector, str) else query_vector
             exclude_id: Optional[str] = None
@@ -314,8 +313,8 @@ class VectorMixin:
         self, query_vector: str, k: int = 50, label_filter: Optional[str] = None
     ) -> List[Tuple[str, float]]:
         _dtype = getattr(self, 'vector_dtype', 'DOUBLE')
-        emb_table = _table("kg_NodeEmbeddings")
-        labels_table = _table("rdf_labels")
+        emb_table = self._t("kg_NodeEmbeddings")
+        labels_table = self._t("rdf_labels")
 
         if label_filter:
             sql = (
@@ -361,8 +360,8 @@ class VectorMixin:
 
             query_array = np.array(json.loads(query_vector))
 
-            emb_table = _table("kg_NodeEmbeddings")
-            labels_table = _table("rdf_labels")
+            emb_table = self._t("kg_NodeEmbeddings")
+            labels_table = self._t("rdf_labels")
             if label_filter is None:
                 cursor.execute(f"SELECT n.id, n.emb FROM {emb_table} n WHERE n.emb IS NOT NULL")
             else:
@@ -1007,7 +1006,7 @@ class VectorMixin:
         import struct
 
         cursor = self.conn.cursor()
-        emb_table = _table("kg_NodeEmbeddings")
+        emb_table = self._t("kg_NodeEmbeddings")
         if node_ids is not None:
             if not node_ids:
                 raise ValueError("ivf_build: node_ids list is empty")

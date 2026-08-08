@@ -47,17 +47,17 @@ class TemporalMixin:
             for nid in (source, target):
                 try:
                     cursor.execute(
-                        f"INSERT INTO {_table('nodes')} (node_id) SELECT ? "
-                        f"WHERE NOT EXISTS (SELECT 1 FROM {_table('nodes')} WHERE node_id=?)",
+                        f"INSERT INTO {self._t('nodes')} (node_id) SELECT ? "
+                        f"WHERE NOT EXISTS (SELECT 1 FROM {self._t('nodes')} WHERE node_id=?)",
                         [nid, nid],
                     )
                 except Exception:
                     pass
             try:
                 cursor.execute(
-                    f"INSERT INTO {_table('rdf_edges')} (s, p, o_id, graph_id) "
+                    f"INSERT INTO {self._t('rdf_edges')} (s, p, o_id, graph_id) "
                     f"SELECT ?, ?, ?, ? WHERE NOT EXISTS "
-                    f"(SELECT 1 FROM {_table('rdf_edges')} WHERE s=? AND p=? AND o_id=? AND graph_id=?)",
+                    f"(SELECT 1 FROM {self._t('rdf_edges')} WHERE s=? AND p=? AND o_id=? AND graph_id=?)",
                     [source, predicate, target, graph, source, predicate, target, graph],
                 )
                 self.conn.commit()
@@ -91,17 +91,17 @@ class TemporalMixin:
                 for nid in (e["source"], e["target"]):
                     try:
                         cursor.execute(
-                            f"INSERT INTO {_table('nodes')} (node_id) SELECT ? "
-                            f"WHERE NOT EXISTS (SELECT 1 FROM {_table('nodes')} WHERE node_id=?)",
+                            f"INSERT INTO {self._t('nodes')} (node_id) SELECT ? "
+                            f"WHERE NOT EXISTS (SELECT 1 FROM {self._t('nodes')} WHERE node_id=?)",
                             [nid, nid],
                         )
                     except Exception:
                         pass
                 try:
                     cursor.execute(
-                        f"INSERT INTO {_table('rdf_edges')} (s, p, o_id, graph_id) "
+                        f"INSERT INTO {self._t('rdf_edges')} (s, p, o_id, graph_id) "
                         f"SELECT ?, ?, ?, ? WHERE NOT EXISTS "
-                        f"(SELECT 1 FROM {_table('rdf_edges')} WHERE s=? AND p=? AND o_id=? AND graph_id=?)",
+                        f"(SELECT 1 FROM {self._t('rdf_edges')} WHERE s=? AND p=? AND o_id=? AND graph_id=?)",
                         [e["source"], e["predicate"], e["target"], graph,
                          e["source"], e["predicate"], e["target"], graph],
                     )

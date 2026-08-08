@@ -49,14 +49,14 @@ Pass these to `iris.connect()` directly, or use the environment-variable helpers
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `IRIS_HOST` | `localhost` | IRIS SuperServer hostname |
-| `IRIS_PORT` | `1972` | IRIS SuperServer port |
-| `IRIS_NAMESPACE` | `USER` | Target namespace |
-| `IRIS_USERNAME` | `_SYSTEM` | Connection user |
-| `IRIS_PASSWORD` | `SYS` | Connection password |
-| `IRIS_CONTAINER` | — | Docker container name (used by `iris-devtester` in tests) |
+| Variable         | Default     | Description                                               |
+| ---------------- | ----------- | --------------------------------------------------------- |
+| `IRIS_HOST`      | `localhost` | IRIS SuperServer hostname                                 |
+| `IRIS_PORT`      | `1972`      | IRIS SuperServer port                                     |
+| `IRIS_NAMESPACE` | `USER`      | Target namespace                                          |
+| `IRIS_USERNAME`  | `_SYSTEM`   | Connection user                                           |
+| `IRIS_PASSWORD`  | `SYS`       | Connection password                                       |
+| `IRIS_CONTAINER` | —           | Docker container name (used by `iris-devtester` in tests) |
 
 ---
 

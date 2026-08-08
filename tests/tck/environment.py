@@ -1,0 +1,283 @@
+"""behave environment hooks for TCK harness."""
+from __future__ import annotations
+
+import contextlib
+import logging
+import os
+import subprocess
+from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+
+# Named graphs: scenario-scoped fixtures rebuilt as needed.
+NAMED_GRAPHS = {
+    "binary-tree-1": "TCK_BINARY_TREE_1",
+    "binary-tree-2": "TCK_BINARY_TREE_2",
+}
+
+# Binary tree structures — exact copies of vendor/opencypher/tck/graphs/binary-tree-*/
+# These must match the graphs used by the TCK feature files exactly.
+_BINARY_TREE_1_CQL = """
+CREATE (a:A {name: 'a'}),
+       (b1:X {name: 'b1'}),
+       (b2:X {name: 'b2'}),
+       (b3:X {name: 'b3'}),
+       (b4:X {name: 'b4'}),
+       (c11:X {name: 'c11'}),
+       (c12:X {name: 'c12'}),
+       (c21:X {name: 'c21'}),
+       (c22:X {name: 'c22'}),
+       (c31:X {name: 'c31'}),
+       (c32:X {name: 'c32'}),
+       (c41:X {name: 'c41'}),
+       (c42:X {name: 'c42'})
+CREATE (a)-[:KNOWS]->(b1),
+       (a)-[:KNOWS]->(b2),
+       (a)-[:FOLLOWS]->(b3),
+       (a)-[:FOLLOWS]->(b4)
+CREATE (b1)-[:FRIEND]->(c11),
+       (b1)-[:FRIEND]->(c12),
+       (b2)-[:FRIEND]->(c21),
+       (b2)-[:FRIEND]->(c22),
+       (b3)-[:FRIEND]->(c31),
+       (b3)-[:FRIEND]->(c32),
+       (b4)-[:FRIEND]->(c41),
+       (b4)-[:FRIEND]->(c42)
+CREATE (b1)-[:FRIEND]->(b2),
+       (b2)-[:FRIEND]->(b3),
+       (b3)-[:FRIEND]->(b4),
+       (b4)-[:FRIEND]->(b1)
+"""
+
+_BINARY_TREE_2_CQL = """
+CREATE (a:A {name: 'a'}),
+       (b1:X {name: 'b1'}),
+       (b2:X {name: 'b2'}),
+       (b3:X {name: 'b3'}),
+       (b4:X {name: 'b4'}),
+       (c11:X {name: 'c11'}),
+       (c12:Y {name: 'c12'}),
+       (c21:X {name: 'c21'}),
+       (c22:Y {name: 'c22'}),
+       (c31:X {name: 'c31'}),
+       (c32:Y {name: 'c32'}),
+       (c41:X {name: 'c41'}),
+       (c42:Y {name: 'c42'})
+CREATE (a)-[:KNOWS]->(b1),
+       (a)-[:KNOWS]->(b2),
+       (a)-[:FOLLOWS]->(b3),
+       (a)-[:FOLLOWS]->(b4)
+CREATE (b1)-[:FRIEND]->(c11),
+       (b1)-[:FRIEND]->(c12),
+       (b2)-[:FRIEND]->(c21),
+       (b2)-[:FRIEND]->(c22),
+       (b3)-[:FRIEND]->(c31),
+       (b3)-[:FRIEND]->(c32),
+       (b4)-[:FRIEND]->(c41),
+       (b4)-[:FRIEND]->(c42)
+CREATE (b1)-[:FRIEND]->(b2),
+       (b2)-[:FRIEND]->(b3),
+       (b3)-[:FRIEND]->(b4),
+       (b4)-[:FRIEND]->(b1)
+"""
+
+
+def before_all(context):
+    """Session setup: connect to ivg-iris, initialize schema only."""
+    container_name = os.environ.get("IVG_TEST_CONTAINER") or os.environ.get("IVG_CONTAINER", "ivg-iris")
+    port = int(os.environ.get("IVG_PORT", "21972"))
+
+    conn = _connect(container_name, port)
+    context.conn = conn
+    context.named_graphs = dict(NAMED_GRAPHS)
+    # Cache: graph_name -> label, only when currently built in DB
+    context._named_graph_labels = {}
+
+    from iris_vector_graph.engine import IRISGraphEngine
+    context.engine = IRISGraphEngine(conn, embedding_dimension=768)
+    schema_ok = True
+    try:
+        context.engine.initialize_schema(auto_deploy_objectscript=False)
+    except Exception as e:
+        logger.warning("Schema init: %s", e)
+        schema_ok = False
+
+    # If initialize_schema caused a stale/broken connection, reconnect before proceeding.
+    if not schema_ok:
+        try:
+            conn2 = _connect(container_name, port)
+            context.conn = conn2
+            context.engine = IRISGraphEngine(conn2, embedding_dimension=768)
+            logger.info("Reconnected after schema init failure")
+        except Exception as e2:
+            logger.warning("Reconnect after schema init failure: %s", e2)
+
+    # Clean up any leftover data from previous test sessions
+    _flush_all_tck_data(context)
+
+
+def before_scenario(context, scenario):
+    context.scenario_label = f"TCK_{uuid4().hex[:8]}"
+    context.params = {}
+    context.last_result = None
+    context.last_error = None
+    context._used_named_graph = None  # track if this scenario uses a named graph
+    context._tck_procedures = {}  # TCK test procedure registry (for CALL support)
+
+
+def after_scenario(context, scenario):
+    label = getattr(context, "scenario_label", None)
+    if label:
+        if label.startswith("TCK_BINARY_TREE"):
+            # Named-graph scenario: tear down this scenario's named graph data
+            _teardown_label(context, label)
+            # Remove from the built-cache so next scenario recreates if needed
+            if hasattr(context, "_named_graph_labels"):
+                context._named_graph_labels = {
+                    k: v for k, v in context._named_graph_labels.items()
+                    if v != label
+                }
+        else:
+            _teardown_label(context, label)
+
+
+def after_all(context):
+    # Final cleanup
+    _flush_all_tck_data(context)
+    with contextlib.suppress(Exception):
+        context.conn.close()
+
+
+def _connect(container_name: str, port: int):
+    """Connect to the IRIS container.
+
+    Strategy (in order):
+    1. OrbStack DNS: {container}.orb.local resolves to a routable IP — use :1972 directly.
+    2. Socat proxy / host port forwarding (port != 21972).
+    3. iris_devtester fallback.
+    """
+    import socket as _socket
+    _orb_host = f"{container_name}.orb.local"
+    try:
+        _orb_ip = _socket.gethostbyname(_orb_host)
+        import iris.dbapi as _dbapi
+        try:
+            conn = _dbapi.connect(
+                hostname=_orb_ip, port=1972, namespace="USER",
+                username="_SYSTEM", password="SYS",
+            )
+            logger.info("TCK connected to %s via OrbStack %s (%s):1972", container_name, _orb_host, _orb_ip)
+            return conn
+        except Exception as e:
+            logger.warning("OrbStack %s:1972 failed (%s) — falling back", _orb_ip, e)
+    except _socket.gaierror:
+        pass  # not OrbStack
+
+    if port != 21972:
+        import iris.dbapi as _dbapi
+        try:
+            conn = _dbapi.connect(
+                hostname="localhost", port=port, namespace="USER",
+                username="_SYSTEM", password="SYS",
+            )
+            logger.info("TCK harness connected to %s via localhost:%s", container_name, port)
+            return conn
+        except Exception as e:
+            logger.warning("Direct connect to localhost:%s failed (%s) — trying iris_devtester", port, e)
+
+    try:
+        from iris_devtester import IRISContainer as IRC
+        fresh = IRC.attach(container_name)
+        fresh._connection = None
+        conn = fresh.get_connection()
+        logger.info("TCK harness connected to %s via iris_devtester", container_name)
+        return conn
+    except Exception as e:
+        raise RuntimeError(
+            f"Cannot connect to IRIS container '{container_name}' (port {port}). "
+            f"Start it with: scripts/test-container.sh up\n"
+            f"Original error: {e}"
+        ) from e
+
+
+def _db_schema(context) -> str:
+    """Return the schema prefix used by this engine (e.g. 'Graph_KG' or 'SQLUser')."""
+    engine = getattr(context, "engine", None)
+    if engine is None:
+        return "SQLUser"
+    return getattr(engine, "_schema_prefix", "SQLUser")
+
+
+def _flush_all_tck_data(context):
+    """Delete all TCK data from the DB (for session start/end cleanup).
+
+    Delete order must respect FK constraints: rdf_props/rdf_labels/rdf_edges
+    must be deleted before nodes (FK rdf_labels.s -> nodes.node_id).
+    """
+    with contextlib.suppress(Exception):
+        store = getattr(context.engine, "_store", None)
+        if store and hasattr(store, "conn"):
+            schema = _db_schema(context)
+            cursor = store.conn.cursor()
+            # Delete in FK-safe order: dependents first
+            cursor.execute(f"DELETE FROM {schema}.rdf_props")
+            cursor.execute(f"DELETE FROM {schema}.rdf_labels")
+            cursor.execute(f"DELETE FROM {schema}.rdf_edges")
+            cursor.execute(f"DELETE FROM {schema}.nodes")
+            store.conn.commit()
+            cursor.close()
+
+
+def _teardown_label(context, label: str):
+    with contextlib.suppress(Exception):
+        context.engine.execute_cypher(
+            f"MATCH (n:{label}) DETACH DELETE n", {}
+        )
+    # Clean up orphaned nodes (no labels) left by anonymous CREATE endpoints
+    # in main test queries that weren't given the isolation label.
+    with contextlib.suppress(Exception):
+        store = getattr(context.engine, "_store", None)
+        if store and hasattr(store, "conn"):
+            schema = _db_schema(context)
+            cursor = store.conn.cursor()
+            cursor.execute(
+                f"DELETE FROM {schema}.nodes WHERE node_id NOT IN "
+                f"(SELECT DISTINCT s FROM {schema}.rdf_labels)"
+            )
+            store.conn.commit()
+
+
+def _ensure_named_graph(context, graph_name: str, label: str):
+    """Build a named graph fixture under its session label if not already present."""
+    try:
+        result = context.engine.execute_cypher(
+            f"MATCH (n:{label}) RETURN count(n) AS cnt", {}
+        )
+        row0 = result.rows[0] if result.rows else None
+        if row0 is not None:
+            # rows may be a list or dict depending on IVGResult format
+            cnt = row0.get("cnt", 0) if isinstance(row0, dict) else (row0[0] if row0 else 0)
+        else:
+            cnt = 0
+        if cnt > 0:
+            return  # already built
+    except Exception:
+        pass
+
+    cql_map = {
+        "binary-tree-1": _BINARY_TREE_1_CQL,
+        "binary-tree-2": _BINARY_TREE_2_CQL,
+    }
+    cql = cql_map.get(graph_name)
+    if not cql:
+        return
+
+    # Inject session label into CREATE
+    from tests.tck.steps.graph_setup import _inject_label, _sync_kg
+    labeled_cql = _inject_label(cql.strip(), label)
+    try:
+        context.engine.execute_cypher(labeled_cql, {})
+    except Exception as e:
+        logger.warning("Failed to create named graph '%s': %s", graph_name, e)
+    # Rebuild ^KG so variable-length path queries work on this named graph.
+    _sync_kg(context)

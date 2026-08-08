@@ -1,0 +1,43 @@
+# TCK Conformance WIP — branch 201-opencypher-tck-harness
+
+## Current Score: 1947/3897 (50.0%) — 2026-08-01
+
+## Recent Fixes (this session)
+- Cartesian product for labeled anon nodes in relationship patterns (1933→1947)
+- Variable-length path *N..M parser tokenization (FLOAT_LITERAL '.2' issue)
+- PropertyAccessExpression alias in column_name_map (nestedMap.name.name2)
+- Relationship type comparison [:T1] ↔ 'T1'
+- Anon-source edge WHERE param ordering (type param was swapped)
+- Null node triplet detection for OPTIONAL MATCH ('[]' vs None)
+- `a.id` fix: no longer shortcuts user-defined 'id' property to node_id
+
+## Active Agents (spawned in parallel)
+- aad662aa024611cd0: Fix variable-length path translator (Match5+6: 54 failures)
+- a534711269cca033d: Fix MERGE find-or-create semantics (Merge: ~50 failures)
+- a57f120a898ae807b: Fix quantifiers (ANY/ALL/NONE/SINGLE) + List5 IN (120+67 failures)
+- a7ddaa556bf400020: Fix Match7 OPTIONAL MATCH bound patterns + Pattern1+2 (33+28 failures)
+
+NOTE: Community IRIS = 2 license limit. Agents may compete for connections.
+
+## Failure Breakdown (pre-agents)
+| Category                         | Failures | Priority |
+|----------------------------------|----------|----------|
+| Temporal (Temporal1-10)          | 846      | LOW (full type system needed) |
+| WithOrderBy (1-4)                | 65       | MED (list sort + temporal) |
+| List5+11                         | 67       | HIGH → agent a57f |
+| Match5+6 (variable-length paths) | 54       | HIGH → agent aad66 |
+| Quantifier (1-12)                | 120      | HIGH → agent a57f |
+| Comparison1+2                    | 37       | HIGH → agent a7dd |
+| Merge (various)                  | ~50      | HIGH → agent a534 |
+| Match7 (OPTIONAL MATCH bound)    | 28       | HIGH → agent a7dd |
+| Pattern1+2                       | 33       | HIGH → agent a7dd |
+| Triadic selection                | 18       | MED |
+| Scattered 1-5 failures (~40 files)| ~100   | LOW→MED |
+
+## Next After Agents
+- Incorporate worktree changes from all 4 agents
+- Re-run full TCK for new score
+- Tackle temporal if score is high enough (846 tests, big block)
+- Fix WithOrderBy list sorting (complex type-comparison ordering)
+- Fix triadic selection (18)
+- Keep rolling agent pattern

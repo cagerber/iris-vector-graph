@@ -11,6 +11,7 @@ services:
     ports:
       - "31972:1972"
       - "62773:52773"
+      - "31971:19721"
     environment:
       - ISC_CPF_MERGE_FILE=/home/irisowner/merge.cpf
     volumes:

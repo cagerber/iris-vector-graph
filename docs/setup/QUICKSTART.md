@@ -27,8 +27,9 @@ docker compose ps       # Should show "healthy"
 ```
 
 IRIS is now running on:
+
 - **Port 1972** — SuperServer (used by the Python SDK)
-- **Port 52773** — Management Portal at http://localhost:52773/csp/sys/UtilHome.csp
+- **Port 52773** — Management Portal at <http://localhost:52773/csp/sys/UtilHome.csp>
 
 Default credentials: `_SYSTEM` / `SYS`
 
@@ -88,6 +89,7 @@ print(f"Loaded {len(nodes)} nodes and {len(edges)} edges.")
 ## Step 5: Query the graph
 
 **Cypher — find what Olaparib treats:**
+
 ```python
 result = engine.execute_cypher(
     "MATCH (d:Drug {node_id:$id})-[:TREATS]->(dis) RETURN d.name AS drug, dis.name AS disease",
@@ -96,25 +98,31 @@ result = engine.execute_cypher(
 for row in result.rows:
     print(f"{row[0]} → {row[1]}")
 ```
+
 Output:
+
 ```
 Olaparib → Breast cancer
 Olaparib → Ovarian cancer
 ```
 
 **Find genes that target a drug:**
+
 ```python
 result = engine.execute_cypher(
     "MATCH (g:Gene)-[:TARGETS]->(d:Drug) RETURN g.name AS gene, d.name AS drug"
 )
 print(result.rows)
 ```
+
 Output:
+
 ```
 [['BRCA1', 'Olaparib']]
 ```
 
 **2-hop path — find diseases reachable from BRCA1:**
+
 ```python
 result = engine.execute_cypher(
     "MATCH (g {node_id:$id})-[*1..2]->(target) RETURN DISTINCT target.name LIMIT 10",
@@ -122,7 +130,9 @@ result = engine.execute_cypher(
 )
 print([row[0] for row in result.rows])
 ```
+
 Output:
+
 ```
 ['Olaparib', 'Breast cancer', 'Ovarian cancer']
 ```
@@ -131,13 +141,13 @@ Output:
 
 ## Step 6: Explore further
 
-| Feature | Method | Guide |
-|---|---|---|
-| Vector search | `engine.ivf_build()`, `engine.search_nodes_by_vector()` | [Python SDK](../python/PYTHON_SDK.md) |
-| Temporal edges | `engine.create_edge_temporal()`, `engine.get_edges_in_window()` | [Architecture](../architecture/ARCHITECTURE.md) |
-| Graph analytics | `engine.run_pagerank()`, `engine.run_khop()` | [Python SDK](../python/PYTHON_SDK.md) |
-| REST / Bolt API | `uvicorn api.main:app` | [Operations](../OPERATIONS.md) |
-| IRIS Management Portal | http://localhost:52773 | (browser) |
+| Feature                | Method                                                          | Guide                                           |
+| ---------------------- | --------------------------------------------------------------- | ----------------------------------------------- |
+| Vector search          | `engine.ivf_build()`, `engine.search_nodes_by_vector()`         | [Python SDK](../python/PYTHON_SDK.md)           |
+| Temporal edges         | `engine.create_edge_temporal()`, `engine.get_edges_in_window()` | [Architecture](../architecture/ARCHITECTURE.md) |
+| Graph analytics        | `engine.run_pagerank()`, `engine.run_khop()`                    | [Python SDK](../python/PYTHON_SDK.md)           |
+| REST / Bolt API        | `uvicorn api.main:app`                                          | [Operations](../OPERATIONS.md)                  |
+| IRIS Management Portal | <http://localhost:52773>                                        | (browser)                                       |
 
 ---
 

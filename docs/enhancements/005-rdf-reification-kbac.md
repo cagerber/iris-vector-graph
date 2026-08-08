@@ -16,7 +16,7 @@ authorization decisions need to be graph-walkable entities.
 
 ## What Reification Adds
 
-Statements *about* edges become first-class triples:
+Statements _about_ edges become first-class triples:
 
 ```
 :Aspirin :treats :Headache .                          # the edge
@@ -44,14 +44,14 @@ CREATE TABLE Graph_KG.rdf_reifications (
 
 ## Implementation Scope
 
-| Component | Change |
-|-----------|--------|
-| `Graph_KG.rdf_reifications` | New SQL table |
-| `Graph.KG.Reification.cls` | New ObjectScript class |
-| `engine.py` | `create_reification()`, `get_reifications()`, `delete_reification()` |
-| `schema.py` | DDL for new table |
-| `^KG` globals | Optional: `^KG("reif", edgeId, predicate)` for graph-traversable metadata |
-| Cypher translator | Phase 2: `MATCH ()-[r]->() WHERE r.confidence > 0.9` via reification join |
+| Component                   | Change                                                                    |
+| --------------------------- | ------------------------------------------------------------------------- |
+| `Graph_KG.rdf_reifications` | New SQL table                                                             |
+| `Graph.KG.Reification.cls`  | New ObjectScript class                                                    |
+| `engine.py`                 | `create_reification()`, `get_reifications()`, `delete_reification()`      |
+| `schema.py`                 | DDL for new table                                                         |
+| `^KG` globals               | Optional: `^KG("reif", edgeId, predicate)` for graph-traversable metadata |
+| Cypher translator           | Phase 2: `MATCH ()-[r]->() WHERE r.confidence > 0.9` via reification join |
 
 ## What Does NOT Change
 

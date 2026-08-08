@@ -724,6 +724,82 @@ class TestOptionalMatch:
         )
         assert sql is not None
 
+    # ------------------------------------------------------------------
+    # Direction-symmetry: openCypher TCK gap — cbm/IVG cross-join bug
+    #
+    # (t)-[:R]->(f_bound) and (f_bound)<-[:R]-(t) denote the same graph
+    # predicate.  A buggy translator cross-joins t when it is nodes[0]
+    # and f is nodes[1].  These tests assert SQL-level equivalence.
+    # Ref: CBM-BUG-optional-match-cross-join.md, TCK Match7 gap.
+    # ------------------------------------------------------------------
+
+    def test_optional_match_bound_target_no_cross_join(self):
+        """(t)-[:CALLS]->(f) with f pre-bound must not emit CROSS JOIN."""
+        sql, _ = _translate(
+            "MATCH (f:Function) "
+            "OPTIONAL MATCH (t)-[:CALLS]->(f) "
+            "RETURN f.name, count(t)"
+        )
+        assert "CROSS JOIN" not in sql, (
+            "CROSS JOIN detected: unbound source (t) was not anchored via edge from bound target (f)"
+        )
+        # Edge must be anchored on f (o_id side for outgoing edge from t's perspective)
+        assert "e3.o_id = n0.node_id" in sql or "o_id = n0.node_id" in sql, (
+            "Edge not anchored on bound target (f); direction-symmetry fix may not have applied"
+        )
+
+    def test_optional_match_direction_symmetry(self):
+        """(t)-[:CALLS]->(f) and (f)<-[:CALLS]-(t) must produce identical SQL when f is bound."""
+        sql_bug_form, _ = _translate(
+            "MATCH (f:Function) "
+            "OPTIONAL MATCH (t)-[:CALLS]->(f) "
+            "RETURN f.name, count(t)"
+        )
+        sql_canonical, _ = _translate(
+            "MATCH (f:Function) "
+            "OPTIONAL MATCH (f)<-[:CALLS]-(t) "
+            "RETURN f.name, count(t)"
+        )
+        assert sql_bug_form == sql_canonical, (
+            f"Direction-symmetry violated:\n"
+            f"  (t)-[:CALLS]->(f): {sql_bug_form}\n"
+            f"  (f)<-[:CALLS]-(t): {sql_canonical}"
+        )
+
+    def test_plain_match_bound_target_no_cross_join(self):
+        """Plain MATCH (t)-[:R]->(f) with f bound also affected by the same bug."""
+        sql, _ = _translate(
+            "MATCH (f:Function) "
+            "MATCH (t)-[:CALLS]->(f) "
+            "RETURN f.name, count(t)"
+        )
+        assert "CROSS JOIN" not in sql, (
+            "CROSS JOIN in plain MATCH: bound-target pattern incorrectly cross-joined"
+        )
+
+    def test_direction_symmetry_plain_match(self):
+        """Plain MATCH direction symmetry: (t)-[:R]->(f) == (f)<-[:R]-(t) when f bound."""
+        sql_a, _ = _translate(
+            "MATCH (f:Function) MATCH (t)-[:CALLS]->(f) RETURN f.name, count(t)"
+        )
+        sql_b, _ = _translate(
+            "MATCH (f:Function) MATCH (f)<-[:CALLS]-(t) RETURN f.name, count(t)"
+        )
+        assert sql_a == sql_b, (
+            f"Direction-symmetry violated for plain MATCH:\n  A: {sql_a}\n  B: {sql_b}"
+        )
+
+    def test_bound_source_unchanged(self):
+        """Standard pattern (f_bound)-[:CALLS]->(t) must be unaffected by the fix."""
+        sql_standard, _ = _translate(
+            "MATCH (f:Function) "
+            "OPTIONAL MATCH (f)-[:CALLS]->(t) "
+            "RETURN f.name, count(t)"
+        )
+        # Standard form: edge anchored on f.s side
+        assert "CROSS JOIN" not in sql_standard
+        assert "e" in sql_standard  # edge alias present
+
 
 # ---------------------------------------------------------------------------
 # EXISTS subquery (L2138-2142)
