@@ -291,6 +291,7 @@ class TestVectorDtypeConsistency:
         eng._arno_capabilities = {}
         eng._index_registry = {}
         eng.vector_dtype = "DOUBLE"
+        eng._schema_prefix = "Graph_KG"
 
         query_vec = json.dumps([0.1, 0.2, 0.3, 0.4])
         eng.kg_KNN_VEC(query_vec, k=5)
@@ -315,6 +316,7 @@ class TestVectorDtypeConsistency:
         eng._arno_capabilities = {}
         eng._index_registry = {}
         eng.vector_dtype = "FLOAT"
+        eng._schema_prefix = "Graph_KG"
 
         query_vec = json.dumps([0.1, 0.2, 0.3, 0.4])
         eng.kg_KNN_VEC(query_vec, k=5)
@@ -547,6 +549,7 @@ class TestNewEngineAPIs:
         eng._index_registry = {}
         eng.vector_dtype = "DOUBLE"
         eng.capabilities = IRISCapabilities()
+        eng._schema_prefix = "Graph_KG"
         return eng
 
     def test_get_node_name_returns_name_property(self):
@@ -629,6 +632,7 @@ class TestDetectStoredVectorDtype:
         eng._index_registry = {}
         eng.vector_dtype = "DOUBLE"
         eng.capabilities = IRISCapabilities()
+        eng._schema_prefix = "Graph_KG"
         return eng
 
     def test_returns_float_when_float_works(self):

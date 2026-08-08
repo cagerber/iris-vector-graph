@@ -51,6 +51,7 @@ def _make_engine(rows_by_query=None):
     engine = IRISGraphEngine.__new__(IRISGraphEngine)
     engine.conn = conn
     engine.schema_prefix = "Graph_KG"
+    engine._schema_prefix = "Graph_KG"
     return engine, cursor
 
 
