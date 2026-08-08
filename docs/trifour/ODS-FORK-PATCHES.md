@@ -21,6 +21,23 @@ See ODS ADR: `docs/dev/journal/adr-2026-06-ivg-vendor-non-vector-license.md`.
 | `iris_vector_graph/_engine/vector_license.py` | Shared classifier for vector-only init failures |
 | `iris_vector_graph/_engine/schema.py` | Skip vector DDL/procedures on license errors; return `status: partial` |
 | `iris_src/src/IVG/CypherEngine.cls` | `InitSchemaJson` partial handling; deploy helpers (`DeployInitSchemaOutput`, `EnsureIrisVectorGraphPythonJSON`, …) |
+| `module.xml` / `module-core.xml` | **IPM completeness** — all 44 `iris_src/src/**/*.cls` resources; version `2.5.0-trifour.1` (wheel `2.5.0+trifour.1`) |
+| `scripts/generate_module_xml_resources.py` | Regenerates module resource lists from the filesystem (core = pure ObjectScript; full = embedded Python + bridge classes) |
+| `tests/unit/test_module_xml_drift.py` | Fails CI when module XML drifts from `iris_src/src` |
+
+### IPM module split (generator rules)
+
+- **`iris-vector-graph-core`**: pure ObjectScript primitives (VecIndex, GraphIndex, Traversal*, NKGAccel*, PageRank, Algorithms, Meta, …).
+- **`iris-vector-graph`**: depends on core; classes with `Language = python` plus explicit bridge entries (`PyOps`, `Service`, `BM25Index`, `GraphOperators`, `User.Exec`, …).
+
+Regenerate after adding or renaming `.cls` files:
+
+```bash
+python3 scripts/generate_module_xml_resources.py
+python3 scripts/generate_module_xml_resources.py --check   # CI drift gate
+```
+
+Prior to this patch, only **16** of **44** classes were listed in the module manifests (IPM load could silently omit new ObjectScript).
 
 ## ODS consumption
 

@@ -4,18 +4,37 @@
     <Module>
       <Name>iris-vector-graph-core</Name>
       <Description>Pure ObjectScript graph + vector primitives for IRIS. No Python required.</Description>
-      <Version>1.27.0</Version>
+      <Version>2.5.0-trifour.1</Version>
       <Packaging>module</Packaging>
       <SourcesRoot>iris_src/src</SourcesRoot>
-      <Resource Name="Graph.KG.VecIndex.CLS"/>
-      <Resource Name="Graph.KG.PLAIDSearch.CLS"/>
-      <Resource Name="Graph.KG.GraphIndex.CLS"/>
-      <Resource Name="Graph.KG.Traversal.CLS"/>
-      <Resource Name="Graph.KG.PageRank.CLS"/>
       <Resource Name="Graph.KG.Algorithms.CLS"/>
-      <Resource Name="Graph.KG.Subgraph.CLS"/>
       <Resource Name="Graph.KG.BenchSeeder.CLS"/>
+      <Resource Name="Graph.KG.Centrality.CLS"/>
+      <Resource Name="Graph.KG.EdgeScan.CLS"/>
+      <Resource Name="Graph.KG.GraphIndex.CLS"/>
+      <Resource Name="Graph.KG.IVFIndex.CLS"/>
+      <Resource Name="Graph.KG.MCPService.CLS"/>
+      <Resource Name="Graph.KG.MCPToolSet.CLS"/>
       <Resource Name="Graph.KG.Meta.CLS"/>
+      <Resource Name="Graph.KG.NKGAccel.CLS"/>
+      <Resource Name="Graph.KG.NKGAccelAdjacency.CLS"/>
+      <Resource Name="Graph.KG.NKGAccelCentrality.CLS"/>
+      <Resource Name="Graph.KG.NKGAccelLoader.CLS"/>
+      <Resource Name="Graph.KG.NKGAccelTraversal.CLS"/>
+      <Resource Name="Graph.KG.PLAIDSearch.CLS"/>
+      <Resource Name="Graph.KG.PageRank.CLS"/>
+      <Resource Name="Graph.KG.Snapshot.CLS"/>
+      <Resource Name="Graph.KG.Subgraph.CLS"/>
+      <Resource Name="Graph.KG.TemporalIndex.CLS"/>
+      <Resource Name="Graph.KG.TestEdge.CLS"/>
+      <Resource Name="Graph.KG.Traversal.CLS"/>
+      <Resource Name="Graph.KG.TraversalBuild.CLS"/>
+      <Resource Name="Graph.KG.TraversalKHop.CLS"/>
+      <Resource Name="Graph.KG.TraversalPaths.CLS"/>
+      <Resource Name="Graph.KG.VecIndex.CLS"/>
+      <Resource Name="Graph.KG.kgNodeEmbeddings.CLS"/>
+      <Resource Name="Graph.KG.kgNodeEmbeddingsoptimized.CLS"/>
+      <Resource Name="IVG.Percentile.CLS"/>
       <Keywords>
         <Keyword>vector</Keyword>
         <Keyword>graph</Keyword>
