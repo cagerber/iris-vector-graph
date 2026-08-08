@@ -5,6 +5,7 @@ from typing import Dict, Any, Optional, List
 from iris_vector_graph.schema import GraphSchema, _call_classmethod
 from iris_vector_graph.cypher.translator import _table
 from iris_vector_graph.capabilities import IRISCapabilities
+from iris_vector_graph._engine.vector_license import vector_init_partial_failure_message
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,7 @@ class SchemaMixin:
             )
 
         cursor = self.conn.cursor()
+        vector_skipped = False
         try:
             cursor.execute("CREATE SCHEMA Graph_KG")
         except Exception:
@@ -140,6 +142,8 @@ class SchemaMixin:
                     "kg_rrf",
                     "irisdev",
                     "iris_src",
+                    "kg_nodeembeddings",
+                    "vector(double",
                 )
                 if (
                     "already exists" not in err
@@ -157,7 +161,14 @@ class SchemaMixin:
                         and "rdf_edges" in stmt.lower()
                         and "create index" in stmt.lower()
                     )
-                    if (
+                    if vector_init_partial_failure_message(str(e)):
+                        vector_skipped = True
+                        logger.warning(
+                            "Vector DDL skipped (license or missing embeddings table): %s | %s",
+                            stmt[:80],
+                            e,
+                        )
+                    elif (
                         any(
                             p in err or p in stmt.lower()
                             for p in _OPTIONAL_DDL_PATTERNS
@@ -278,10 +289,21 @@ class SchemaMixin:
                     )
 
         if procedure_errors:
-            raise RuntimeError(
-                f"initialize_schema() failed to install {len(procedure_errors)} "
-                f"stored procedure(s). Server-side vector search will be unavailable. "
-                f"First error: {procedure_errors[0][1]}"
+            fatal_errors = [
+                (stmt, err)
+                for stmt, err in procedure_errors
+                if not vector_init_partial_failure_message(str(err))
+            ]
+            if fatal_errors:
+                raise RuntimeError(
+                    f"initialize_schema() failed to install {len(fatal_errors)} "
+                    f"stored procedure(s). Server-side vector search will be unavailable. "
+                    f"First error: {fatal_errors[0][1]}"
+                )
+            vector_skipped = True
+            logger.warning(
+                "Vector stored procedures skipped (%d) — IRIS license or embeddings table",
+                len(procedure_errors),
             )
 
         self.conn.commit()
@@ -364,12 +386,19 @@ class SchemaMixin:
                 logger.warning("^KG bootstrap failed: %s", exc)
 
         status = {
+            "status": "partial" if vector_skipped else "ok",
             "tables_created": True,
             "objectscript_deployed": self.capabilities.objectscript_deployed,
             "kg_built": self.capabilities.kg_built,
             "embedding_dimension": dim,
             "warnings": [],
         }
+        if vector_skipped:
+            status["vector_skipped"] = True
+            status["warnings"].append(
+                "Vector Search unavailable on this IRIS instance — core graph and Cypher OK; "
+                "embeddings / kg_KNN_VEC / RAG features disabled."
+            )
         if not self.capabilities.objectscript_deployed:
             status["warnings"].append(
                 "ObjectScript classes not deployed — BFS, Subgraph, PageRank using Python fallbacks. "

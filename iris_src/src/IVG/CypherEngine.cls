@@ -198,7 +198,28 @@ Method InitSchemaJson() As %String [ Language = python ]
 {
     import json
     self.EnsureEngine()
-    result = self.PyEngine.initialize_schema()
+    try:
+        result = self.PyEngine.initialize_schema()
+    except Exception as ex:
+        msg = str(ex)
+        m = msg.lower()
+        # IRISHealth / no Vector Search: #15806, missing KG_NODEEMBEDDINGS, or vector stored-proc install.
+        vector_partial = (
+            ('15806' in msg)
+            or ('vector search' in m and 'not permitted' in m)
+            or ('vector' in m and 'not permitted' in m)
+            or ('kg_nodeembeddings' in m)
+            or ('server-side vector search will be unavailable' in m)
+            or ('failed to install' in m and 'stored procedure' in m)
+        )
+        if vector_partial:
+            result = {
+                'status': 'partial',
+                'vector_skipped': True,
+                'warning': msg,
+            }
+        else:
+            raise
     return json.dumps({k: str(v) for k, v in result.items()})
 }
 
@@ -222,6 +243,139 @@ Method IsReady() As %Boolean [ Language = python ]
         return 1 if self.PyEngine.is_ready() else 0
     except Exception:
         return 0
+}
+
+/// Run pip install for ``iris-vector-graph[full]`` in-process; Return JSON with rc and log tails.
+ClassMethod PipInstallIrisVectorGraphJson() As %String [ Language = python ]
+{
+    import io
+    import json
+    from contextlib import redirect_stderr, redirect_stdout
+
+    buf_out = io.StringIO()
+    buf_err = io.StringIO()
+    pip_rc = 0
+    try:
+        from pip._internal.cli.main import main as pip_main
+
+        with redirect_stdout(buf_out), redirect_stderr(buf_err):
+            try:
+                pip_main(["install", "iris-vector-graph[full]"])
+            except SystemExit as ex:
+                code = ex.code
+                pip_rc = int(code) if code is not None else 1
+    except Exception as ex:
+        pip_rc = 1
+        buf_err.write(str(ex))
+    return json.dumps(
+        {
+            "pip_rc": int(pip_rc),
+            "pip_stdout_tail": buf_out.getvalue()[-1500:],
+            "pip_stderr_tail": buf_err.getvalue()[-1500:],
+        }
+    )
+}
+
+/// Populate ``result`` when ``iris_vector_graph`` imports; Return 1 when ready.
+ClassMethod FillIrisVectorGraphProbe(result As %DynamicObject) As %Boolean
+{
+    Try {
+        Set mod = ##class(%SYS.Python).Import("iris_vector_graph")
+        If $IsObject(mod) {
+            Do result.%Set("ok", 1)
+            If 'result.%IsDefined("action") {
+                Do result.%Set("action", "present")
+            }
+            Return 1
+        }
+    } Catch ex {
+        Do result.%Set("import_error", ex.DisplayString())
+    }
+    Return 0
+}
+
+/// Ensure ``iris_vector_graph`` is importable in IRIS embedded Python; optional pip install.
+ClassMethod EnsureIrisVectorGraphPythonJSON(pInstall As %Boolean = 0) As %String
+{
+    Set result = ##class(%DynamicObject).%New()
+    Set ready = ..FillIrisVectorGraphProbe(result)
+    If ready {
+        Return result.%ToJSON()
+    }
+    If 'pInstall {
+        Do result.%Set("ok", 0)
+        Do result.%Set("action", "missing")
+        Return result.%ToJSON()
+    }
+    Try {
+        Set pipJson = ..PipInstallIrisVectorGraphJson()
+        If pipJson '= "" {
+            Set pipObj = ##class(%DynamicObject).%FromJSON(pipJson)
+            If $IsObject(pipObj) {
+                Set pipRc = +pipObj.%Get("pip_rc")
+                Do result.%Set("pip_rc", pipRc)
+                Set tailOut = pipObj.%Get("pip_stdout_tail")
+                If tailOut '= "" {
+                    Do result.%Set("pip_stdout_tail", tailOut)
+                }
+                Set tailErr = pipObj.%Get("pip_stderr_tail")
+                If tailErr '= "" {
+                    Do result.%Set("pip_stderr_tail", tailErr)
+                }
+                If pipRc '= 0 {
+                    Do result.%Set("ok", 0)
+                    Do result.%Set("action", "install_failed")
+                    Do result.%Set("error", "pip install failed with rc "_pipRc)
+                    Return result.%ToJSON()
+                }
+            }
+        }
+    } Catch ex {
+        Do result.%Set("ok", 0)
+        Do result.%Set("action", "install_failed")
+        Do result.%Set("error", ex.DisplayString())
+        Return result.%ToJSON()
+    }
+    Set ready = ..FillIrisVectorGraphProbe(result)
+    If ready {
+        Do result.%Remove("import_error")
+        Do result.%Set("action", "installed")
+        Return result.%ToJSON()
+    }
+    Do result.%Set("ok", 0)
+    Do result.%Set("action", "install_failed")
+    If 'result.%IsDefined("error") {
+        Do result.%Set("error", "import still fails after pip install")
+    }
+    Return result.%ToJSON()
+}
+
+/// Deploy: delete legacy ``Graph.KG.rdfedges`` when present (#5523); Write status lines.
+ClassMethod RemediateGraphKgLegacyRdfedgesOutput() As %Status
+{
+    Set legacy = "Graph.KG.rdfedges"
+    If ##class(%Dictionary.CompiledClass).%ExistsId(legacy) {
+        Write "Deleting legacy ", legacy, !
+        Set sc = $System.OBJ.Delete(legacy, "ck")
+        If $System.Status.IsError(sc) {
+            Write "ERROR delete: ", $System.Status.GetErrorText(sc), !
+            Return sc
+        }
+        Write "deleted legacy", !
+    } Else {
+        Write "no legacy", !
+    }
+    Write "OK", !
+    Return $$$OK
+}
+
+/// Deploy/install entry: init schema and emit ``InitSchema:`` JSON line for deploy parsing.
+ClassMethod DeployInitSchemaOutput() As %Status
+{
+    Set engine = ..Local()
+    Do engine.InitSchema()
+    Write "InitSchema: "_engine.InitSchemaJson(),!
+    Return $$$OK
 }
 
 /// Quick smoke test — initializes schema if needed, runs MATCH (n) RETURN count(n) AS cnt.
