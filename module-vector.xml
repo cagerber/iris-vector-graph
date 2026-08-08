@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="25">
+  <Document name="iris-vector-graph-vector.ZPM">
+    <Module>
+      <Name>iris-vector-graph-vector</Name>
+      <Description>VECTOR Search license required — kg_NodeEmbeddings persistence (%Library.Vector). Not a dependency of iris-vector-graph-core or iris-vector-graph.</Description>
+      <Version>2.5.0-trifour.2</Version>
+      <Packaging>module</Packaging>
+      <SourcesRoot>iris_src/src</SourcesRoot>
+      <Dependencies>
+        <ModuleReference>
+          <Name>iris-vector-graph-core</Name>
+          <Version>2.5.0-trifour.2</Version>
+        </ModuleReference>
+      </Dependencies>
+      <Resource Name="Graph.KG.kgNodeEmbeddings.CLS"/>
+      <Resource Name="Graph.KG.kgNodeEmbeddingsoptimized.CLS"/>
+      <Keywords>
+        <Keyword>vector</Keyword>
+        <Keyword>embeddings</Keyword>
+        <Keyword>knowledge-graph</Keyword>
+      </Keywords>
+    </Module>
+  </Document>
+</Export>

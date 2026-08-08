@@ -3,14 +3,14 @@
   <Document name="iris-vector-graph.ZPM">
     <Module>
       <Name>iris-vector-graph</Name>
-      <Description>Knowledge graph engine for InterSystems IRIS — temporal property graph, openCypher queries, vector search (HNSW/IVFFlat/BM25/PLAID), graph analytics (PageRank, WCC, PPR), and pre-aggregated time-series analytics. Python SDK on PyPI: iris-vector-graph.</Description>
-      <Version>2.5.0-trifour.1</Version>
+      <Description>Knowledge graph engine for InterSystems IRIS — temporal property graph, openCypher queries, graph analytics (PageRank, WCC, PPR), and pre-aggregated time-series analytics. Python SDK on PyPI: iris-vector-graph.</Description>
+      <Version>2.5.0-trifour.2</Version>
       <Packaging>module</Packaging>
       <SourcesRoot>iris_src/src</SourcesRoot>
       <Dependencies>
         <ModuleReference>
           <Name>iris-vector-graph-core</Name>
-          <Version>2.5.0-trifour.1</Version>
+          <Version>2.5.0-trifour.2</Version>
         </ModuleReference>
       </Dependencies>
       <Resource Name="Graph.KG.ArnoAccel.CLS"/>

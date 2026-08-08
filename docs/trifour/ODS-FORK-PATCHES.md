@@ -21,14 +21,16 @@ See ODS ADR: `docs/dev/journal/adr-2026-06-ivg-vendor-non-vector-license.md`.
 | `iris_vector_graph/_engine/vector_license.py` | Shared classifier for vector-only init failures |
 | `iris_vector_graph/_engine/schema.py` | Skip vector DDL/procedures on license errors; return `status: partial` |
 | `iris_src/src/IVG/CypherEngine.cls` | `InitSchemaJson` partial handling; deploy helpers (`DeployInitSchemaOutput`, `EnsureIrisVectorGraphPythonJSON`, …) |
-| `module.xml` / `module-core.xml` | **IPM completeness** — all 44 `iris_src/src/**/*.cls` resources; version `2.5.0-trifour.1` (wheel `2.5.0+trifour.1`) |
-| `scripts/generate_module_xml_resources.py` | Regenerates module resource lists from the filesystem (core = pure ObjectScript; full = embedded Python + bridge classes) |
+| `module.xml` / `module-core.xml` / `module-vector.xml` | **IPM completeness** — all 44 `iris_src/src/**/*.cls` resources; version `2.5.0-trifour.2` (wheel `2.5.0+trifour.2`) |
+| `scripts/generate_module_xml_resources.py` | Regenerates module resource lists from the filesystem (core / full / vector split) |
 | `tests/unit/test_module_xml_drift.py` | Fails CI when module XML drifts from `iris_src/src` |
+| `iris_vector_graph/_engine/vector_license.py` | `vector_module_license_load_error()` — named failure when `iris-vector-graph-vector` cannot compile (#15806) |
 
 ### IPM module split (generator rules)
 
-- **`iris-vector-graph-core`**: pure ObjectScript primitives (VecIndex, GraphIndex, Traversal*, NKGAccel*, PageRank, Algorithms, Meta, …).
-- **`iris-vector-graph`**: depends on core; classes with `Language = python` plus explicit bridge entries (`PyOps`, `Service`, `BM25Index`, `GraphOperators`, `User.Exec`, …).
+- **`iris-vector-graph-core`**: pure ObjectScript primitives (VecIndex, GraphIndex, Traversal*, NKGAccel*, PageRank, Algorithms, Meta, …). **No VECTOR license required.**
+- **`iris-vector-graph`**: depends on core; classes with `Language = python` plus explicit bridge entries (`PyOps`, `Service`, `BM25Index`, `GraphOperators`, `User.Exec`, …). **Does not depend on vector module.**
+- **`iris-vector-graph-vector`** (optional): `Graph.KG.kgNodeEmbeddings` + `kgNodeEmbeddingsoptimized` — declare `%Library.Vector`; **compile fails with IRIS #15806** on IRISHealth / restricted targets (verified 2026-08-08 on CREST-ODS). Not a dependency of core or full.
 
 Regenerate after adding or renaming `.cls` files:
 

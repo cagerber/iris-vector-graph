@@ -1,4 +1,4 @@
-"""Ensure module.xml / module-core.xml cover every iris_src/src/**/*.cls file."""
+"""Ensure module XML files cover every iris_src/src/**/*.cls file."""
 
 from __future__ import annotations
 
@@ -31,12 +31,22 @@ def test_module_resources_match_filesystem() -> None:
     assert fs, "expected ObjectScript classes under iris_src/src"
     core = _module_resources(REPO_ROOT / "module-core.xml")
     full = _module_resources(REPO_ROOT / "module.xml")
-    assert not (core & full), f"overlap between core and full: {sorted(core & full)}"
-    assert core | full == fs, (
-        f"module drift: missing={sorted(fs - core - full)} "
-        f"extra={sorted((core | full) - fs)}"
+    vector = _module_resources(REPO_ROOT / "module-vector.xml")
+    assert not (core & full), f"overlap core/full: {sorted(core & full)}"
+    assert not (core & vector), f"overlap core/vector: {sorted(core & vector)}"
+    assert not (full & vector), f"overlap full/vector: {sorted(full & vector)}"
+    assert core | full | vector == fs, (
+        f"module drift: missing={sorted(fs - core - full - vector)} "
+        f"extra={sorted((core | full | vector) - fs)}"
     )
     assert len(fs) == 44
+    assert len(vector) == 2
+
+
+def test_core_and_full_do_not_depend_on_vector_module() -> None:
+    for path in (REPO_ROOT / "module-core.xml", REPO_ROOT / "module.xml"):
+        text = path.read_text(encoding="utf-8")
+        assert "iris-vector-graph-vector" not in text
 
 
 def test_generator_check_is_clean() -> None:
