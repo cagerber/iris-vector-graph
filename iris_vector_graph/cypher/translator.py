@@ -773,7 +773,7 @@ def _translate_test_procedure(proc: ast.CypherProcedureCall, context: Translatio
         call_args = []
         for i, arg in enumerate(proc.arguments or []):
             # Check for aggregation functions in arguments (InvalidAggregation)
-            if isinstance(arg, ast.FunctionCall) and arg.name.lower() in (
+            if isinstance(arg, ast.FunctionCall) and arg.function_name.lower() in (
                 'count', 'sum', 'avg', 'min', 'max', 'collect', 'stdev', 'stdevp',
                 'percentiledisc', 'percentilecont',
             ):
@@ -9927,6 +9927,41 @@ def _normalize_tz_offset(tz):
     if m:
         return m.group(1)
     return tz
+
+
+def _format_tz_for_iso(tz_str, ref_year=None, ref_month=None, ref_day=None):
+    """Format a timezone string for an ISO 8601 datetime/time literal.
+
+    Accepts:
+      - Numeric offsets like '+01:00', '-05:00', 'Z'
+      - IANA timezone names like 'Europe/Stockholm', 'UTC', 'GMT'
+
+    Returns the ISO suffix to append, e.g. '+01:00', 'Z', '+02:00[Europe/Stockholm]'.
+
+    If ref_year/month/day are provided, computes the DST-aware numeric offset for that
+    specific date (for IANA zones).  Otherwise uses a representative summer date.
+    """
+    import re as _re_ftz
+    if tz_str in ('Z', 'z', 'UTC', 'GMT', '+00:00', '-00:00', '+0000', '-0000'):
+        return 'Z' if tz_str in ('Z', 'z', 'UTC', 'GMT') else tz_str
+    # Numeric offset pattern: +HH:MM or -HH:MM or +HHMM or -HHMM
+    m_num = _re_ftz.match(r'^([+-])(\d{2}):?(\d{2})(?::(\d{2}))?$', tz_str)
+    if m_num:
+        offset_str = f"{m_num.group(1)}{m_num.group(2)}:{m_num.group(3)}"
+        if m_num.group(4) and m_num.group(4) != '00':
+            offset_str += f":{m_num.group(4)}"
+        return offset_str
+    # IANA timezone name
+    if '/' in tz_str or tz_str in ('UTC', 'GMT'):
+        y = ref_year or 2015
+        mo = ref_month or 7
+        d = ref_day or 21
+        numeric_offset = _iana_tz_offset(tz_str, y, mo, d)
+        if numeric_offset:
+            return f"{numeric_offset}[{tz_str}]"
+        return tz_str
+    # Fallback: return as-is after normalizing
+    return _normalize_tz_offset(tz_str)
 
 
 def _subsecond_frac(ns, us, ms):

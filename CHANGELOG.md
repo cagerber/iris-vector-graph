@@ -1,5 +1,26 @@
 # Changelog
 
+### v2.7.0 (2026-08-08)
+
+**Test coverage: 90%** (21,058 statements, up from ~74% at v2.6.0)
+
+#### Test suite
+
+- Added 43 new unit test files (7,000+ new assertions) across all modules:
+  translator, parser, query engine, snapshot, schema, admin, bulk loader,
+  embeddings, vector, cypher API, GQL, fusion, embedded, RDF/SHACL/prov
+- Coverage per module: translator.py 84%, query.py 88%, cypher_api.py 94%,
+  schema.py 93%, fusion.py 100%, snapshot.py 76%
+
+#### Bug fixes
+
+- `translator.py`: add missing `_format_tz_for_iso` helper (called by
+  `_build_temporal_from_variable_map` but never defined — dead-code fix)
+- `translator.py` line 776: `arg.name` → `arg.function_name` for `FunctionCall`
+  nodes in vector search argument resolution
+
+---
+
 ### v2.6.0 (2026-08-08)
 
 **openCypher TCK compliance: 2930/3897 scenarios (75.2%)**
@@ -237,7 +258,7 @@ Six bugs/gaps fixed in `Graph.KG.BM25Index`:
   exceeded 10M (e.g. many-doc indexes with saturated query terms). Fixed by
   scaling to a 12-decimal integer key and using `$Order(..., -1)` native descending
   iteration instead.
-- fix: `Insert` vocab_size increment dead code — `$Data` check fired *after* the
+- fix: `Insert` vocab_size increment dead code — `$Data` check fired _after_ the
   IDF `Set`, so the condition was always false and vocab_size never grew on insert.
   Fixed by checking `$Data` before the `Set`.
 - fix: `Tokenize` fallback branch had no stopword filtering; now shares the same
