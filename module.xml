@@ -25,7 +25,6 @@
       <Resource Name="Graph.KG.Service.CLS"/>
       <Resource Name="Graph.KG.TraversalBFS.CLS"/>
       <Resource Name="IVG.CypherEngine.CLS"/>
-      <Resource Name="IVG.PageRankEmbedded.CLS"/>
       <Resource Name="iris.vector.graph.GraphOperators.CLS"/>
     </Module>
   </Document>

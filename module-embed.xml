@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="25">
+  <Document name="iris-vector-graph-embed.ZPM">
+    <Module>
+      <Name>iris-vector-graph-embed</Name>
+      <Description>Optional embedded-Python PageRank helpers. Not a dependency of iris-vector-graph-core or iris-vector-graph. Skip on IRIS Health ODS graph deploy.</Description>
+      <Version>2.5.0-trifour.6</Version>
+      <Packaging>module</Packaging>
+      <SourcesRoot>iris_src/src</SourcesRoot>
+      <Dependencies>
+        <ModuleReference>
+          <Name>iris-vector-graph-core</Name>
+          <Version>2.5.0-trifour.6</Version>
+        </ModuleReference>
+      </Dependencies>
+      <Resource Name="IVG.PageRankEmbedded.CLS"/>
+    </Module>
+  </Document>
+</Export>
