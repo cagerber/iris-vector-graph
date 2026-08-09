@@ -10,6 +10,7 @@
       <Resource Name="Graph.KG.Algorithms.CLS"/>
       <Resource Name="Graph.KG.BenchSeeder.CLS"/>
       <Resource Name="Graph.KG.Centrality.CLS"/>
+      <Resource Name="Graph.KG.EdgeScan.CLS"/>
       <Resource Name="Graph.KG.GraphIndex.CLS"/>
       <Resource Name="Graph.KG.IVFIndex.CLS"/>
       <Resource Name="Graph.KG.Meta.CLS"/>
@@ -21,9 +22,11 @@
       <Resource Name="Graph.KG.PLAIDSearch.CLS"/>
       <Resource Name="Graph.KG.PageRank.CLS"/>
       <Resource Name="Graph.KG.Snapshot.CLS"/>
+      <Resource Name="Graph.KG.Subgraph.CLS"/>
       <Resource Name="Graph.KG.TemporalIndex.CLS"/>
       <Resource Name="Graph.KG.TestEdge.CLS"/>
       <Resource Name="Graph.KG.Traversal.CLS"/>
+      <Resource Name="Graph.KG.TraversalBuild.CLS"/>
       <Resource Name="Graph.KG.TraversalKHop.CLS"/>
       <Resource Name="Graph.KG.TraversalPaths.CLS"/>
       <Resource Name="Graph.KG.VecIndex.CLS"/>

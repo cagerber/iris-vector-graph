@@ -19,14 +19,11 @@
       <Resource Name="Graph.KG.Benchmark.CLS"/>
       <Resource Name="Graph.KG.Communities.CLS"/>
       <Resource Name="Graph.KG.Edge.CLS"/>
-      <Resource Name="Graph.KG.EdgeScan.CLS"/>
       <Resource Name="Graph.KG.EmbedQueue.CLS"/>
       <Resource Name="Graph.KG.Loader.CLS"/>
       <Resource Name="Graph.KG.PyOps.CLS"/>
       <Resource Name="Graph.KG.Service.CLS"/>
-      <Resource Name="Graph.KG.Subgraph.CLS"/>
       <Resource Name="Graph.KG.TraversalBFS.CLS"/>
-      <Resource Name="Graph.KG.TraversalBuild.CLS"/>
       <Resource Name="IVG.CypherEngine.CLS"/>
       <Resource Name="PageRankEmbedded.CLS"/>
       <Resource Name="User.Exec.CLS"/>

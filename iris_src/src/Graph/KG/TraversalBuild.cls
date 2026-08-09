@@ -10,33 +10,39 @@ ClassMethod BuildKG() As %Status
 		Kill ^KG
 		TStart
 		
-		// 1. Labels
-		&sql(DECLARE c1 CURSOR FOR SELECT s, label FROM Graph_KG.rdf_labels)
-		&sql(OPEN c1)
-		For {
-			&sql(FETCH c1 INTO :s, :label)
-			Quit:SQLCODE'=0
-			Set ^KG("label", label, s) = ""
+		// 1. Labels (runtime SQL — core IPM loads before InitSchema)
+		Set stmt1 = ##class(%SQL.Statement).%New()
+		If $$$ISOK(stmt1.%Prepare("SELECT s, label FROM Graph_KG.rdf_labels")) {
+			Set rs1 = stmt1.%Execute()
+			While $IsObject(rs1) && rs1.%Next() {
+				Set s = rs1.%Get("s")
+				Set label = rs1.%Get("label")
+				Set ^KG("label", label, s) = ""
+			}
 		}
-		&sql(CLOSE c1)
 		
 		// 2. Props
-		&sql(DECLARE c2 CURSOR FOR SELECT s, key, val FROM Graph_KG.rdf_props)
-		&sql(OPEN c2)
-		For {
-			&sql(FETCH c2 INTO :s, :key, :val)
-			Quit:SQLCODE'=0
-			Set ^KG("prop", s, key) = val
+		Set stmt2 = ##class(%SQL.Statement).%New()
+		If $$$ISOK(stmt2.%Prepare("SELECT s, key, val FROM Graph_KG.rdf_props")) {
+			Set rs2 = stmt2.%Execute()
+			While $IsObject(rs2) && rs2.%Next() {
+				Set s = rs2.%Get("s")
+				Set key = rs2.%Get("key")
+				Set val = rs2.%Get("val")
+				Set ^KG("prop", s, key) = val
+			}
 		}
-		&sql(CLOSE c2)
 		
 		// 3. Edges & Stats (including weights)
 		Set count = 0
-		&sql(DECLARE c3 CURSOR FOR SELECT s, p, o_id, qualifiers FROM Graph_KG.rdf_edges)
-		&sql(OPEN c3)
-		For {
-			&sql(FETCH c3 INTO :s, :p, :o, :qual)
-			Quit:SQLCODE'=0
+		Set stmt3 = ##class(%SQL.Statement).%New()
+		If $$$ISOK(stmt3.%Prepare("SELECT s, p, o_id, qualifiers FROM Graph_KG.rdf_edges")) {
+			Set rs3 = stmt3.%Execute()
+			While $IsObject(rs3) && rs3.%Next() {
+				Set s = rs3.%Get("s")
+				Set p = rs3.%Get("p")
+				Set o = rs3.%Get("o_id")
+				Set qual = rs3.%Get("qualifiers")
 			
 			If (s = "") || (p = "") || (o = "") Continue
 			
@@ -59,8 +65,8 @@ ClassMethod BuildKG() As %Status
 				TCommit
 				TStart
 			}
+			}
 		}
-		&sql(CLOSE c3)
 		
 		TCommit
 
