@@ -44,8 +44,8 @@ def test_module_resources_match_filesystem() -> None:
         f"extra={sorted((core | full | vector | mcp) - fs)}"
     )
     assert len(fs) == 44
-    assert len(core) == 22
-    assert len(full) == 17
+    assert len(core) == 25
+    assert len(full) == 14
     assert len(vector) == 2
     assert len(mcp) == 3
 

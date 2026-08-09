@@ -8,11 +8,12 @@ Module split:
 - **iris-vector-graph-mcp**: optional; ``%AI.MCP`` / ``%AI.Tool*`` (full IRIS only, not IRIS Health).
 
 A class is placed in the full module when its ``.cls`` file contains
-``Language = python`` (embedded Python), its resource name is listed in
-``FULL_MODULE_EXTRA`` or ``SCHEMA_DEPENDENT_CLASSES`` below, or it has embedded
-``&sql`` against Graph_KG tables (listed explicitly — compile requires schema).
-Classes in ``VECTOR_MODULE_CLASSES`` or ``MCP_MODULE_CLASSES`` go to the vector
-or MCP optional modules.
+``Language = python`` (embedded Python) or its resource name is listed in
+``FULL_MODULE_EXTRA`` below. Classes in ``VECTOR_MODULE_CLASSES`` or
+``MCP_MODULE_CLASSES`` go to the vector or MCP optional modules.
+
+Core classes that reference ``Graph_KG`` SQL tables use runtime ``%SQL.Statement``
+(not compile-time ``&sql``) so ``iris-vector-graph-core`` compiles before ``InitSchema``.
 """
 
 from __future__ import annotations
@@ -30,16 +31,6 @@ MODULE_VECTOR = REPO_ROOT / "module-vector.xml"
 MODULE_MCP = REPO_ROOT / "module-mcp.xml"
 
 ZPM_VERSION = "2.5.0-trifour.6"
-
-# Classes with embedded &sql against Graph_KG tables — compile-time SQL validation
-# requires tables to exist; must load after IVG.CypherEngine.InitSchema (full module).
-SCHEMA_DEPENDENT_CLASSES: frozenset[str] = frozenset(
-    {
-        "Graph.KG.EdgeScan.CLS",
-        "Graph.KG.Subgraph.CLS",
-        "Graph.KG.TraversalBuild.CLS",
-    }
-)
 
 # Bridge / integration classes without embedded Python — belong in full module.
 FULL_MODULE_EXTRA: frozenset[str] = frozenset(
@@ -112,11 +103,7 @@ def split_resources(
             vector.append(name)
         elif name in MCP_MODULE_CLASSES:
             mcp.append(name)
-        elif (
-            name in SCHEMA_DEPENDENT_CLASSES
-            or name in FULL_MODULE_EXTRA
-            or _EMBEDDED_PYTHON.search(text)
-        ):
+        elif name in FULL_MODULE_EXTRA or _EMBEDDED_PYTHON.search(text):
             full.append(name)
         else:
             core.append(name)

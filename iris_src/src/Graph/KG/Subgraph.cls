@@ -120,19 +120,17 @@ ClassMethod SubgraphJson(seedJson As %String, maxHops As %Integer = 2, edgeTypes
 		}
 		If hasProp Do propsObj.%Set(n, propObj)
 		
-		// Labels: scan all known labels for this node
-		// ^KG("label", labelName, nodeId) = ""
+		// Labels: runtime SQL — no compile-time &sql (core IPM loads before InitSchema).
 		Set labelArr = ##class(%DynamicArray).%New()
 		Set hasLabel = 0
-		&sql(DECLARE lblCursor CURSOR FOR SELECT label FROM Graph_KG.rdf_labels WHERE s = :n)
-		&sql(OPEN lblCursor)
-		For {
-			&sql(FETCH lblCursor INTO :lbl)
-			Quit:SQLCODE'=0
-			Do labelArr.%Push(lbl)
-			Set hasLabel = 1
+		Set lblStmt = ##class(%SQL.Statement).%New()
+		If $$$ISOK(lblStmt.%Prepare("SELECT label FROM Graph_KG.rdf_labels WHERE s = ?")) {
+			Set lblRs = lblStmt.%Execute(n)
+			While $IsObject(lblRs) && lblRs.%Next() {
+				Do labelArr.%Push(lblRs.%Get("label"))
+				Set hasLabel = 1
+			}
 		}
-		&sql(CLOSE lblCursor)
 		If hasLabel Do labelsObj.%Set(n, labelArr)
 	}
 	
