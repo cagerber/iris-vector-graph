@@ -32,21 +32,27 @@ def test_module_resources_match_filesystem() -> None:
     core = _module_resources(REPO_ROOT / "module-core.xml")
     full = _module_resources(REPO_ROOT / "module.xml")
     vector = _module_resources(REPO_ROOT / "module-vector.xml")
+    mcp = _module_resources(REPO_ROOT / "module-mcp.xml")
     assert not (core & full), f"overlap core/full: {sorted(core & full)}"
     assert not (core & vector), f"overlap core/vector: {sorted(core & vector)}"
     assert not (full & vector), f"overlap full/vector: {sorted(full & vector)}"
-    assert core | full | vector == fs, (
-        f"module drift: missing={sorted(fs - core - full - vector)} "
-        f"extra={sorted((core | full | vector) - fs)}"
+    assert not (core & mcp), f"overlap core/mcp: {sorted(core & mcp)}"
+    assert not (full & mcp), f"overlap full/mcp: {sorted(full & mcp)}"
+    assert not (vector & mcp), f"overlap vector/mcp: {sorted(vector & mcp)}"
+    assert core | full | vector | mcp == fs, (
+        f"module drift: missing={sorted(fs - core - full - vector - mcp)} "
+        f"extra={sorted((core | full | vector | mcp) - fs)}"
     )
     assert len(fs) == 44
     assert len(vector) == 2
+    assert len(mcp) == 3
 
 
-def test_core_and_full_do_not_depend_on_vector_module() -> None:
+def test_core_and_full_do_not_depend_on_optional_modules() -> None:
     for path in (REPO_ROOT / "module-core.xml", REPO_ROOT / "module.xml"):
         text = path.read_text(encoding="utf-8")
         assert "iris-vector-graph-vector" not in text
+        assert "iris-vector-graph-mcp" not in text
 
 
 def test_generator_check_is_clean() -> None:

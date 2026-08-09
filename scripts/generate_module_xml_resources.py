@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Generate module.xml, module-core.xml, and module-vector.xml from iris_src/src/**/*.cls.
+"""Generate module.xml, module-core.xml, module-vector.xml, and module-mcp.xml from iris_src/src/**/*.cls.
 
 Module split:
 - **iris-vector-graph-core**: pure ObjectScript graph primitives (no embedded Python).
-- **iris-vector-graph**: depends on core; Python bridge, MCP, Cypher engine, BM25, etc.
+- **iris-vector-graph**: depends on core; Python bridge, Cypher engine, BM25, etc.
 - **iris-vector-graph-vector**: optional; classes declaring ``%Library.Vector`` (VECTOR license).
+- **iris-vector-graph-mcp**: optional; ``%AI.MCP`` / ``%AI.Tool*`` (full IRIS only, not IRIS Health).
 
 A class is placed in the full module when its ``.cls`` file contains
 ``Language = python`` (embedded Python) or its resource name is listed in
-``FULL_MODULE_EXTRA`` below. Classes in ``VECTOR_MODULE_CLASSES`` go to the vector module.
+``FULL_MODULE_EXTRA`` below. Classes in ``VECTOR_MODULE_CLASSES`` or
+``MCP_MODULE_CLASSES`` go to the vector or MCP optional modules.
 """
 
 from __future__ import annotations
@@ -23,8 +25,9 @@ SRC_ROOT = REPO_ROOT / "iris_src" / "src"
 MODULE_CORE = REPO_ROOT / "module-core.xml"
 MODULE_FULL = REPO_ROOT / "module.xml"
 MODULE_VECTOR = REPO_ROOT / "module-vector.xml"
+MODULE_MCP = REPO_ROOT / "module-mcp.xml"
 
-ZPM_VERSION = "2.5.0-trifour.2"
+ZPM_VERSION = "2.5.0-trifour.3"
 
 # Bridge / integration classes without embedded Python — belong in full module.
 FULL_MODULE_EXTRA: frozenset[str] = frozenset(
@@ -48,6 +51,15 @@ VECTOR_MODULE_CLASSES: frozenset[str] = frozenset(
     {
         "Graph.KG.kgNodeEmbeddings.CLS",
         "Graph.KG.kgNodeEmbeddingsoptimized.CLS",
+    }
+)
+
+# Requires %AI.MCP / %AI.Tool* — not shipped on IRIS Health (e.g. CREST-ODS).
+MCP_MODULE_CLASSES: frozenset[str] = frozenset(
+    {
+        "Graph.KG.MCPService.CLS",
+        "Graph.KG.MCPToolSet.CLS",
+        "Graph.KG.MCPTools.CLS",
     }
 )
 
@@ -76,21 +88,24 @@ def filesystem_resources() -> frozenset[str]:
 
 def split_resources(
     resources: frozenset[str],
-) -> tuple[list[str], list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str], list[str]]:
     by_name = {cls_path_to_resource(p): p for p in filesystem_class_files()}
     full: list[str] = []
     core: list[str] = []
     vector: list[str] = []
+    mcp: list[str] = []
     for name in sorted(resources):
         cls_path = by_name[name]
         text = cls_path.read_text(encoding="utf-8")
         if name in VECTOR_MODULE_CLASSES:
             vector.append(name)
+        elif name in MCP_MODULE_CLASSES:
+            mcp.append(name)
         elif name in FULL_MODULE_EXTRA or _EMBEDDED_PYTHON.search(text):
             full.append(name)
         else:
             core.append(name)
-    return core, full, vector
+    return core, full, vector, mcp
 
 
 def _resource_lines(names: list[str], indent: str) -> str:
@@ -163,24 +178,56 @@ def render_module_vector(resources: list[str]) -> str:
 """
 
 
+def render_module_mcp(resources: list[str]) -> str:
+    resources_block = _resource_lines(resources, "      ")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="25">
+  <Document name="iris-vector-graph-mcp.ZPM">
+    <Module>
+      <Name>iris-vector-graph-mcp</Name>
+      <Description>Requires %AI.MCP (full IRIS; not IRIS Health). MCP service and knowledge-graph tools. Not a dependency of iris-vector-graph-core or iris-vector-graph.</Description>
+      <Version>{ZPM_VERSION}</Version>
+      <Packaging>module</Packaging>
+      <SourcesRoot>iris_src/src</SourcesRoot>
+      <Dependencies>
+        <ModuleReference>
+          <Name>iris-vector-graph-core</Name>
+          <Version>{ZPM_VERSION}</Version>
+        </ModuleReference>
+      </Dependencies>
+{resources_block}
+    </Module>
+  </Document>
+</Export>
+"""
+
+
 def parse_module_resources(path: Path) -> frozenset[str]:
     text = path.read_text(encoding="utf-8")
     return frozenset(re.findall(r'<Resource Name="([^"]+)"', text))
 
 
-def generate(*, check_only: bool = False) -> tuple[int, int, int, int]:
+def generate(*, check_only: bool = False) -> tuple[int, int, int, int, int]:
     all_resources = filesystem_resources()
-    core, full, vector = split_resources(all_resources)
-    partitions = core, full, vector
+    core, full, vector, mcp = split_resources(all_resources)
+    partitions = core, full, vector, mcp
     if sum(len(p) for p in partitions) != len(all_resources):
-        raise RuntimeError("core/full/vector partition does not cover all classes")
-    overlap = (set(core) & set(full)) | (set(core) & set(vector)) | (set(full) & set(vector))
+        raise RuntimeError("core/full/vector/mcp partition does not cover all classes")
+    overlap = (
+        (set(core) & set(full))
+        | (set(core) & set(vector))
+        | (set(core) & set(mcp))
+        | (set(full) & set(vector))
+        | (set(full) & set(mcp))
+        | (set(vector) & set(mcp))
+    )
     if overlap:
         raise RuntimeError(f"module overlap: {sorted(overlap)}")
 
     core_xml = render_module_core(core)
     full_xml = render_module_full(full)
     vector_xml = render_module_vector(vector)
+    mcp_xml = render_module_mcp(mcp)
 
     if check_only:
         drift: list[str] = []
@@ -190,30 +237,36 @@ def generate(*, check_only: bool = False) -> tuple[int, int, int, int]:
             drift.append(str(MODULE_FULL))
         if parse_module_resources(MODULE_VECTOR) != frozenset(vector):
             drift.append(str(MODULE_VECTOR))
+        if parse_module_resources(MODULE_MCP) != frozenset(mcp):
+            drift.append(str(MODULE_MCP))
         if MODULE_CORE.read_text(encoding="utf-8") != core_xml:
             drift.append(f"{MODULE_CORE} (content)")
         if MODULE_FULL.read_text(encoding="utf-8") != full_xml:
             drift.append(f"{MODULE_FULL} (content)")
         if MODULE_VECTOR.read_text(encoding="utf-8") != vector_xml:
             drift.append(f"{MODULE_VECTOR} (content)")
+        if MODULE_MCP.read_text(encoding="utf-8") != mcp_xml:
+            drift.append(f"{MODULE_MCP} (content)")
         if drift:
             print("DRIFT:", ", ".join(drift), file=sys.stderr)
-            return len(all_resources), len(core), len(full), len(vector)
+            return len(all_resources), len(core), len(full), len(vector), len(mcp)
         print(
             f"OK: {len(all_resources)} classes "
-            f"({len(core)} core, {len(full)} full, {len(vector)} vector)"
+            f"({len(core)} core, {len(full)} full, {len(vector)} vector, {len(mcp)} mcp)"
         )
-        return len(all_resources), len(core), len(full), len(vector)
+        return len(all_resources), len(core), len(full), len(vector), len(mcp)
 
     MODULE_CORE.write_text(core_xml, encoding="utf-8", newline="\n")
     MODULE_FULL.write_text(full_xml, encoding="utf-8", newline="\n")
     MODULE_VECTOR.write_text(vector_xml, encoding="utf-8", newline="\n")
+    MODULE_MCP.write_text(mcp_xml, encoding="utf-8", newline="\n")
     print(
         f"Wrote {MODULE_CORE.name} ({len(core)}), "
         f"{MODULE_FULL.name} ({len(full)}), "
-        f"{MODULE_VECTOR.name} ({len(vector)}); total {len(all_resources)} classes"
+        f"{MODULE_VECTOR.name} ({len(vector)}), "
+        f"{MODULE_MCP.name} ({len(mcp)}); total {len(all_resources)} classes"
     )
-    return len(all_resources), len(core), len(full), len(vector)
+    return len(all_resources), len(core), len(full), len(vector), len(mcp)
 
 
 def main() -> int:
@@ -224,9 +277,9 @@ def main() -> int:
         help="exit 1 if module XML files differ from generator output",
     )
     args = parser.parse_args()
-    total, core_n, full_n, vector_n = generate(check_only=args.check)
+    generate(check_only=args.check)
     if args.check:
-        expected_core, expected_full, expected_vector = split_resources(
+        expected_core, expected_full, expected_vector, expected_mcp = split_resources(
             filesystem_resources()
         )
         if parse_module_resources(MODULE_CORE) != frozenset(expected_core):
@@ -234,6 +287,8 @@ def main() -> int:
         if parse_module_resources(MODULE_FULL) != frozenset(expected_full):
             return 1
         if parse_module_resources(MODULE_VECTOR) != frozenset(expected_vector):
+            return 1
+        if parse_module_resources(MODULE_MCP) != frozenset(expected_mcp):
             return 1
         if MODULE_CORE.read_text(encoding="utf-8") != render_module_core(
             list(expected_core)
@@ -245,6 +300,10 @@ def main() -> int:
             return 1
         if MODULE_VECTOR.read_text(encoding="utf-8") != render_module_vector(
             list(expected_vector)
+        ):
+            return 1
+        if MODULE_MCP.read_text(encoding="utf-8") != render_module_mcp(
+            list(expected_mcp)
         ):
             return 1
         return 0
