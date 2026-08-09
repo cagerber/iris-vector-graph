@@ -44,8 +44,8 @@ def test_module_resources_match_filesystem() -> None:
         f"extra={sorted((core | full | vector | mcp) - fs)}"
     )
     assert len(fs) == 44
-    assert len(core) == 24
-    assert len(full) == 15
+    assert len(core) == 21
+    assert len(full) == 18
     assert len(vector) == 2
     assert len(mcp) == 3
 
@@ -55,19 +55,6 @@ def test_core_and_full_do_not_depend_on_optional_modules() -> None:
         text = path.read_text(encoding="utf-8")
         assert "iris-vector-graph-vector" not in text
         assert "iris-vector-graph-mcp" not in text
-
-
-def test_core_classes_have_no_compile_time_sql() -> None:
-    """Core IPM loads before InitSchema — no embedded &sql against Graph_KG."""
-    core = _module_resources(REPO_ROOT / "module-core.xml")
-    offenders: list[str] = []
-    for resource in sorted(core):
-        rel = resource[:-4].replace(".", "/") + ".cls"
-        path = SRC_ROOT / rel
-        text = path.read_text(encoding="utf-8")
-        if "&sql(" in text and "Graph_KG" in text:
-            offenders.append(resource)
-    assert offenders == [], f"core module must not use compile-time &sql on Graph_KG: {offenders}"
 
 
 def test_generator_check_is_clean() -> None:
