@@ -4,13 +4,13 @@
     <Module>
       <Name>iris-vector-graph</Name>
       <Description>Knowledge graph engine for InterSystems IRIS — temporal property graph, openCypher queries, graph analytics (PageRank, WCC, PPR), and pre-aggregated time-series analytics. Python SDK on PyPI: iris-vector-graph.</Description>
-      <Version>2.5.0-trifour.3</Version>
+      <Version>2.5.0-trifour.4</Version>
       <Packaging>module</Packaging>
       <SourcesRoot>iris_src/src</SourcesRoot>
       <Dependencies>
         <ModuleReference>
           <Name>iris-vector-graph-core</Name>
-          <Version>2.5.0-trifour.3</Version>
+          <Version>2.5.0-trifour.4</Version>
         </ModuleReference>
       </Dependencies>
       <Resource Name="Graph.KG.ArnoAccel.CLS"/>
@@ -19,11 +19,14 @@
       <Resource Name="Graph.KG.Benchmark.CLS"/>
       <Resource Name="Graph.KG.Communities.CLS"/>
       <Resource Name="Graph.KG.Edge.CLS"/>
+      <Resource Name="Graph.KG.EdgeScan.CLS"/>
       <Resource Name="Graph.KG.EmbedQueue.CLS"/>
       <Resource Name="Graph.KG.Loader.CLS"/>
       <Resource Name="Graph.KG.PyOps.CLS"/>
       <Resource Name="Graph.KG.Service.CLS"/>
+      <Resource Name="Graph.KG.Subgraph.CLS"/>
       <Resource Name="Graph.KG.TraversalBFS.CLS"/>
+      <Resource Name="Graph.KG.TraversalBuild.CLS"/>
       <Resource Name="IVG.CypherEngine.CLS"/>
       <Resource Name="PageRankEmbedded.CLS"/>
       <Resource Name="User.Exec.CLS"/>

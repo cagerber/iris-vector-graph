@@ -4,13 +4,12 @@
     <Module>
       <Name>iris-vector-graph-core</Name>
       <Description>Pure ObjectScript graph primitives for IRIS. No Python required. No VECTOR license required.</Description>
-      <Version>2.5.0-trifour.3</Version>
+      <Version>2.5.0-trifour.4</Version>
       <Packaging>module</Packaging>
       <SourcesRoot>iris_src/src</SourcesRoot>
       <Resource Name="Graph.KG.Algorithms.CLS"/>
       <Resource Name="Graph.KG.BenchSeeder.CLS"/>
       <Resource Name="Graph.KG.Centrality.CLS"/>
-      <Resource Name="Graph.KG.EdgeScan.CLS"/>
       <Resource Name="Graph.KG.GraphIndex.CLS"/>
       <Resource Name="Graph.KG.IVFIndex.CLS"/>
       <Resource Name="Graph.KG.Meta.CLS"/>
@@ -22,11 +21,9 @@
       <Resource Name="Graph.KG.PLAIDSearch.CLS"/>
       <Resource Name="Graph.KG.PageRank.CLS"/>
       <Resource Name="Graph.KG.Snapshot.CLS"/>
-      <Resource Name="Graph.KG.Subgraph.CLS"/>
       <Resource Name="Graph.KG.TemporalIndex.CLS"/>
       <Resource Name="Graph.KG.TestEdge.CLS"/>
       <Resource Name="Graph.KG.Traversal.CLS"/>
-      <Resource Name="Graph.KG.TraversalBuild.CLS"/>
       <Resource Name="Graph.KG.TraversalKHop.CLS"/>
       <Resource Name="Graph.KG.TraversalPaths.CLS"/>
       <Resource Name="Graph.KG.VecIndex.CLS"/>

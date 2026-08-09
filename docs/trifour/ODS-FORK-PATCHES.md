@@ -21,16 +21,17 @@ See ODS ADR: `docs/dev/journal/adr-2026-06-ivg-vendor-non-vector-license.md`.
 | `iris_vector_graph/_engine/vector_license.py` | Shared classifier for vector-only init failures |
 | `iris_vector_graph/_engine/schema.py` | Skip vector DDL/procedures on license errors; return `status: partial` |
 | `iris_src/src/IVG/CypherEngine.cls` | `InitSchemaJson` partial handling; deploy helpers (`DeployInitSchemaOutput`, `EnsureIrisVectorGraphPythonJSON`, …) |
-| `module.xml` / `module-core.xml` / `module-vector.xml` / `module-mcp.xml` | **IPM completeness** — all 44 `iris_src/src/**/*.cls` resources; version `2.5.0-trifour.3` (wheel `2.5.0+trifour.3`) |
+| `module.xml` / `module-core.xml` / `module-vector.xml` / `module-mcp.xml` | **IPM completeness** — all 44 `iris_src/src/**/*.cls` resources; version `2.5.0-trifour.4` (wheel `2.5.0+trifour.4`) |
 | `scripts/generate_module_xml_resources.py` | Regenerates module resource lists from the filesystem (core / full / vector / mcp split) |
+| `Graph.KG.Subgraph` / `TraversalBuild` / `EdgeScan` | **Compile-time SQL fix (trifour.4)** — embedded ``&sql`` replaced with runtime ``%SQL.Statement`` so `iris-vector-graph-core` compiles on an empty namespace before `InitSchema` |
 | `tests/unit/test_module_xml_drift.py` | Fails CI when module XML drifts from `iris_src/src` |
 | `iris_vector_graph/_engine/vector_license.py` | `vector_module_license_load_error()` — named failure when `iris-vector-graph-vector` cannot compile (#15806) |
 | `iris_vector_graph/_engine/mcp_license.py` | `mcp_module_load_error()` — named failure when `iris-vector-graph-mcp` cannot compile (%AI.MCP missing on IRIS Health) |
 
 ### IPM module split (generator rules)
 
-- **`iris-vector-graph-core`**: pure ObjectScript primitives (VecIndex, GraphIndex, Traversal*, NKGAccel*, PageRank, Algorithms, Meta, …). **No VECTOR license required. No %AI.MCP required.**
-- **`iris-vector-graph`**: depends on core; classes with `Language = python` plus explicit bridge entries (`PyOps`, `Service`, `BM25Index`, `GraphOperators`, `User.Exec`, …). **Does not depend on vector or MCP modules.**
+- **iris-vector-graph-core**: pure ObjectScript primitives (VecIndex, GraphIndex, Traversal*, NKGAccel*, PageRank, Algorithms, Meta, Subgraph, EdgeScan, …). **No VECTOR license required. No %AI.MCP required.** Uses runtime ``%SQL.Statement`` (not compile-time ``&sql``) where Graph_KG tables are referenced so core IPM compiles before ``InitSchema``.
+- **`iris-vector-graph`**: depends on core; classes with `Language = python` plus explicit bridge entries (`PyOps`, `Service`, `BM25Index`, `GraphOperators`, `User.Exec`, …). **Does not depend on vector or MCP modules.** `InitSchema` runs post-IPM via deploy / `IVG.CypherEngine`.
 - **`iris-vector-graph-vector`** (optional): `Graph.KG.kgNodeEmbeddings` + `kgNodeEmbeddingsoptimized` — declare `%Library.Vector`; **compile fails with IRIS #15806** on IRISHealth / restricted targets (verified 2026-08-08 on CREST-ODS). Not a dependency of core or full.
 - **`iris-vector-graph-mcp`** (optional): `Graph.KG.MCPService` + `MCPToolSet` + `MCPTools` — extend `%AI.MCP.Service` / `%AI.Tool*`; **compile fails on IRIS Health** (verified 2026-08-09 on CREST-ODS: `superclass %AI.MCP.Service does not exist`). Not a dependency of core or full. Explicit load only on full IRIS with %AI.MCP.
 

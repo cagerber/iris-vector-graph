@@ -4,13 +4,13 @@
     <Module>
       <Name>iris-vector-graph-mcp</Name>
       <Description>Requires %AI.MCP (full IRIS; not IRIS Health). MCP service and knowledge-graph tools. Not a dependency of iris-vector-graph-core or iris-vector-graph.</Description>
-      <Version>2.5.0-trifour.3</Version>
+      <Version>2.5.0-trifour.4</Version>
       <Packaging>module</Packaging>
       <SourcesRoot>iris_src/src</SourcesRoot>
       <Dependencies>
         <ModuleReference>
           <Name>iris-vector-graph-core</Name>
-          <Version>2.5.0-trifour.3</Version>
+          <Version>2.5.0-trifour.4</Version>
         </ModuleReference>
       </Dependencies>
       <Resource Name="Graph.KG.MCPService.CLS"/>

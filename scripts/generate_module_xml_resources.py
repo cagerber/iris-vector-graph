@@ -11,6 +11,9 @@ A class is placed in the full module when its ``.cls`` file contains
 ``Language = python`` (embedded Python) or its resource name is listed in
 ``FULL_MODULE_EXTRA`` below. Classes in ``VECTOR_MODULE_CLASSES`` or
 ``MCP_MODULE_CLASSES`` go to the vector or MCP optional modules.
+
+Core classes that reference ``Graph_KG`` SQL tables use runtime ``%SQL.Statement``
+(not compile-time ``&sql``) so ``iris-vector-graph-core`` compiles before ``InitSchema``.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ MODULE_FULL = REPO_ROOT / "module.xml"
 MODULE_VECTOR = REPO_ROOT / "module-vector.xml"
 MODULE_MCP = REPO_ROOT / "module-mcp.xml"
 
-ZPM_VERSION = "2.5.0-trifour.3"
+ZPM_VERSION = "2.5.0-trifour.4"
 
 # Bridge / integration classes without embedded Python — belong in full module.
 FULL_MODULE_EXTRA: frozenset[str] = frozenset(
