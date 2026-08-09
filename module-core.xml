@@ -33,15 +33,6 @@
       <Resource Name="Graph.KG.TraversalPaths.CLS"/>
       <Resource Name="Graph.KG.VecIndex.CLS"/>
       <Resource Name="IVG.Percentile.CLS"/>
-      <Keywords>
-        <Keyword>vector</Keyword>
-        <Keyword>graph</Keyword>
-        <Keyword>knowledge-graph</Keyword>
-        <Keyword>ANN</Keyword>
-        <Keyword>PLAID</Keyword>
-        <Keyword>PageRank</Keyword>
-        <Keyword>objectscript</Keyword>
-      </Keywords>
     </Module>
   </Document>
 </Export>

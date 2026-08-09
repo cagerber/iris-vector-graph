@@ -109,15 +109,6 @@ def render_module_core(resources: list[str]) -> str:
       <Packaging>module</Packaging>
       <SourcesRoot>iris_src/src</SourcesRoot>
 {resources_block}
-      <Keywords>
-        <Keyword>vector</Keyword>
-        <Keyword>graph</Keyword>
-        <Keyword>knowledge-graph</Keyword>
-        <Keyword>ANN</Keyword>
-        <Keyword>PLAID</Keyword>
-        <Keyword>PageRank</Keyword>
-        <Keyword>objectscript</Keyword>
-      </Keywords>
     </Module>
   </Document>
 </Export>
@@ -142,19 +133,6 @@ def render_module_full(resources: list[str]) -> str:
         </ModuleReference>
       </Dependencies>
 {resources_block}
-      <Keywords>
-        <Keyword>vector</Keyword>
-        <Keyword>graph</Keyword>
-        <Keyword>knowledge-graph</Keyword>
-        <Keyword>cypher</Keyword>
-        <Keyword>temporal-graph</Keyword>
-        <Keyword>vector-search</Keyword>
-        <Keyword>graphql</Keyword>
-        <Keyword>FHIR</Keyword>
-        <Keyword>PLAID</Keyword>
-        <Keyword>openCypher</Keyword>
-        <Keyword>analytics</Keyword>
-      </Keywords>
     </Module>
   </Document>
 </Export>
@@ -179,11 +157,6 @@ def render_module_vector(resources: list[str]) -> str:
         </ModuleReference>
       </Dependencies>
 {resources_block}
-      <Keywords>
-        <Keyword>vector</Keyword>
-        <Keyword>embeddings</Keyword>
-        <Keyword>knowledge-graph</Keyword>
-      </Keywords>
     </Module>
   </Document>
 </Export>

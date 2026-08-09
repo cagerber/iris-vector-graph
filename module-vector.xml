@@ -15,11 +15,6 @@
       </Dependencies>
       <Resource Name="Graph.KG.kgNodeEmbeddings.CLS"/>
       <Resource Name="Graph.KG.kgNodeEmbeddingsoptimized.CLS"/>
-      <Keywords>
-        <Keyword>vector</Keyword>
-        <Keyword>embeddings</Keyword>
-        <Keyword>knowledge-graph</Keyword>
-      </Keywords>
     </Module>
   </Document>
 </Export>
