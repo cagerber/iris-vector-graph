@@ -29,7 +29,7 @@ MODULE_FULL = REPO_ROOT / "module.xml"
 MODULE_VECTOR = REPO_ROOT / "module-vector.xml"
 MODULE_MCP = REPO_ROOT / "module-mcp.xml"
 
-ZPM_VERSION = "2.5.0-trifour.4"
+ZPM_VERSION = "2.5.0-trifour.6"
 
 # Classes with embedded &sql against Graph_KG tables — compile-time SQL validation
 # requires tables to exist; must load after IVG.CypherEngine.InitSchema (full module).
@@ -54,7 +54,6 @@ FULL_MODULE_EXTRA: frozenset[str] = frozenset(
         "Graph.KG.PyOps.CLS",
         "Graph.KG.Service.CLS",
         "iris.vector.graph.GraphOperators.CLS",
-        "User.Exec.CLS",
     }
 )
 

@@ -4,7 +4,7 @@
     <Module>
       <Name>iris-vector-graph-core</Name>
       <Description>Pure ObjectScript graph primitives for IRIS. No Python required. No VECTOR license required.</Description>
-      <Version>2.5.0-trifour.4</Version>
+      <Version>2.5.0-trifour.6</Version>
       <Packaging>module</Packaging>
       <SourcesRoot>iris_src/src</SourcesRoot>
       <Resource Name="Graph.KG.Algorithms.CLS"/>
@@ -27,6 +27,7 @@
       <Resource Name="Graph.KG.TraversalKHop.CLS"/>
       <Resource Name="Graph.KG.TraversalPaths.CLS"/>
       <Resource Name="Graph.KG.VecIndex.CLS"/>
+      <Resource Name="IVG.Exec.CLS"/>
       <Resource Name="IVG.Percentile.CLS"/>
     </Module>
   </Document>
