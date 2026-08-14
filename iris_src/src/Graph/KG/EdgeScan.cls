@@ -132,6 +132,8 @@ ClassMethod BulkIngestEdgesSQL(edgesJson As %String, predicate As %String = "KNO
 {
 	Set data = {}.%FromJSON(edgesJson)
 	Set n = 0
+	Set edgeStmt = ##class(%SQL.Statement).%New()
+	Set edgeOk = $$$ISOK(edgeStmt.%Prepare("INSERT INTO Graph_KG.rdf_edges (s, p, o_id) VALUES (?, ?, ?)"))
 	TSTART
 	Set iter = data.%GetIterator()
 	While iter.%GetNext(.idx, .edge) {
@@ -140,8 +142,13 @@ ClassMethod BulkIngestEdgesSQL(edgesJson As %String, predicate As %String = "KNO
 		Set o = edge.o
 		If (s = "") || (o = "") { Continue }
 		If s = o { Continue }
-		&sql(INSERT INTO Graph_KG.rdf_edges (s, p, o_id) VALUES (:s, :p, :o))
-		If (SQLCODE '= 0) && (SQLCODE '= -119) { Continue }
+		If edgeOk {
+			Set edgeRs = edgeStmt.%Execute(s, p, o)
+			If $IsObject(edgeRs) {
+				Set sqlcode = edgeRs.%SQLCODE
+				If (sqlcode '= 0) && (sqlcode '= -119) { Continue }
+			}
+		}
 		Do ..WriteAdjacency(s, p, o, "1.0")
 		Set n = n + 1
 	}
@@ -168,18 +175,31 @@ ClassMethod BulkIngestNodesSQL(nodesJson As %String) As %Integer
 {
 	Set data = {}.%FromJSON(nodesJson)
 	Set n = 0
+	Set nodeStmt = ##class(%SQL.Statement).%New()
+	Set nodeOk = $$$ISOK(nodeStmt.%Prepare("INSERT INTO Graph_KG.nodes (node_id) VALUES (?)"))
+	Set labelStmt = ##class(%SQL.Statement).%New()
+	Set labelOk = $$$ISOK(labelStmt.%Prepare("INSERT INTO Graph_KG.rdf_labels (s, label) VALUES (?, ?)"))
+	Set propStmt = ##class(%SQL.Statement).%New()
+	Set propOk = $$$ISOK(propStmt.%Prepare("INSERT INTO Graph_KG.rdf_props (s, ""key"", val) VALUES (?, ?, ?)"))
 	TSTART
 	Set iter = data.%GetIterator()
 	While iter.%GetNext(.idx, .node) {
 		Set id = node.id
 		If id = "" { Continue }
-		&sql(INSERT INTO Graph_KG.nodes (node_id) VALUES (:id))
-		If (SQLCODE '= 0) && (SQLCODE '= -119) { Continue }
+		If nodeOk {
+			Set nodeRs = nodeStmt.%Execute(id)
+			If $IsObject(nodeRs) {
+				Set sqlcode = nodeRs.%SQLCODE
+				If (sqlcode '= 0) && (sqlcode '= -119) { Continue }
+			}
+		}
 		If $IsObject(node.labels) {
 			Set liter = node.labels.%GetIterator()
 			While liter.%GetNext(.li, .label) {
 				If label = "" { Continue }
-				&sql(INSERT INTO Graph_KG.rdf_labels (s, label) VALUES (:id, :label))
+				If labelOk {
+					Do labelStmt.%Execute(id, label)
+				}
 			}
 		}
 		If $IsObject(node.props) {
@@ -188,7 +208,9 @@ ClassMethod BulkIngestNodesSQL(nodesJson As %String) As %Integer
 				If key = "" { Continue }
 				Try {
 					Set valStr = $Select($IsObject(val):val.%ToJSON(), $IsValidNum(val):val, 1:""""_$Replace($ZConvert(val,"O","UTF8"),"""","""""")_"""")
-					&sql(INSERT INTO Graph_KG.rdf_props (s, "key", val) VALUES (:id, :key, :valStr))
+					If propOk {
+						Do propStmt.%Execute(id, key, valStr)
+					}
 				} Catch ex { }
 			}
 		}

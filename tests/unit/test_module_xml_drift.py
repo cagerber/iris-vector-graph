@@ -77,6 +77,29 @@ def test_core_classes_have_no_compile_time_sql() -> None:
     assert offenders == [], f"core module must not use compile-time &sql on Graph_KG: {offenders}"
 
 
+def test_full_schema_consumers_use_runtime_sql() -> None:
+    """Full IPM compiles before InitSchema — Graph_KG consumers must not use &sql."""
+    # CypherEngine (InitSchema) lives in the full module, so tables cannot exist yet.
+    schema_consumers = (
+        "Graph.KG.EdgeScan.CLS",
+        "Graph.KG.Subgraph.CLS",
+        "Graph.KG.TraversalBuild.CLS",
+    )
+    offenders: list[str] = []
+    for resource in schema_consumers:
+        rel = resource[:-4].replace(".", "/") + ".cls"
+        path = SRC_ROOT / rel
+        text = path.read_text(encoding="utf-8")
+        if "&sql(" in text and "Graph_KG" in text:
+            offenders.append(resource)
+        if "##class(%SQL.Statement)" not in text:
+            offenders.append(f"{resource}:missing-%SQL.Statement")
+    assert offenders == [], (
+        "full-module Graph_KG consumers must use runtime %SQL.Statement "
+        f"(no compile-time &sql): {offenders}"
+    )
+
+
 def test_generator_check_is_clean() -> None:
     proc = subprocess.run(
         [sys.executable, str(GENERATOR), "--check"],

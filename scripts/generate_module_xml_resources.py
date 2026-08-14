@@ -9,9 +9,10 @@ Module split:
 - **iris-vector-graph-embed**: optional; ``IVG.PageRankEmbedded`` (heavy embedded Python; not required for ODS graph deploy on Health).
 
 A class is placed in the full module when its ``.cls`` file contains
-``Language = python`` (embedded Python), its resource name is listed in
-``FULL_MODULE_EXTRA`` or ``SCHEMA_DEPENDENT_CLASSES`` below, or it has embedded
-``&sql`` against Graph_KG tables (listed explicitly — compile requires schema).
+``Language = python`` (embedded Python), or its resource name is listed in
+``FULL_MODULE_EXTRA`` or ``SCHEMA_DEPENDENT_CLASSES`` below.
+``SCHEMA_DEPENDENT_CLASSES`` must use runtime ``%SQL.Statement`` (not ``&sql``)
+so the full module compiles before ``InitSchema``.
 Classes in ``VECTOR_MODULE_CLASSES``, ``MCP_MODULE_CLASSES``, or
 ``EMBED_MODULE_CLASSES`` go to the vector, MCP, or embed optional modules.
 """
@@ -31,10 +32,11 @@ MODULE_VECTOR = REPO_ROOT / "module-vector.xml"
 MODULE_MCP = REPO_ROOT / "module-mcp.xml"
 MODULE_EMBED = REPO_ROOT / "module-embed.xml"
 
-ZPM_VERSION = "2.5.0-trifour.6"
+ZPM_VERSION = "2.5.0-trifour.7"
 
-# Classes with embedded &sql against Graph_KG tables — compile-time SQL validation
-# requires tables to exist; must load after IVG.CypherEngine.InitSchema (full module).
+# Full-module Graph_KG consumers (placement only). Use runtime %SQL.Statement —
+# compile-time &sql fails because InitSchema runs only after the full IPM load
+# (CypherEngine lives in the full module; chicken-and-egg with table existence).
 SCHEMA_DEPENDENT_CLASSES: frozenset[str] = frozenset(
     {
         "Graph.KG.EdgeScan.CLS",

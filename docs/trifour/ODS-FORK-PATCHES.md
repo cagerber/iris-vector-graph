@@ -21,8 +21,9 @@ See ODS ADR: `docs/dev/journal/adr-2026-06-ivg-vendor-non-vector-license.md`.
 | `iris_vector_graph/_engine/vector_license.py` | Shared classifier for vector-only init failures |
 | `iris_vector_graph/_engine/schema.py` | Skip vector DDL/procedures on license errors; return `status: partial` |
 | `iris_src/src/IVG/CypherEngine.cls` | `InitSchemaJson` partial handling; deploy helpers (`DeployInitSchemaOutput`, `EnsureIrisVectorGraphPythonJSON`, …) |
-| `module.xml` / `module-core.xml` / `module-vector.xml` / `module-mcp.xml` / `module-embed.xml` | **IPM completeness** — all 44 `iris_src/src/**/*.cls` resources; version `2.5.0-trifour.6` (wheel `2.5.0+trifour.6`) |
-| `scripts/generate_module_xml_resources.py` | Regenerates module resource lists; **`SCHEMA_DEPENDENT_CLASSES`** — `EdgeScan`, `Subgraph`, `TraversalBuild` in full module (embedded `&sql` requires `Graph_KG` tables at compile) |
+| `module.xml` / `module-core.xml` / `module-vector.xml` / `module-mcp.xml` / `module-embed.xml` | **IPM completeness** — all 44 `iris_src/src/**/*.cls` resources; version `2.5.0-trifour.7` (wheel `2.5.0+trifour.7`) |
+| `scripts/generate_module_xml_resources.py` | Regenerates module resource lists; **`SCHEMA_DEPENDENT_CLASSES`** — `EdgeScan`, `Subgraph`, `TraversalBuild` in full module with **runtime `%SQL.Statement`** (no compile-time `&sql`; InitSchema runs only after full IPM load) |
+| `Graph.KG.Subgraph` / `EdgeScan` / `TraversalBuild` | **trifour.7:** restore runtime SQL so full module compiles on empty NS before `InitSchema` (trifour.6 regression restored compile-time `&sql`) |
 | `IVG.Exec` (renamed from `User.Exec`, trifour.5) | **IRIS Health ZPM fix** — `User` package triggers `Config.MapPackages` `<SUBSCRIPT>` during full-module Reload |
 | `IVG.PageRankEmbedded` in **`iris-vector-graph-embed`** (trifour.6) | Root-level `PageRankEmbedded` also triggered MapPackages SUBSCRIPT; moved to optional embed module (not loaded on CREST-ODS graph deploy) |
 | `tests/unit/test_module_xml_drift.py` | Fails CI when module XML drifts from `iris_src/src` |
@@ -32,7 +33,7 @@ See ODS ADR: `docs/dev/journal/adr-2026-06-ivg-vendor-non-vector-license.md`.
 ### IPM module split (generator rules)
 
 - **iris-vector-graph-core**: pure ObjectScript primitives (VecIndex, GraphIndex, Traversal*, NKGAccel*, PageRank, Algorithms, Meta, `IVG.Exec`, …). **No VECTOR license required. No %AI.MCP required.** **No embedded `&sql` against `Graph_KG` tables** — compiles before `InitSchema`.
-- **`iris-vector-graph`**: depends on core; classes with `Language = python`, `SCHEMA_DEPENDENT_CLASSES` (`EdgeScan`, `Subgraph`, `TraversalBuild`), plus explicit bridge entries (`PyOps`, `Service`, `BM25Index`, `GraphOperators`, …). **Does not depend on vector, MCP, or embed modules.** Load after core; `InitSchema` runs post-IPM via deploy / `IVG.CypherEngine`.
+- **`iris-vector-graph`**: depends on core; classes with `Language = python`, `SCHEMA_DEPENDENT_CLASSES` (`EdgeScan`, `Subgraph`, `TraversalBuild` — **runtime SQL**, not `&sql`), plus explicit bridge entries (`PyOps`, `Service`, `BM25Index`, `GraphOperators`, …). **Does not depend on vector, MCP, or embed modules.** Load after core; `InitSchema` runs post-IPM via deploy / `IVG.CypherEngine` (cannot run between core and full because `CypherEngine` is in the full module).
 - **`iris-vector-graph-embed`** (optional): `IVG.PageRankEmbedded` — heavy embedded Python; **not loaded** on IRIS Health ODS graph deploy.
 - **`iris-vector-graph-vector`** (optional): `Graph.KG.kgNodeEmbeddings` + `kgNodeEmbeddingsoptimized` — **#15806** on IRISHealth.
 - **`iris-vector-graph-mcp`** (optional): `Graph.KG.MCPService` + `MCPToolSet` + `MCPTools` — **%AI.MCP missing** on IRIS Health.
