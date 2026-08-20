@@ -3,6 +3,7 @@
 ## SQL Tables (Graph_KG)
 
 ### nodes
+
 ```sql
 CREATE TABLE Graph_KG.nodes (
     node_id VARCHAR(256) PRIMARY KEY,
@@ -11,6 +12,7 @@ CREATE TABLE Graph_KG.nodes (
 ```
 
 ### rdf_labels
+
 ```sql
 CREATE TABLE Graph_KG.rdf_labels (
     s VARCHAR(256) NOT NULL,
@@ -20,6 +22,7 @@ CREATE TABLE Graph_KG.rdf_labels (
 ```
 
 ### rdf_props
+
 ```sql
 CREATE TABLE Graph_KG.rdf_props (
     s VARCHAR(256) NOT NULL,
@@ -30,6 +33,7 @@ CREATE TABLE Graph_KG.rdf_props (
 ```
 
 ### rdf_edges
+
 ```sql
 CREATE TABLE Graph_KG.rdf_edges (
     edge_id BIGINT IDENTITY PRIMARY KEY,
@@ -41,6 +45,7 @@ CREATE TABLE Graph_KG.rdf_edges (
 ```
 
 ### kg_NodeEmbeddings
+
 ```sql
 CREATE TABLE Graph_KG.kg_NodeEmbeddings (
     id VARCHAR(256) PRIMARY KEY,
@@ -53,6 +58,7 @@ CREATE INDEX kg_emb_hnsw ON Graph_KG.kg_NodeEmbeddings(emb)
 ```
 
 ### fhir_bridges
+
 ```sql
 CREATE TABLE Graph_KG.fhir_bridges (
     fhir_code VARCHAR(64) %EXACT NOT NULL,
@@ -71,13 +77,13 @@ Note: `%EXACT` preserves case (IRIS VARCHAR uppercases by default).
 
 ## SQL Stored Procedures (Graph_KG)
 
-| Procedure | Signature | Description |
-|-----------|-----------|-------------|
-| `kg_KNN_VEC` | `(query_vector, k, label, property)` | HNSW vector search, returns JSON `[{"id","score"},...]` |
-| `kg_PPR` | `(seeds_json, damping, max_iter, ...)` | Personalized PageRank, returns JSON `[{"id","score"},...]` |
-| `kg_NEIGHBORS` | `(sources, predicate, direction)` | 1-hop neighborhood, returns JSON array |
-| `kg_BM25` | `(name, query, k)` | BM25 lexical search, returns JSON `[{"id","score"},...]` |
-| `kg_RRF_FUSE` | `(k, k1, k2, c, vector, text)` | Reciprocal rank fusion (vector + text) |
+| Procedure      | Signature                              | Description                                                |
+| -------------- | -------------------------------------- | ---------------------------------------------------------- |
+| `kg_KNN_VEC`   | `(query_vector, k, label, property)`   | HNSW vector search, returns JSON `[{"id","score"},...]`    |
+| `kg_PPR`       | `(seeds_json, damping, max_iter, ...)` | Personalized PageRank, returns JSON `[{"id","score"},...]` |
+| `kg_NEIGHBORS` | `(sources, predicate, direction)`      | 1-hop neighborhood, returns JSON array                     |
+| `kg_BM25`      | `(name, query, k)`                     | BM25 lexical search, returns JSON `[{"id","score"},...]`   |
+| `kg_RRF_FUSE`  | `(k, k1, k2, c, vector, text)`         | Reciprocal rank fusion (vector + text)                     |
 
 `kg_BM25` is a thin wrapper over `Graph.KG.BM25Index.Search()` exposed as an SQL stored procedure for Cypher translator Stage CTEs.
 

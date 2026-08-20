@@ -21,7 +21,7 @@ curl http://localhost:8200/schema
   "propertyKeys": ["name", "organism", "score"],
   "nodeCount": 8904,
   "edgeCount": 31000,
-  "labelDistribution": {"Gene": 4200, "Disease": 2100, "Drug": 2604}
+  "labelDistribution": { "Gene": 4200, "Disease": 2100, "Drug": 2604 }
 }
 ```
 
@@ -60,8 +60,8 @@ curl http://localhost:8200/server
   "ivg_version": "1.96.0",
   "iris_version": "IRIS for UNIX (Apple M3 Ultra) 2026.2 (Build 161)",
   "namespace": "IVG",
-  "schema": {"nodes": 8904, "edges": 31000, "labels": 12453, "embeddings": 8904},
-  "adjacency": {"kg_populated": true, "nkg_populated": true, "bfs_path": "arno"},
+  "schema": { "nodes": 8904, "edges": 31000, "labels": 12453, "embeddings": 8904 },
+  "adjacency": { "kg_populated": true, "nkg_populated": true, "bfs_path": "arno" },
   "objectscript_deployed": true,
   "arno_loaded": true,
   "probe_ms": 4.2,
@@ -108,7 +108,7 @@ curl http://localhost:8200/stats
 
 ```json
 {
-  "labelDistribution": {"Gene": 4200, "Disease": 2100},
+  "labelDistribution": { "Gene": 4200, "Disease": 2100 },
   "nodeCount": 8904,
   "edgeCount": 31000,
   "embeddingCount": 8904
@@ -124,7 +124,7 @@ curl http://localhost:8200/health
 ```
 
 ```json
-{"status": "ok", "node_count": 8904}
+{ "status": "ok", "node_count": 8904 }
 ```
 
 ---
@@ -154,7 +154,7 @@ curl -X POST http://localhost:8200/admin/indexes/rebuild \
 ```
 
 ```json
-{"status": "ok", "kg": true, "nkg": true}
+{ "status": "ok", "kg": true, "nkg": true }
 ```
 
 ### `POST /admin/embed`
@@ -180,6 +180,7 @@ curl -X POST http://localhost:8200/admin/load \
 ```
 
 NDJSON format — one event per line:
+
 ```json
 {"kind": "node", "id": "mesh:D003924", "labels": ["Disease"], "properties": {"name": "Diabetes mellitus"}}
 {"kind": "edge", "source": "mesh:D003924", "predicate": "INTERACTS_WITH", "target": "mesh:D011014", "properties": {}}
@@ -205,7 +206,7 @@ curl -X POST http://localhost:8200/admin/snapshot \
 ```
 
 ```json
-{"status": "ok", "path": "/tmp/ivg_snapshot_1747353600.snapshot"}
+{ "status": "ok", "path": "/tmp/ivg_snapshot_1747353600.snapshot" }
 ```
 
 ---
@@ -224,7 +225,12 @@ curl http://localhost:8200/admin/queries \
 ```json
 {
   "queries": [
-    {"id": "12345", "state": "RUN", "client": "127.0.0.1", "command": "SELECT * FROM Graph_KG.rdf_edges ..."}
+    {
+      "id": "12345",
+      "state": "RUN",
+      "client": "127.0.0.1",
+      "command": "SELECT * FROM Graph_KG.rdf_edges ..."
+    }
   ]
 }
 ```
@@ -239,7 +245,7 @@ curl -X DELETE http://localhost:8200/admin/queries/12345 \
 ```
 
 ```json
-{"status": "ok", "killed": "12345"}
+{ "status": "ok", "killed": "12345" }
 ```
 
 ---
@@ -265,7 +271,7 @@ curl -X POST http://localhost:8200/admin/explain \
   "cypher": "MATCH (a)-[*1..3]->(b) WHERE a.node_id = $s RETURN b.node_id",
   "sql": null,
   "parameters": [["mesh:D003924"]],
-  "var_length_paths": [{"min_hops": 1, "max_hops": 3, "direction": "out"}],
+  "var_length_paths": [{ "min_hops": 1, "max_hops": 3, "direction": "out" }],
   "is_transactional": false
 }
 ```

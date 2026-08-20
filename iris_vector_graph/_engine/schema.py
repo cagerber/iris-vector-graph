@@ -3,7 +3,6 @@ import logging
 from typing import Dict, Any, Optional, List
 
 from iris_vector_graph.schema import GraphSchema, _call_classmethod
-from iris_vector_graph.cypher.translator import _table
 from iris_vector_graph.capabilities import IRISCapabilities
 from iris_vector_graph._engine.vector_license import vector_init_partial_failure_message
 
@@ -792,7 +791,7 @@ class SchemaMixin:
         cursor = self.conn.cursor()
         try:
             cursor.execute(
-                f"SELECT edge_id FROM {_table('rdf_edges')} WHERE edge_id = ?",
+                f"SELECT edge_id FROM {self._t('rdf_edges')} WHERE edge_id = ?",
                 [edge_id],
             )
             if not cursor.fetchone():
@@ -800,21 +799,21 @@ class SchemaMixin:
                 return None
             self.create_node(reifier_id)
             cursor.execute(
-                f"INSERT INTO {_table('rdf_labels')} (s, label) "
+                f"INSERT INTO {self._t('rdf_labels')} (s, label) "
                 f"SELECT ?, ? WHERE NOT EXISTS "
-                f"(SELECT 1 FROM {_table('rdf_labels')} WHERE s = ? AND label = ?)",
+                f"(SELECT 1 FROM {self._t('rdf_labels')} WHERE s = ? AND label = ?)",
                 [reifier_id, label, reifier_id, label],
             )
             cursor.execute(
-                f"INSERT INTO {_table('rdf_reifications')} (reifier_id, edge_id) VALUES (?, ?)",
+                f"INSERT INTO {self._t('rdf_reifications')} (reifier_id, edge_id) VALUES (?, ?)",
                 [reifier_id, edge_id],
             )
             if props:
                 for key, val in props.items():
                     cursor.execute(
-                        f'INSERT INTO {_table("rdf_props")} (s, "key", val) '
+                        f'INSERT INTO {self._t("rdf_props")} (s, "key", val) '
                         f"SELECT ?, ?, ? WHERE NOT EXISTS "
-                        f'(SELECT 1 FROM {_table("rdf_props")} WHERE s = ? AND "key" = ?)',
+                        f'(SELECT 1 FROM {self._t("rdf_props")} WHERE s = ? AND "key" = ?)',
                         [reifier_id, key, str(val), reifier_id, key],
                     )
             self.conn.commit()
@@ -832,8 +831,8 @@ class SchemaMixin:
         try:
             cursor.execute(
                 f'SELECT r.reifier_id, p."key", p.val '
-                f"FROM {_table('rdf_reifications')} r "
-                f"LEFT JOIN {_table('rdf_props')} p ON p.s = r.reifier_id "
+                f"FROM {self._t('rdf_reifications')} r "
+                f"LEFT JOIN {self._t('rdf_props')} p ON p.s = r.reifier_id "
                 f"WHERE r.edge_id = ?",
                 [edge_id],
             )
@@ -856,17 +855,17 @@ class SchemaMixin:
         cursor = self.conn.cursor()
         try:
             cursor.execute(
-                f"DELETE FROM {_table('rdf_reifications')} WHERE reifier_id = ?",
+                f"DELETE FROM {self._t('rdf_reifications')} WHERE reifier_id = ?",
                 [reifier_id],
             )
             cursor.execute(
-                f"DELETE FROM {_table('rdf_props')} WHERE s = ?", [reifier_id]
+                f"DELETE FROM {self._t('rdf_props')} WHERE s = ?", [reifier_id]
             )
             cursor.execute(
-                f"DELETE FROM {_table('rdf_labels')} WHERE s = ?", [reifier_id]
+                f"DELETE FROM {self._t('rdf_labels')} WHERE s = ?", [reifier_id]
             )
             cursor.execute(
-                f"DELETE FROM {_table('nodes')} WHERE node_id = ?", [reifier_id]
+                f"DELETE FROM {self._t('nodes')} WHERE node_id = ?", [reifier_id]
             )
             self.conn.commit()
             return True

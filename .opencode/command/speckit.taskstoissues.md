@@ -1,6 +1,6 @@
 ---
 description: Convert existing tasks into actionable, dependency-ordered GitHub issues for the feature based on available design artifacts.
-tools: ['github/github-mcp-server/issue_write']
+tools: ["github/github-mcp-server/issue_write"]
 ---
 
 ## User Input
@@ -36,6 +36,7 @@ git config --get remote.origin.url
 **STOP AFTER THIS COMMAND COMPLETES.**
 
 Do NOT proceed to:
+
 - Running other speckit commands
 - Implementation or code changes
 - Any follow-up actions or "next steps"

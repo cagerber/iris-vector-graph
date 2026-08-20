@@ -1,15 +1,18 @@
 # Temporal Property Graph Ingest and Query Spec for `iris-vector-graph`
 
 ## Status
+
 Draft for initial implementation in `iris-vector-graph`
 
 ## Purpose
+
 Implement temporal property-graph ingest and query in `iris-vector-graph`, using the existing `^KG` model and Cypher layer as the primary runtime abstraction.
 
 The package is positioned as an IRIS-based graph/vector/text engine with SQL, openCypher, and GraphQL over a unified graph substrate, so temporal edges should extend that substrate rather than create a parallel one.
 
 Reference:
-- https://pypi.org/project/iris-vector-graph/
+
+- <https://pypi.org/project/iris-vector-graph/>
 
 ---
 
@@ -41,72 +44,88 @@ This spec does not cover:
 ### 2.1 Tier A: Immediate Fit
 
 #### 2.1.1 RCAEval benchmark
-- Zenodo: https://zenodo.org/records/14590730
-- GitHub: https://github.com/phamquiluan/RCAEval
+
+- Zenodo: <https://zenodo.org/records/14590730>
+- GitHub: <https://github.com/phamquiluan/RCAEval>
 
 Why:
+
 - Explicit metrics, logs, and traces RCA benchmark for microservices
 - Suitable for service-call graph, incident graph, and temporal path queries
 - Good primary target for validating root-cause-oriented temporal graph patterns
 
 #### 2.1.2 Train-Ticket anomaly dataset
-- Zenodo: https://zenodo.org/records/6979726
-- Train-Ticket system: https://github.com/FudanSELab/train-ticket/
+
+- Zenodo: <https://zenodo.org/records/6979726>
+- Train-Ticket system: <https://github.com/FudanSELab/train-ticket/>
 
 Why:
+
 - Includes logs, Jaeger traces, and Prometheus KPI data
 - Smaller and easier first ingest target than RCAEval full benchmark family
 - Good first integration target for temporal service-call and KPI graphs
 
 #### 2.1.3 TraceRCA
-- GitHub: https://github.com/NetManAIOps/TraceRCA
+
+- GitHub: <https://github.com/NetManAIOps/TraceRCA>
 
 Why:
+
 - Trace-centric RCA workflow
 - Clean fit for span graph and service-call temporal graph derivation
 
 ### 2.2 Tier B: Scale / Production Realism
 
 #### 2.2.1 Alibaba cluster-trace-microservices-v2021
-- Root repo: https://github.com/alibaba/clusterdata
-- README: https://github.com/alibaba/clusterdata/blob/master/cluster-trace-microservices-v2021/README.md
+
+- Root repo: <https://github.com/alibaba/clusterdata>
+- README: <https://github.com/alibaba/clusterdata/blob/master/cluster-trace-microservices-v2021/README.md>
 
 Why:
+
 - Production-scale microservice trace/runtime dataset
 - Best scale validation for `CALLS_AT` edges and time-window scans
 
 #### 2.2.2 Microsoft Cloud Monitoring Dataset
-- GitHub: https://github.com/Microsoft/cloud-monitoring-dataset
-- README: https://github.com/Microsoft/cloud-monitoring-dataset/blob/master/README.md
+
+- GitHub: <https://github.com/Microsoft/cloud-monitoring-dataset>
+- README: <https://github.com/Microsoft/cloud-monitoring-dataset/blob/master/README.md>
 
 Why:
+
 - KPI anomaly corpus
 - Good validation set for metric-oriented temporal edges and burst windows
 
 #### 2.2.3 IBM cloud anomaly dataset
-- Zenodo: https://zenodo.org/records/14062900
-- Paper / description: https://arxiv.org/pdf/2411.09047
+
+- Zenodo: <https://zenodo.org/records/14062900>
+- Paper / description: <https://arxiv.org/pdf/2411.09047>
 
 Why:
+
 - Extremely wide telemetry table
 - Good for validating metric-heavy and bucket-heavy workloads
 
 ### 2.3 Tier C: Optional Workload Traces
 
 #### 2.3.1 Azure Public Dataset
-- GitHub: https://github.com/Azure/AzurePublicDataset
-- README: https://github.com/Azure/AzurePublicDataset/blob/master/README.md
+
+- GitHub: <https://github.com/Azure/AzurePublicDataset>
+- README: <https://github.com/Azure/AzurePublicDataset/blob/master/README.md>
 
 Why:
+
 - Useful workload traces and infra traces
 - Secondary target after service-centric observability ingestion is stable
 
 ### 2.4 Useful Derived Standard
 
 #### 2.4.1 OpenTelemetry service graph connector
-- README: https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/connector/servicegraphconnector/README.md
+
+- README: <https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/connector/servicegraphconnector/README.md>
 
 Why:
+
 - Good reference model for deriving service-to-service graphs from traces
 - Useful as the semantic baseline for OTel / Jaeger trace adapters
 
@@ -213,7 +232,8 @@ This is the first interchange format to implement.
 Use the OTel service graph model as the reference for service-call derivation.
 
 Reference:
-- https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/connector/servicegraphconnector/README.md
+
+- <https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/connector/servicegraphconnector/README.md>
 
 #### 5.1.1 Service call graph
 
@@ -381,7 +401,8 @@ IRISGraphEngine.export_temporal_edges_ndjson(path, start=None, end=None, predica
 Best compatibility with property-graph tooling and Neo4j-style bulk loaders.
 
 Reference:
-- https://neo4j.com/docs/operations-manual/current/import/
+
+- <https://neo4j.com/docs/operations-manual/current/import/>
 
 #### 7.2.1 Nodes CSV
 
@@ -409,7 +430,8 @@ IRISGraphEngine.import_temporal_edges_csv(edges_path, delimiter=",")
 Implement export first, import later.
 
 Reference:
-- https://tinkerpop.apache.org/docs/current/reference/
+
+- <https://tinkerpop.apache.org/docs/current/reference/>
 
 #### 7.3.1 Export API
 
@@ -844,4 +866,3 @@ The implementation strategy is:
 - support GraphML export for tool interoperability
 - keep Cypher as the primary query language
 - layer temporal procedures first, then deeper temporal path semantics
-

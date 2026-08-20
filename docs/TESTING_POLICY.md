@@ -22,12 +22,12 @@ This policy derives directly from [Constitution Principle II](../.specify/memory
 
 All tests that interact with the database MUST use the official fixtures defined in `tests/conftest.py`:
 
-| Fixture | Scope | Required For |
-|---------|-------|--------------|
-| `iris_connection` | Module | Any test requiring a database connection |
-| `iris_cursor` | Function | Any test executing SQL statements |
-| `iris_test_container` | Session | Managed container lifecycle (auto-injected) |
-| `clean_test_data` | Function | Tests that create data requiring cleanup |
+| Fixture               | Scope    | Required For                                |
+| --------------------- | -------- | ------------------------------------------- |
+| `iris_connection`     | Module   | Any test requiring a database connection    |
+| `iris_cursor`         | Function | Any test executing SQL statements           |
+| `iris_test_container` | Session  | Managed container lifecycle (auto-injected) |
+| `clean_test_data`     | Function | Tests that create data requiring cleanup    |
 
 ### Prohibited Patterns
 
@@ -79,21 +79,21 @@ def test_full_workflow(iris_cursor, clean_test_data):
 
 Any test using `iris_connection` or `iris_cursor` fixtures **MUST** have the `@pytest.mark.requires_database` marker. This is enforced by a pytest hook that will **fail tests** violating this policy.
 
-| If Test Uses... | MUST Have Marker |
-|-----------------|------------------|
-| `iris_connection` | `@pytest.mark.requires_database` |
-| `iris_cursor` | `@pytest.mark.requires_database` |
+| If Test Uses...       | MUST Have Marker                 |
+| --------------------- | -------------------------------- |
+| `iris_connection`     | `@pytest.mark.requires_database` |
+| `iris_cursor`         | `@pytest.mark.requires_database` |
 | `iris_test_container` | `@pytest.mark.requires_database` |
 
 ### Marker Definitions
 
-| Marker | Meaning | IRIS Required |
-|--------|---------|---------------|
-| `@pytest.mark.requires_database` | Test requires live IRIS | **YES** |
-| `@pytest.mark.integration` | Integration test | **YES** |
-| `@pytest.mark.e2e` | End-to-end test | **YES** |
-| `@pytest.mark.performance` | Performance benchmark | **YES** |
-| (no marker) | Unit test | May mock for isolation |
+| Marker                           | Meaning                 | IRIS Required          |
+| -------------------------------- | ----------------------- | ---------------------- |
+| `@pytest.mark.requires_database` | Test requires live IRIS | **YES**                |
+| `@pytest.mark.integration`       | Integration test        | **YES**                |
+| `@pytest.mark.e2e`               | End-to-end test         | **YES**                |
+| `@pytest.mark.performance`       | Performance benchmark   | **YES**                |
+| (no marker)                      | Unit test               | May mock for isolation |
 
 ---
 
@@ -154,7 +154,7 @@ A `pytest_runtest_setup` hook in `tests/conftest.py` enforces marker-fixture con
 
 ---
 
-**Author**: Thomas Dyar (thomas.dyar@intersystems.com)
+**Author**: Thomas Dyar (<thomas.dyar@intersystems.com>)
 
 ---
 
@@ -163,6 +163,7 @@ A `pytest_runtest_setup` hook in `tests/conftest.py` enforces marker-fixture con
 The project's standard test command is `pytest`. The `run-tests` entry point described below is a project-specific CLI wrapper that may or may not be present depending on how the package was installed.
 
 > **Current recommended commands:**
+>
 > ```bash
 > pytest tests/unit/ -q                  # unit tests (no IRIS required)
 > pytest tests/e2e/ -q                   # e2e tests (requires IRIS container)
@@ -188,17 +189,18 @@ run-tests unit -- -x --pdb   # Pass arguments directly to pytest
 
 ### Test Categories
 
-| Category | Markers | Demo Server | Database |
-|----------|---------|-------------|----------|
-| `unit` | `not (requires_database or e2e or integration)` | No | No |
-| `integration` | `integration` or `requires_database` | No | Required |
-| `e2e` | `e2e` | Optional | Required |
-| `ux` | `e2e` + `*_ui.py` | **Auto** | Required |
-| `contract` | `tests/contract/` | No | Required |
+| Category      | Markers                                         | Demo Server | Database |
+| ------------- | ----------------------------------------------- | ----------- | -------- |
+| `unit`        | `not (requires_database or e2e or integration)` | No          | No       |
+| `integration` | `integration` or `requires_database`            | No          | Required |
+| `e2e`         | `e2e`                                           | Optional    | Required |
+| `ux`          | `e2e` + `*_ui.py`                               | **Auto**    | Required |
+| `contract`    | `tests/contract/`                               | No          | Required |
 
 ### Demo Server Lifecycle
 
 For `ux` tests, the runner automatically:
+
 1. Starts the demo server on port 8200
 2. Waits for health check (up to 30s)
 3. Executes requested tests
@@ -217,4 +219,3 @@ python tests/python/run_all_tests.py --quick
 run-tests integration
 run-tests --quick
 ```
-

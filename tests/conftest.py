@@ -108,10 +108,28 @@ def iris_connection(iris_test_container):
 
     conn = None
 
-    # Try container IP first (Linux Docker where container IPs are routable from host).
-    # On macOS Docker Desktop / OrbStack the container IP is NOT routable from the host,
-    # so we catch the connection error and fall through to the iris_devtester path.
-    if cip:
+    # Try OrbStack DNS first: {container}.orb.local resolves to the OrbStack-routable IP,
+    # which allows direct :1972 connections without port-forwarding or socat.
+    # Falls through silently on non-OrbStack hosts.
+    import socket as _socket
+    _orb_host = f"{container_name}.orb.local"
+    try:
+        _orb_ip = _socket.gethostbyname(_orb_host)
+        import iris.dbapi as _dbapi
+        try:
+            conn = _dbapi.connect(
+                hostname=_orb_ip, port=1972, namespace="USER",
+                username="_SYSTEM", password="SYS",
+            )
+            logger.info("Connected to %s via OrbStack DNS %s (%s):1972", container_name, _orb_host, _orb_ip)
+        except Exception as _e:
+            logger.info("OrbStack %s:1972 connect failed (%s) — falling back", _orb_ip, _e)
+            conn = None
+    except _socket.gaierror:
+        pass  # not OrbStack
+
+    # Try container IP (Linux Docker where container IPs are routable from host).
+    if conn is None and cip:
         import iris.dbapi as _dbapi
         try:
             conn = _dbapi.connect(
@@ -120,10 +138,20 @@ def iris_connection(iris_test_container):
             )
             logger.info("Connected to %s via container IP %s:1972", container_name, cip)
         except Exception as _e:
-            logger.info(
-                "Container IP %s:1972 not routable from host (%s) — falling back to iris_devtester",
-                cip, _e,
+            logger.info("Container IP %s:1972 not routable (%s) — falling back", cip, _e)
+            conn = None
+
+    if conn is None and _IVG_PORT != 21972:
+        # Socat proxy fallback (legacy; OrbStack path above should handle enterprise container).
+        import iris.dbapi as _dbapi
+        try:
+            conn = _dbapi.connect(
+                hostname="localhost", port=_IVG_PORT, namespace="USER",
+                username="_SYSTEM", password="SYS",
             )
+            logger.info("Connected to %s via localhost:%s (socat proxy)", container_name, _IVG_PORT)
+        except Exception as _e:
+            logger.info("localhost:%s connect failed (%s) — trying iris_devtester", _IVG_PORT, _e)
             conn = None
 
     if conn is None:
@@ -225,7 +253,7 @@ def iris_connection(iris_test_container):
 
 
 _ARNO_CONTAINER = os.environ.get("IVG_ARNO_CONTAINER", "ivg-iris-enterprise")
-_ARNO_PORT = int(os.environ.get("IVG_ARNO_PORT", "31972"))
+_ARNO_PORT = int(os.environ.get("IVG_ARNO_PORT", "31971"))
 
 
 @pytest.fixture(scope="session")
@@ -262,21 +290,18 @@ def arno_iris_connection():
         except OSError:
             return False
 
-    hostname, port = "localhost", 21972  # fallback
-    if cip and _tcp_reachable(cip, 1972):
-        hostname, port = cip, 1972
-    else:
-        # Ask Docker for the host-mapped port for 1972/tcp
-        port_out = _sp.run(
-            ["docker", "port", _ARNO_CONTAINER, "1972/tcp"],
-            capture_output=True, text=True,
-        ).stdout.strip()
-        # docker port output: "0.0.0.0:31972" or "[::]:31972" (possibly multiple lines)
-        for line in port_out.splitlines():
-            candidate = line.split(":")[-1].strip()
-            if candidate.isdigit():
-                hostname, port = "localhost", int(candidate)
-                break
+    # OrbStack DNS: {container}.orb.local resolves to a host-routable IP.
+    hostname, port = "localhost", _ARNO_PORT
+    import socket as _socket
+    _orb_host = f"{_ARNO_CONTAINER}.orb.local"
+    try:
+        _orb_ip = _socket.gethostbyname(_orb_host)
+        hostname, port = _orb_ip, 1972
+        logger.info("arno_iris_connection: using OrbStack DNS %s → %s:1972", _orb_host, _orb_ip)
+    except _socket.gaierror:
+        # Not OrbStack — try direct container IP, then fall back to host port
+        if cip and _tcp_reachable(cip, 1972):
+            hostname, port = cip, 1972
 
     conn = _dbapi.connect(
         hostname=hostname, port=port, namespace="USER",

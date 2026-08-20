@@ -307,6 +307,13 @@ class IRISGraphStore:
             cursor.execute(sql, params)
             cols = [d[0] for d in cursor.description] if cursor.description else []
             rows = cursor.fetchall()
+            if "__rn" in cols:
+                rn_idx = cols.index("__rn")
+                cols = [c for c in cols if c != "__rn"]
+                rows = [
+                    [v for i, v in enumerate(r) if i != rn_idx]
+                    for r in rows
+                ]
             return IVGResult(columns=cols, rows=[list(r) for r in rows], sql=sql, params=params)
         except Exception as e:
             err = str(e)[:200]
@@ -317,18 +324,119 @@ class IRISGraphStore:
                 pass
             return IVGResult(columns=[], rows=[], sql=sql, params=params, error=err)
 
+    @staticmethod
+    def _stmt_is_dml(stmt: str) -> bool:
+        """Return True if stmt is a DELETE/INSERT/UPDATE DML (not a SELECT)."""
+        if stmt.startswith("__constraint_check_delete_connected__"):
+            return False  # handled separately; not a data-mutating DML
+        upper = stmt.lstrip().upper()
+        # Statements may be prefixed by a CTE ("WITH … DELETE …")
+        # Walk past any leading WITH clause to find the verb.
+        if upper.startswith("WITH "):
+            # Find the first DML verb after the CTE block.
+            for verb in ("DELETE ", "INSERT ", "UPDATE "):
+                if verb in upper:
+                    return True
+            return False
+        return upper.startswith(("DELETE ", "INSERT ", "UPDATE "))
+
     def execute_transaction(self, stmts: list, params_list: list) -> IVGResult:
         cursor = self.conn.cursor()
         cursor.execute("START TRANSACTION")
         try:
             rows = []
+            pre_captured_rows = None
+            pre_captured_description = None
+
+            # When a transactional query has DELETE NODES or REMOVE label followed
+            # by a final SELECT, the SELECT must see the pre-delete snapshot.
+            # Detect that pattern and run the SELECT first so its results reflect
+            # the rows that are about to be deleted/unlabeled.
+            #
+            # Pre-snapshot is needed for:
+            #   DELETE FROM nodes         — node deletion (nodes gone after DELETE)
+            #   DELETE FROM rdf_labels    — label removal (MATCH by label fails after removal)
+            #
+            # Pre-snapshot is NOT needed for:
+            #   DELETE FROM rdf_props     — property removal (nodes still exist, SELECT
+            #                               should see the post-removal state where the
+            #                               property is NULL, not the pre-removal value)
+            import re as _del_re
+            # Use re.search (not re.match) so CTE-prefixed DELETE statements like
+            # "WITH Stage1 AS (...) DELETE FROM nodes ..." are also detected.
+            # Include rdf_edges and rdf_labels so all label/relationship DELETE operations
+            # trigger pre-snapshot. For rdf_labels: the outer MATCH JOINs use the deleted
+            # labels as filter conditions, so the SELECT must run before DELETE. The
+            # labels() function in the translator excludes removed labels from its result
+            # via NOT IN (...) to return the post-deletion view.
+            has_delete_dml = any(
+                isinstance(s, str) and
+                _del_re.search(
+                    r'DELETE\s+FROM\s+(?:\w+\.)?(?:nodes|rdf_edges|rdf_labels)\b',
+                    s, _del_re.IGNORECASE
+                ) and
+                not s.startswith("__constraint_check_delete_connected__")
+                for s in stmts
+            )
+            last_is_select = (
+                stmts
+                and isinstance(stmts[-1], str)
+                and not self._stmt_is_dml(stmts[-1])
+                and not stmts[-1].startswith("__constraint_check_delete_connected__")
+            )
+            if has_delete_dml and last_is_select:
+                final_sql = stmts[-1]
+                final_params = params_list[-1] if len(params_list) >= len(stmts) else []
+                cursor.execute(final_sql, final_params)
+                pre_captured_rows = cursor.fetchall()
+                pre_captured_description = cursor.description
+
             for i, stmt in enumerate(stmts):
                 p = params_list[i] if i < len(params_list) else []
+                if isinstance(stmt, str) and stmt.startswith("__constraint_check_delete_connected__"):
+                    actual_sql = stmt[len("__constraint_check_delete_connected__ "):]
+                    cursor.execute(actual_sql, p)
+                    count_row = cursor.fetchone()
+                    count = count_row[0] if count_row else 0
+                    if count > 0:
+                        raise Exception(
+                            "ConstraintVerificationFailed: Cannot delete node with existing relationships. Use DETACH DELETE."
+                        )
+                    continue
+                # Skip the final SELECT — already executed above for pre-snapshot.
+                if pre_captured_rows is not None and i == len(stmts) - 1:
+                    continue
                 cursor.execute(stmt, p)
                 if cursor.description:
                     rows = cursor.fetchall()
             self.conn.commit()
+
+            if pre_captured_rows is not None:
+                # Use the pre-delete snapshot as the result.
+                desc = pre_captured_description
+                snap_rows = pre_captured_rows
+                cols = [d[0] for d in desc] if desc else []
+                if "__rn" in cols:
+                    rn_idx = cols.index("__rn")
+                    cols = [c for c in cols if c != "__rn"]
+                    snap_rows = [
+                        [v for j, v in enumerate(r) if j != rn_idx]
+                        for r in snap_rows
+                    ]
+                return IVGResult(columns=cols, rows=[list(r) for r in snap_rows])
+
             cols = [d[0] for d in cursor.description] if cursor.description else []
+            # Strip internal ROW_NUMBER column injected by fetch-first-unsafe pagination
+            if "__rn" in cols:
+                rn_idx = cols.index("__rn")
+                cols = [c for c in cols if c != "__rn"]
+                if rows is not None:
+                    rows = [
+                        [v for i, v in enumerate(r) if i != rn_idx]
+                        for r in rows
+                    ]
+            if rows is None:
+                rows = []
             return IVGResult(columns=cols, rows=[list(r) for r in rows])
         except Exception as e:
             self.conn.rollback()
@@ -385,8 +493,11 @@ class IRISGraphStore:
 
         val = bfs_json if isinstance(bfs_json, str) else str(bfs_json)
         if val.startswith("SORTED:"):
-            from iris_vector_graph.engine import _bfs_stream_pages
             tag = val.split(":", 2)[1]
+            if tag == "0":
+                # ^KG not built or source has no edges — fall back to SQL BFS
+                return self._sql_bfs_fallback(source_id, predicates, max_hops, direction, max_results)
+            from iris_vector_graph.engine import _bfs_stream_pages
             results = list(_bfs_stream_pages(self.conn, tag))
             rows = [[r.get("o", r.get("id", "")), r.get("step", r.get("hops", 0)), r.get("pred", r.get("p", ""))] for r in results]
             return IVGResult(columns=["id", "hops", "pred"], rows=rows)

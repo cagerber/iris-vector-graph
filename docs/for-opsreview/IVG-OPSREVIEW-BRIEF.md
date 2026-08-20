@@ -11,10 +11,12 @@
 OpsReview spec 002 (SQL Workload Intelligence) answers "what is expensive?" via cost share ranking and parameter sensitivity. But advisors immediately ask the follow-up: **"When did it get expensive? Did it coincide with anything else?"**
 
 Today there is no time dimension. The agent knows:
+
 - QueryGroup A is 27.7% of total SQL cost
 - QueryGroup A is parameter-sensitive (35.7× tail/normal ratio)
 
 It does not know:
+
 - Whether that 27.7% appeared last Tuesday or has been stable for 6 months
 - Whether it spiked at the same moment WD queue depth spiked in the P-Buttons data
 - Whether Customer B had the same query group go critical last quarter
@@ -25,16 +27,17 @@ IVG's temporal graph is the missing primitive that answers all three questions.
 
 ## IVG Capabilities Relevant to OpsReview
 
-| Primitive | How | Current Speed |
-|-----------|-----|--------------|
-| k-hop ego graph | `BFSFastJson`, `kg_SUBGRAPH` | 1–20ms |
-| Node similarity (KNN) | `kg_KNN_VEC` (HNSW, 384-dim) | 1.7ms |
-| Community detection | `WCCJson`, `CDLPJson` | batch |
-| Pattern matching | Cypher `[*1..3]`, EXISTS | varies |
-| VECTOR similarity | IRIS `VECTOR(DOUBLE, 384)` + HNSW | <10ms |
-| Multi-vector retrieval | PLAIDSearch | 9ms |
+| Primitive              | How                               | Current Speed |
+| ---------------------- | --------------------------------- | ------------- |
+| k-hop ego graph        | `BFSFastJson`, `kg_SUBGRAPH`      | 1–20ms        |
+| Node similarity (KNN)  | `kg_KNN_VEC` (HNSW, 384-dim)      | 1.7ms         |
+| Community detection    | `WCCJson`, `CDLPJson`             | batch         |
+| Pattern matching       | Cypher `[*1..3]`, EXISTS          | varies        |
+| VECTOR similarity      | IRIS `VECTOR(DOUBLE, 384)` + HNSW | <10ms         |
+| Multi-vector retrieval | PLAIDSearch                       | 9ms           |
 
 **What's missing for OpsReview** (see roadmap below):
+
 - Temporal edges (`^KG("tout", ts, s, p, o)`) — not yet in globals
 - Per-workload KG ingest pipeline (Statement Index → graph edges)
 - Incident correlation across the P-Buttons + SQL signal stream
@@ -88,6 +91,7 @@ IVG's temporal graph is the missing primitive that answers all three questions.
 ### Feature 4: SQL Query Timeline
 
 **What it does**: Feed `INFORMATION_SCHEMA.STATEMENT_DAILY_STATS` into IVG as temporal edges:
+
 ```
 QueryGroup_A --[COST_ON]--> Date_2026-03-15 (weight=cost_share_pct)
 QueryGroup_A --[EXECUTED_AT]--> Date_2026-03-15 (weight=avg_latency_ms)
@@ -121,13 +125,13 @@ Time-window queries then answer: "Show me the 7-day cost trajectory for this gro
 
 ## Implementation Sequence (CRISP-aligned)
 
-| Priority | Feature | IVG Gap | OpsReview Gap | Weeks |
-|----------|---------|---------|---------------|-------|
-| **P1** | Feature 3: Incident Correlation | None — VECTOR already in IRIS | Populate PatternLibrary with real runs | 1–2 |
-| **P2** | Feature 4: SQL Query Timeline | None — TemporalIndex fully built | ETL: STATEMENT_DAILY_STATS → TemporalIndex.InsertEdge() | 2–3 |
-| **P3** | Feature 1: Routine Sampler | None — graph ingest exists | P-Buttons ETL for routine samples | 4–6 |
-| **P4** | Feature 2: Ensemble Topology | None | New data source: Ens.MessageHeader | 6–9 |
-| **P5** | Feature 5: Cross-Customer KG | dpgenai1 deployment | Anonymization + governance | 12+ |
+| Priority | Feature                         | IVG Gap                          | OpsReview Gap                                           | Weeks |
+| -------- | ------------------------------- | -------------------------------- | ------------------------------------------------------- | ----- |
+| **P1**   | Feature 3: Incident Correlation | None — VECTOR already in IRIS    | Populate PatternLibrary with real runs                  | 1–2   |
+| **P2**   | Feature 4: SQL Query Timeline   | None — TemporalIndex fully built | ETL: STATEMENT_DAILY_STATS → TemporalIndex.InsertEdge() | 2–3   |
+| **P3**   | Feature 1: Routine Sampler      | None — graph ingest exists       | P-Buttons ETL for routine samples                       | 4–6   |
+| **P4**   | Feature 2: Ensemble Topology    | None                             | New data source: Ens.MessageHeader                      | 6–9   |
+| **P5**   | Feature 5: Cross-Customer KG    | dpgenai1 deployment              | Anonymization + governance                              | 12+   |
 
 ---
 
@@ -139,7 +143,7 @@ Time-window queries then answer: "Show me the 7-day cost trajectory for this gro
 
 3. **Answers the most urgent advisor question** — after seeing "QueryGroup A = 27.7% of cost", the next question is always "was it always this high?" A timeline answers it without a follow-up analysis.
 
-4. **Unlocks Feature 3 (Incident Correlation) from the time dimension** — knowing *when* a pattern first appeared turns a static similarity match into a historical incident log.
+4. **Unlocks Feature 3 (Incident Correlation) from the time dimension** — knowing _when_ a pattern first appeared turns a static similarity match into a historical incident log.
 
 5. **No IVG changes required** — `Graph.KG.TemporalIndex` is already fully implemented with `InsertEdge()`, `BulkInsert()`, `QueryWindow()`, `GetAggregate()`, `GetVelocity()`, `FindBursts()`. The integration is 100% OpsReview-side Python.
 
@@ -173,10 +177,10 @@ Then `QueryWindow()` and `GetAggregate()` answer "what was the cost trajectory?"
 
 ## CRISP Phase Mapping for Feature 4
 
-| CRISP Phase | Output | Status |
-|-------------|--------|--------|
-| **C — Clarify** | Problem: "no time dimension on SQL cost data"; constraint: use existing IVG + IRIS | Done (this doc) |
-| **R — Results** | Baseline: 0 temporal queries today; Target: advisor can ask "when did X spike?" in same report | Needs `success-metrics.md` |
-| **I — Investigate** | Process flow: `STATEMENT_DAILY_STATS` → IVG edge ingest → temporal Cypher query → report section | Needs `process-flow.md` |
-| **S — Spec** | AI Spec Sprint 1: temporal edges in IVG; ETL wrapper in `sql_workload_tools.py`; report section | Needs spec |
-| **P — Prove** | Validate: report for a customer shows 7-day cost trajectory for top 3 groups | Deferred to post-build |
+| CRISP Phase         | Output                                                                                           | Status                     |
+| ------------------- | ------------------------------------------------------------------------------------------------ | -------------------------- |
+| **C — Clarify**     | Problem: "no time dimension on SQL cost data"; constraint: use existing IVG + IRIS               | Done (this doc)            |
+| **R — Results**     | Baseline: 0 temporal queries today; Target: advisor can ask "when did X spike?" in same report   | Needs `success-metrics.md` |
+| **I — Investigate** | Process flow: `STATEMENT_DAILY_STATS` → IVG edge ingest → temporal Cypher query → report section | Needs `process-flow.md`    |
+| **S — Spec**        | AI Spec Sprint 1: temporal edges in IVG; ETL wrapper in `sql_workload_tools.py`; report section  | Needs spec                 |
+| **P — Prove**       | Validate: report for a customer shows 7-day cost trajectory for top 3 groups                     | Deferred to post-build     |

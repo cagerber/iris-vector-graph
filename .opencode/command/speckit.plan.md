@@ -1,6 +1,6 @@
 ---
 description: Execute the implementation planning workflow using the plan template to generate design artifacts.
-handoffs: 
+handoffs:
   - label: Create Tasks
     agent: speckit.tasks
     prompt: Break the plan into tasks
@@ -81,7 +81,7 @@ You **MUST** consider the user input before proceeding (if not empty).
    - Add only new technology from current plan
    - Preserve manual additions between markers
 
-**Output**: data-model.md, /contracts/*, quickstart.md, agent-specific file
+**Output**: data-model.md, /contracts/\*, quickstart.md, agent-specific file
 
 ## Key rules
 
@@ -95,6 +95,7 @@ You **MUST** consider the user input before proceeding (if not empty).
 **STOP AFTER THIS COMMAND COMPLETES.**
 
 Do NOT proceed to:
+
 - Running `/speckit.tasks`, `/speckit.implement`, or other speckit commands
 - Implementation or code changes
 - Any follow-up actions or "next steps"

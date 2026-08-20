@@ -1,4 +1,5 @@
 # pyTigerGraph SDK Research Report
+
 **Date**: May 19, 2026  
 **Repository**: [tigergraph/pyTigerGraph](https://github.com/tigergraph/pyTigerGraph)  
 **Commit**: e7a7e7ebd49baae265a33b9c6e76a76eef5815ec
@@ -8,6 +9,7 @@
 ## 1. CONNECTION & INITIALIZATION PATTERN
 
 ### Synchronous Connection
+
 ```python
 from pyTigerGraph import TigerGraphConnection
 
@@ -20,11 +22,13 @@ conn = TigerGraphConnection(
 ```
 
 **Pattern**: Thread-local session per connection object.
+
 - Each thread gets its own dedicated `requests.Session` with a single TCP connection pool
 - Lazy-initialized on first use via `_session` property
 - Isolated via `threading.local()` — no cross-thread pollution
 
 **Async Connection**
+
 ```python
 from pyTigerGraph import AsyncTigerGraphConnection
 import asyncio
@@ -40,6 +44,7 @@ async def main():
 ```
 
 **Pattern**: Single unbounded `aiohttp.ClientSession` shared across all concurrent coroutines.
+
 - Lazy-initialized inside async context to avoid "session created outside event loop" warnings
 - Unbounded connection pool (`limit=0`) — grows with demand
 - Uses `asyncio.Lock()` for port failover + token refresh synchronization
@@ -49,28 +54,31 @@ async def main():
 ## 2. REST API vs QUERY PROTOCOL ABSTRACTION
 
 ### Multi-API Surface
+
 pyTigerGraph wraps **three distinct protocols**:
 
-| Protocol | Purpose | Abstraction | Example |
-|----------|---------|-------------|---------|
-| **REST++** | Graph queries, CRUD | `_req()` generic method | `runInstalledQuery()` |
+| Protocol        | Purpose                        | Abstraction                         | Example                        |
+| --------------- | ------------------------------ | ----------------------------------- | ------------------------------ |
+| **REST++**      | Graph queries, CRUD            | `_req()` generic method             | `runInstalledQuery()`          |
 | **GSQL Server** | Query management, schema, auth | GSQL subprocess via `pyTigerDriver` | `getSchema()`, `createQuery()` |
-| **GraphStudio** | UI endpoints (secondary) | Embedded in REST++ calls | Schema ops |
+| **GraphStudio** | UI endpoints (secondary)       | Embedded in REST++ calls            | Schema ops                     |
 
 ### Request Layer Architecture
-- **_req()** (base): Generic HTTP dispatcher, handles auth + retry logic
-- **_get() / _post() / _put() / _delete()**: Thin wrappers over _req()
-- **_prep_req()**: Header + auth encoding (Bearer token or Basic auth)
-- **_do_request()** (sync): Calls `requests.Session.request()` directly
-- **_do_request()** (async): Calls `aiohttp.ClientSession.request()` with timeout wrappe
 
-**Evidence**: [pyTigerGraphBase._req() and session management](https://github.com/tigergraph/pyTigerGraph/blob/e7a7e7ebd49baae265a33b9c6e76a76eef5815ec/pyTigerGraph/pyTigerGraphBase.py#L155-L240)
+- **\_req()** (base): Generic HTTP dispatcher, handles auth + retry logic
+- **\_get() / \_post() / \_put() / \_delete()**: Thin wrappers over \_req()
+- **\_prep_req()**: Header + auth encoding (Bearer token or Basic auth)
+- **\_do_request()** (sync): Calls `requests.Session.request()` directly
+- **\_do_request()** (async): Calls `aiohttp.ClientSession.request()` with timeout wrappe
+
+**Evidence**: [pyTigerGraphBase.\_req() and session management](https://github.com/tigergraph/pyTigerGraph/blob/e7a7e7ebd49baae265a33b9c6e76a76eef5815ec/pyTigerGraph/pyTigerGraphBase.py#L155-L240)
 
 ---
 
 ## 3. RESULT TYPES FROM QUERIES
 
 ### runInstalledQuery() Return
+
 Returns **`List[Dict]`** — always a list, even for scalar results:
 
 ```python
@@ -90,6 +98,7 @@ result = conn.runInstalledQuery("query_all_param_types", params)
 ```
 
 ### Schema Queries (getSchema, getVertexCount, etc.)
+
 Returns **`dict`** or **`int`** depending on the query:
 
 ```python
@@ -98,7 +107,9 @@ count = conn.getVertexCount()  # int
 ```
 
 ### Error Response Format
+
 Returns error in **JSON body** (not HTTP exception):
+
 ```python
 # TigerGraph returns HTTP 200 with:
 {
@@ -115,6 +126,7 @@ Returns error in **JSON body** (not HTTP exception):
 ### Three Auth Modes
 
 #### A. Username/Password (GSQL auth)
+
 ```python
 conn = TigerGraphConnection(
     host="...", graphname="...",
@@ -122,11 +134,13 @@ conn = TigerGraphConnection(
     password="tigergraph"
 )
 ```
+
 - Used for **GSQL operations** (schema, query creation)
 - Encoded as `Basic {base64(username:password)}`
 - **Always required** if GSQL endpoints are used
 
 #### B. API Token (REST++ auth)
+
 ```python
 # Option 1: Pre-obtained token
 conn = TigerGraphConnection(
@@ -143,22 +157,26 @@ conn = TigerGraphConnection(
 )
 token, expiration_ms, formatted_expiry = conn.getToken("my_secret", setToken=True)
 ```
+
 - Used for **REST++ operations** (queries, graph ops)
 - Encoded as `Bearer {token}`
 - Token auto-minted + cached, auto-refreshed on 401
 
 #### C. JWT Token (customer-managed auth)
+
 ```python
 conn = TigerGraphConnection(
     host="...", graphname="...",
     jwtToken="eyJhbGciOiJIUzI1NiIs..."
 )
 ```
+
 - Passed as `Bearer {jwtToken}`
 - Token refresh happens if server returns 401
 - Verified on init via `_verify_jwt_token_support()`
 
 ### Token Refresh Logic
+
 **Evidence**: [pyTigerGraphBase token retry + getToken()](https://github.com/tigergraph/pyTigerGraph/blob/e7a7e7ebd49baae265a33b9c6e76a76eef5815ec/pyTigerGraph/pyTigerGraphBase.py#L220-L260)
 
 ```python
@@ -177,6 +195,7 @@ conn = TigerGraphConnection(
 ## 5. CONNECTION POOLING STRATEGY
 
 ### Synchronous (requests)
+
 ```python
 _adapter = HTTPAdapter(
     pool_connections=1,   # one pool per host (we talk to one TG server)
@@ -186,12 +205,14 @@ _adapter = HTTPAdapter(
 s.mount("http://", _adapter)
 s.mount("https://", _adapter)
 ```
+
 - **One session per thread** via `threading.local()`
 - Thread-local prevents concurrent modification of shared state
 - Pool size 1 because each thread is sequential
 - Concurrent threads never block each other (separate sessions)
 
 ### Asynchronous (aiohttp)
+
 ```python
 connector = aiohttp.TCPConnector(
     limit=0,                            # unbounded — grows with demand
@@ -199,25 +220,28 @@ connector = aiohttp.TCPConnector(
 )
 return aiohttp.ClientSession(connector=connector)
 ```
+
 - **Single session** shared across all concurrent coroutines
 - Unbounded connection pool — scales automatically
 - No GIL serialization — tasks parse concurrently
 - Optional: Install `pyTigerGraph[fast]` for orjson (2-10× faster JSON parsing, releases GIL)
 
-**Evidence**: [pyTigerGraphBase._session property (sync)](https://github.com/tigergraph/pyTigerGraph/blob/e7a7e7ebd49baae265a33b9c6e76a76eef5815ec/pyTigerGraph/pyTigerGraphBase.py#L291-L310)  
-[AsyncPyTigerGraphBase._make_async_client() (async)](https://github.com/tigergraph/pyTigerGraph/blob/e7a7e7ebd49baae265a33b9c6e76a76eef5815ec/pyTigerGraph/pytgasync/pyTigerGraphBase.py#L520-L533)
+**Evidence**: [pyTigerGraphBase.\_session property (sync)](https://github.com/tigergraph/pyTigerGraph/blob/e7a7e7ebd49baae265a33b9c6e76a76eef5815ec/pyTigerGraph/pyTigerGraphBase.py#L291-L310)  
+[AsyncPyTigerGraphBase.\_make_async_client() (async)](https://github.com/tigergraph/pyTigerGraph/blob/e7a7e7ebd49baae265a33b9c6e76a76eef5815ec/pyTigerGraph/pytgasync/pyTigerGraphBase.py#L520-L533)
 
 ---
 
 ## 6. ASYNC SUPPORT
 
 ### Full Dual API
+
 - `TigerGraphConnection` — synchronous (requests-based)
 - `AsyncTigerGraphConnection` — asynchronous (aiohttp-based)
 - **100% parallel class hierarchy** under `pytgasync/`
   - `AsyncPyTigerGraphBase`, `AsyncPyTigerGraphQuery`, `AsyncPyTigerGraphVertex`, etc.
 
 ### Async Context Manager
+
 ```python
 # Preferred pattern: automatic cleanup
 async with AsyncTigerGraphConnection(...) as conn:
@@ -231,6 +255,7 @@ await conn.aclose()  # close socket pool
 ```
 
 ### High-Concurrency Pattern
+
 ```python
 async def main():
     async with AsyncTigerGraphConnection(...) as conn:
@@ -250,6 +275,7 @@ async def main():
 ## 7. ERROR HANDLING
 
 ### Exception Hierarchy
+
 ```python
 class TigerGraphException(Exception):
     def __init__(self, message, code=None):
@@ -258,7 +284,8 @@ class TigerGraphException(Exception):
 ```
 
 ### Error Detection Logic
-**Sync**: [pyTigerGraphBase._error_check()](https://github.com/tigergraph/pyTigerGraph/blob/e7a7e7ebd49baae265a33b9c6e76a76eef5815ec/pyTigerGraph/pyTigerGraphBase.py#L145-L150)
+
+**Sync**: [pyTigerGraphBase.\_error_check()](https://github.com/tigergraph/pyTigerGraph/blob/e7a7e7ebd49baae265a33b9c6e76a76eef5815ec/pyTigerGraph/pyTigerGraphBase.py#L145-L150)
 
 ```python
 def _error_check(self, res):
@@ -272,6 +299,7 @@ def _error_check(self, res):
 ```
 
 ### Automatic Auth Error Recovery
+
 ```python
 # Triggers on EITHER:
 # 1. HTTP 401 status
@@ -284,6 +312,7 @@ if (not getattr(self, "_refreshing_token", False)
 ```
 
 ### Port Failover Logic (TG 3.x → 4.x)
+
 ```python
 # TigerGraph 4.x moved REST++ from port 9000 to 14240
 # On first connection error to :9000:
@@ -298,6 +327,7 @@ if (not getattr(self, "_refreshing_token", False)
 ## 8. QUERY PARAMETER BINDING
 
 ### Parameter Encoding
+
 ```python
 # Sync version uses urllib.parse + URL encoding
 def _prep_params(self, params: dict) -> str:
@@ -318,6 +348,7 @@ def _prep_params(self, params: dict) -> str:
 ```
 
 ### POST vs GET Auto-Detection
+
 ```python
 # usePost=None (default):
 #   - Dict params → POST (with JSON body)
@@ -332,6 +363,7 @@ def _prep_params(self, params: dict) -> str:
 ```
 
 ### Type Coercion
+
 ```python
 params = {
     "p01_int": 1,
@@ -351,17 +383,17 @@ params = {
 
 ## SUMMARY TABLE
 
-| Aspect | Sync (requests) | Async (aiohttp) |
-|--------|-----------------|-----------------|
-| **Connection** | `requests.Session` (thread-local) | `aiohttp.ClientSession` (single, shared) |
-| **Pool Size** | 1 socket/thread (sequential) | Unbounded (grows with demand) |
-| **Concurrency** | ThreadPoolExecutor + threads | `asyncio.gather()` + tasks |
-| **Token Refresh** | `threading.Lock()` | `asyncio.Lock()` |
-| **Port Failover** | `threading.Lock()` | `asyncio.Lock()` |
-| **Error Recovery** | Automatic on 401 + retry | Automatic on 401 + retry |
-| **Context Manager** | `with conn:` | `async with conn:` |
-| **Cleanup** | `.close()` | `await .aclose()` |
-| **Max QPS** | ~100-200 (GIL contention) | ~1000+ (no GIL lock) |
+| Aspect              | Sync (requests)                   | Async (aiohttp)                          |
+| ------------------- | --------------------------------- | ---------------------------------------- |
+| **Connection**      | `requests.Session` (thread-local) | `aiohttp.ClientSession` (single, shared) |
+| **Pool Size**       | 1 socket/thread (sequential)      | Unbounded (grows with demand)            |
+| **Concurrency**     | ThreadPoolExecutor + threads      | `asyncio.gather()` + tasks               |
+| **Token Refresh**   | `threading.Lock()`                | `asyncio.Lock()`                         |
+| **Port Failover**   | `threading.Lock()`                | `asyncio.Lock()`                         |
+| **Error Recovery**  | Automatic on 401 + retry          | Automatic on 401 + retry                 |
+| **Context Manager** | `with conn:`                      | `async with conn:`                       |
+| **Cleanup**         | `.close()`                        | `await .aclose()`                        |
+| **Max QPS**         | ~100-200 (GIL contention)         | ~1000+ (no GIL lock)                     |
 
 ---
 
@@ -373,4 +405,3 @@ params = {
 4. **Implement automatic token refresh** on 401, WITH user-supplied token bypass
 5. **Parameter binding**: POST body for lists/sets, GET query string for scalars (unless usePost specified)
 6. **Lock strategy**: `threading.Lock()` for sync, `asyncio.Lock()` for async (prevents thundering herd on failover)
-

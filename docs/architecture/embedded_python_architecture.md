@@ -47,11 +47,11 @@ When designing PageRank and graph analytics:
 
 ### The Three Call Contexts
 
-| Context | `Language = python` (`iris.gref`) | Pure ObjectScript (`$ORDER`) |
-|---------|----------------------------------|------------------------------|
-| **SQL function** (`SELECT kg_PPR(...)`) | ✅ runs inside IRIS | ✅ |
-| **Native API bridge** (`classMethodValue()`) | ❌ `iris.gref` unavailable | ✅ |
-| **Direct `iris session`** | ✅ runs inside IRIS | ✅ |
+| Context                                      | `Language = python` (`iris.gref`) | Pure ObjectScript (`$ORDER`) |
+| -------------------------------------------- | --------------------------------- | ---------------------------- |
+| **SQL function** (`SELECT kg_PPR(...)`)      | ✅ runs inside IRIS               | ✅                           |
+| **Native API bridge** (`classMethodValue()`) | ❌ `iris.gref` unavailable        | ✅                           |
+| **Direct `iris session`**                    | ✅ runs inside IRIS               | ✅                           |
 
 ### Why This Matters
 
@@ -71,6 +71,7 @@ When Python code calls an ObjectScript method via `_call_classmethod()` → `iri
 ### Example: PageRank.RunJson (v1.10.2)
 
 **Before** (broken through bridge):
+
 ```objectscript
 ClassMethod RunJson(...) As %String [ Language = python ]
 {
@@ -81,6 +82,7 @@ ClassMethod RunJson(...) As %String [ Language = python ]
 ```
 
 **After** (works everywhere):
+
 ```objectscript
 ClassMethod RunJson(...) As %String
 {
@@ -211,7 +213,7 @@ ClassMethod PageRankWithVectorReranking(...) As %DynamicArray [ Language = pytho
 
 ## When to Use Embedded Python vs SQL
 
-### Use Embedded Python When:
+### Use Embedded Python When
 
 ✅ **Pure graph traversal** (BFS, DFS, shortest path)
 ✅ **Iterative graph algorithms** (PageRank, Connected Components, Label Propagation)
@@ -219,7 +221,7 @@ ClassMethod PageRankWithVectorReranking(...) As %DynamicArray [ Language = pytho
 ✅ **Custom graph algorithms** that don't involve vectors
 ✅ **Building secondary indexes on graph structure** (via globals)
 
-### MUST Use SQL When:
+### MUST Use SQL When
 
 ❌ **Vector similarity search** (k-NN, HNSW index queries)
 ❌ **Any VECTOR_DOT_PRODUCT operations**
@@ -274,12 +276,12 @@ Your `../rag-templates` implementation follows this pattern correctly:
 
 ## PageRank Implementation Decision Matrix
 
-| Use Case | Vector Involved? | Implementation | Rationale |
-|----------|-----------------|----------------|-----------|
-| **Pure PageRank on full graph** | ❌ No | Embedded Python | No HNSW needed, pure graph |
-| **PageRank on semantically similar subgraph** | ✅ Yes (seed selection) | SQL (vector) → Embedded Python (graph) | Vector search needs HNSW |
-| **PageRank with vector-based edge weights** | ✅ Yes (edge scoring) | SQL only | Edge weights from VECTOR_DOT_PRODUCT |
-| **Re-rank PageRank results by similarity** | ✅ Yes (re-ranking) | Embedded Python (PageRank) → SQL (vector) | Final re-rank needs HNSW |
+| Use Case                                      | Vector Involved?        | Implementation                            | Rationale                            |
+| --------------------------------------------- | ----------------------- | ----------------------------------------- | ------------------------------------ |
+| **Pure PageRank on full graph**               | ❌ No                   | Embedded Python                           | No HNSW needed, pure graph           |
+| **PageRank on semantically similar subgraph** | ✅ Yes (seed selection) | SQL (vector) → Embedded Python (graph)    | Vector search needs HNSW             |
+| **PageRank with vector-based edge weights**   | ✅ Yes (edge scoring)   | SQL only                                  | Edge weights from VECTOR_DOT_PRODUCT |
+| **Re-rank PageRank results by similarity**    | ✅ Yes (re-ranking)     | Embedded Python (PageRank) → SQL (vector) | Final re-rank needs HNSW             |
 
 ---
 
@@ -354,6 +356,7 @@ ClassMethod CorrectApproach() [ Language = python ]
 - Combine results in embedded Python (in-process)
 
 **Expected Performance**:
+
 - Vector search: 1-10ms (HNSW-optimized SQL)
 - Graph expansion: 0.1-1ms (embedded Python)
 - PageRank on subgraph: 10-100ms (embedded Python, 1K-10K nodes)
@@ -402,14 +405,14 @@ Try optimized path (IRIS-native) → Catch failure → Fall back to pure Python
 
 ### Fallback Matrix
 
-| Method | Primary Path | Fallback Path | When Fallback Triggers |
-|--------|-------------|---------------|------------------------|
-| `kg_KNN_VEC` | HNSW index (`kg_NodeEmbeddings` table with `VECTOR` type) | Python CSV parsing (`kg_NodeEmbeddings_old` table with CSV strings) | `kg_NodeEmbeddings` table doesn't exist or has wrong type |
-| `kg_PERSONALIZED_PAGERANK` | SQL function → ObjectScript embedded Python | Pure Python in `IRISGraphEngine` | `kg_PPR` SQL function doesn't exist |
-| `kg_TXT` | SQL with JSON_TABLE | ❌ No fallback | Core IRIS SQL feature, always available |
-| `kg_NEIGHBORHOOD_EXPANSION` | SQL with JSON_TABLE | ❌ No fallback | Core IRIS SQL feature, always available |
-| `kg_RRF_FUSE` | Inherits from `kg_KNN_VEC` | Inherits fallback | Same as `kg_KNN_VEC` |
-| `kg_VECTOR_GRAPH_SEARCH` | Inherits from `kg_KNN_VEC` | Inherits fallback | Same as `kg_KNN_VEC` |
+| Method                      | Primary Path                                              | Fallback Path                                                       | When Fallback Triggers                                    |
+| --------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------- | --------------------------------------------------------- |
+| `kg_KNN_VEC`                | HNSW index (`kg_NodeEmbeddings` table with `VECTOR` type) | Python CSV parsing (`kg_NodeEmbeddings_old` table with CSV strings) | `kg_NodeEmbeddings` table doesn't exist or has wrong type |
+| `kg_PERSONALIZED_PAGERANK`  | SQL function → ObjectScript embedded Python               | Pure Python in `IRISGraphEngine`                                    | `kg_PPR` SQL function doesn't exist                       |
+| `kg_TXT`                    | SQL with JSON_TABLE                                       | ❌ No fallback                                                      | Core IRIS SQL feature, always available                   |
+| `kg_NEIGHBORHOOD_EXPANSION` | SQL with JSON_TABLE                                       | ❌ No fallback                                                      | Core IRIS SQL feature, always available                   |
+| `kg_RRF_FUSE`               | Inherits from `kg_KNN_VEC`                                | Inherits fallback                                                   | Same as `kg_KNN_VEC`                                      |
+| `kg_VECTOR_GRAPH_SEARCH`    | Inherits from `kg_KNN_VEC`                                | Inherits fallback                                                   | Same as `kg_KNN_VEC`                                      |
 
 ### Design Principle
 
@@ -421,11 +424,11 @@ Try optimized path (IRIS-native) → Catch failure → Fall back to pure Python
 
 ### Performance Implications
 
-| Method | Optimized Path | Fallback Path | Slowdown |
-|--------|---------------|---------------|----------|
-| `kg_KNN_VEC` (10K vectors) | ~2ms (HNSW) | ~5800ms (Python scan) | ~2900x |
-| `kg_PERSONALIZED_PAGERANK` (1K nodes) | ~10ms (embedded Python) | ~25ms (pure Python) | ~2.5x |
-| `kg_PERSONALIZED_PAGERANK` (10K nodes) | ~50ms (embedded Python) | ~500ms (pure Python) | ~10x |
+| Method                                 | Optimized Path          | Fallback Path         | Slowdown |
+| -------------------------------------- | ----------------------- | --------------------- | -------- |
+| `kg_KNN_VEC` (10K vectors)             | ~2ms (HNSW)             | ~5800ms (Python scan) | ~2900x   |
+| `kg_PERSONALIZED_PAGERANK` (1K nodes)  | ~10ms (embedded Python) | ~25ms (pure Python)   | ~2.5x    |
+| `kg_PERSONALIZED_PAGERANK` (10K nodes) | ~50ms (embedded Python) | ~500ms (pure Python)  | ~10x     |
 
 ### Implementation Pattern
 
@@ -451,6 +454,7 @@ class IRISGraphEngine:
 ```
 
 **Key Features:**
+
 1. **Try optimized first** - Get full performance when available
 2. **Cache failure** - Don't retry failed SQL function calls on every request
 3. **Log degradation** - Users know when fallback is active

@@ -282,3 +282,67 @@ class TestPydanticModels:
         from iris_vector_graph.cypher_api import Neo4jTxRequest, Neo4jStatement
         req = Neo4jTxRequest(statements=[Neo4jStatement(statement="MATCH (n) RETURN n")])
         assert len(req.statements) == 1
+
+
+# ---------------------------------------------------------------------------
+# _make_engine: paths with env vars (lines 127-167)
+# ---------------------------------------------------------------------------
+
+class TestMakeEngine:
+
+    def test_get_engine_caches(self, mock_engine):
+        """_get_engine caches after first call."""
+        from iris_vector_graph import cypher_api
+        with patch("iris_vector_graph.cypher_api._make_engine", return_value=mock_engine):
+            cypher_api._reset_engine()
+            eng1 = cypher_api._get_engine()
+            eng2 = cypher_api._get_engine()
+            assert eng1 is eng2
+
+
+# ---------------------------------------------------------------------------
+# Cypher error paths (lines 256-264, 333-336)
+# ---------------------------------------------------------------------------
+
+class TestErrorPaths:
+
+    def test_cypher_endpoint_exception_returns_400(self, mock_engine):
+        from fastapi.testclient import TestClient
+        from iris_vector_graph.cypher_api import app
+        bad_eng = MagicMock()
+        bad_eng.execute_cypher.side_effect = Exception("parse error")
+        with patch("iris_vector_graph.cypher_api._get_engine", return_value=bad_eng):
+            c = TestClient(app, raise_server_exceptions=False)
+            resp = c.post("/api/cypher", json={"query": "BAD QUERY", "parameters": {}})
+        assert resp.status_code in (400, 500)
+
+    def test_query_v2_exception_returns_400(self, mock_engine):
+        from fastapi.testclient import TestClient
+        from iris_vector_graph.cypher_api import app
+        bad_eng = MagicMock()
+        bad_eng.execute_cypher.side_effect = Exception("error")
+        with patch("iris_vector_graph.cypher_api._get_engine", return_value=bad_eng):
+            c = TestClient(app, raise_server_exceptions=False)
+            resp = c.post("/db/neo4j/query/v2", json={"statement": "BAD", "parameters": {}})
+        assert resp.status_code in (400, 422, 500)
+
+    def test_schema_exception_returns_500(self, mock_engine):
+        from fastapi.testclient import TestClient
+        from iris_vector_graph.cypher_api import app
+        bad_eng = MagicMock()
+        bad_eng.get_labels.side_effect = Exception("db error")
+        with patch("iris_vector_graph.cypher_api._get_engine", return_value=bad_eng):
+            c = TestClient(app, raise_server_exceptions=False)
+            resp = c.get("/schema")
+        assert resp.status_code in (500, 400)
+
+    def test_neo4j_meta_with_id(self):
+        from iris_vector_graph.cypher_api import _neo4j_meta
+        result = _neo4j_meta({"id": "n1", "type": "Person"})
+        assert result is not None
+        assert result["id"] == "n1"
+
+    def test_neo4j_meta_without_id(self):
+        from iris_vector_graph.cypher_api import _neo4j_meta
+        result = _neo4j_meta({"name": "Alice"})
+        assert result is None

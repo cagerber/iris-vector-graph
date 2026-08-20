@@ -11,12 +11,12 @@
 `kg_SUBGRAPH(seed_ids, k_hops=K)` produces D^K candidate nodes where D is average degree.
 At D=10:
 
-| k | nodes |
-|---|-------|
-| 2 | 100 |
-| 3 | 1,000 |
-| 4 | 10,000 |
-| 5 | 100,000 — OOM / timeout |
+| k   | nodes                   |
+| --- | ----------------------- |
+| 2   | 100                     |
+| 3   | 1,000                   |
+| 4   | 10,000                  |
+| 5   | 100,000 — OOM / timeout |
 
 k≥3 is impractical for production workloads without a pruning strategy.
 
@@ -25,7 +25,7 @@ k≥3 is impractical for production workloads without a pruning strategy.
 ## Solution
 
 PPRGo (Bojchevski et al., KDD 2020) solves this by using Personalized PageRank scores
-to select the ~top_k most relevant nodes *before* BFS, preventing exponential blowup.
+to select the ~top_k most relevant nodes _before_ BFS, preventing exponential blowup.
 PPR scores decay naturally with graph distance, so distant low-relevance nodes are
 eliminated automatically.
 
@@ -125,11 +125,11 @@ IRIS process memory. Target: <100ms for 10K-node graphs at k=5.
 
 ## Performance
 
-| k | `kg_SUBGRAPH` | `kg_PPR_GUIDED_SUBGRAPH` (top_k=50) |
-|---|---|---|
-| 2 | ~40ms, D² nodes | ~60ms, ≤50 nodes |
-| 3 | ~200ms, D³ nodes | ~70ms, ≤50 nodes |
-| 5 | OOM / timeout | ~80ms, ≤50 nodes |
+| k   | `kg_SUBGRAPH`    | `kg_PPR_GUIDED_SUBGRAPH` (top_k=50) |
+| --- | ---------------- | ----------------------------------- |
+| 2   | ~40ms, D² nodes  | ~60ms, ≤50 nodes                    |
+| 3   | ~200ms, D³ nodes | ~70ms, ≤50 nodes                    |
+| 5   | OOM / timeout    | ~80ms, ≤50 nodes                    |
 
 At k=5, D=10: plain BFS = 100K nodes; PPR-guided = 50 nodes. **~2000x reduction**.
 
@@ -137,12 +137,12 @@ At k=5, D=10: plain BFS = 100K nodes; PPR-guided = 50 nodes. **~2000x reduction*
 
 ## Parameters (from PPRGo paper defaults)
 
-| Param | Default | Meaning |
-|-------|---------|---------|
-| `alpha` | 0.15 | Teleport probability. `damping = 1 - alpha`. Standard across APPNP, PPRGo, HippoRAG. |
-| `eps` | 1e-5 | Relative sparsification threshold. Nodes with score < eps×max_score dropped. |
-| `top_k` | 50 | Hard cap. PPRGo trained 12.4M nodes at top_k=50 in <2 min. |
-| `max_hops` | 5 | Hard BFS depth limit within pruned set. |
+| Param      | Default | Meaning                                                                              |
+| ---------- | ------- | ------------------------------------------------------------------------------------ |
+| `alpha`    | 0.15    | Teleport probability. `damping = 1 - alpha`. Standard across APPNP, PPRGo, HippoRAG. |
+| `eps`      | 1e-5    | Relative sparsification threshold. Nodes with score < eps×max_score dropped.         |
+| `top_k`    | 50      | Hard cap. PPRGo trained 12.4M nodes at top_k=50 in <2 min.                           |
+| `max_hops` | 5       | Hard BFS depth limit within pruned set.                                              |
 
 **Critical**: `alpha` is teleport probability, NOT damping. Existing `kg_PAGERANK` takes
 `damping`; caller must pass `damping=1-alpha`. Document this prominently.
@@ -151,12 +151,12 @@ At k=5, D=10: plain BFS = 100K nodes; PPR-guided = 50 nodes. **~2000x reduction*
 
 ## Files to Change
 
-| File | Change |
-|------|--------|
-| `iris_vector_graph/operators.py` | Add `kg_PPR_GUIDED_SUBGRAPH` to `IRISGraphOperators` |
-| `iris_vector_graph/models.py` | Add `PprGuidedSubgraphData` dataclass |
-| `tests/unit/test_ppr_guided_subgraph.py` | Unit tests (empty seeds, top_k, nodes_after <= nodes_before) |
-| `tests/integration/test_ppr_guided_e2e.py` | E2E test against live IRIS with 1K-node graph |
+| File                                       | Change                                                       |
+| ------------------------------------------ | ------------------------------------------------------------ |
+| `iris_vector_graph/operators.py`           | Add `kg_PPR_GUIDED_SUBGRAPH` to `IRISGraphOperators`         |
+| `iris_vector_graph/models.py`              | Add `PprGuidedSubgraphData` dataclass                        |
+| `tests/unit/test_ppr_guided_subgraph.py`   | Unit tests (empty seeds, top_k, nodes_after <= nodes_before) |
+| `tests/integration/test_ppr_guided_e2e.py` | E2E test against live IRIS with 1K-node graph                |
 
 ---
 

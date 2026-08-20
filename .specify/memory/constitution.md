@@ -1,23 +1,22 @@
 <!--
 SYNC IMPACT REPORT
 ==================
-Version change: 1.1.0 → 1.1.1 (PATCH — clarification; no principles added or removed)
-Bump rationale: Principle IV example container name corrected from "los-iris" (a different
-  project's container) to the actual project container name "iris_vector_graph" (from
-  docker-compose.yml). Added Principle VI (Grounding Rule) to prevent recurrence: any
-  infrastructure detail written into specs, tests, or templates MUST first be verified
-  against the authoritative source in the repository (docker-compose.yml, pyproject.toml,
-  conftest.py) before use. No placeholder values, no assumed names from other projects.
+Version change: 1.1.1 → 1.2.0 (MINOR — new principle VII added)
+Bump rationale: Added Principle VII (Cypher Conformance Gates) after the
+  direction-symmetry cross-join bug was found independently in two Cypher
+  implementations (cbm HEAD 571196db and IVG ≤v2.5.1).
+
+  The openCypher TCK (~1,615 scenarios across 220 .feature files) has no
+  Python-native runner — the official harness is Scala/JVM only.  Running TCK
+  requires building a behave step-definition harness: that work is tracked as a
+  future spec, not a current requirement.  Principle VII therefore specifies the
+  conformance obligation (what to test), names the TCK as the authoritative
+  reference, and sets a direction-symmetry gate as the minimum immediate bar.
 
 Modified principles:
-  - IV: example container name corrected (iris_vector_graph, not los-iris)
-  - VI: new principle added — Grounding Rule (verify before you write)
+  - VII: new principle added — Cypher Conformance Gates
 
-Templates requiring updates:
-  ✅ .specify/templates/plan-template.md — container name corrected
-  ✅ .specify/templates/tasks-template.md — container name corrected
-
-Deferred items: none.
+No other principles changed.  Templates do not require updates.
 -->
 
 # iris-vector-graph Constitution
@@ -92,6 +91,54 @@ Violation of this rule caused the `los-iris` incident (Feb 2026): a container na
 an unrelated project was propagated into the constitution, all spec artifacts, and test
 code before being caught. The fix required amending 8+ files. The cost is not acceptable.
 
+### VII. Cypher Conformance Gates
+
+#### Immediate gate (required now)
+
+Any spec that modifies the Cypher translator (`cypher/translator.py`,
+`cypher/parser.py`, or any `_engine/` mixin that generates SQL from a Cypher pattern)
+MUST include an E2E integration test asserting **direction-symmetry**:
+
+> For any directed pattern `(a)-[:R]->(b)` and its mirror `(b)<-[:R]-(a)`, when one
+> of the variables is pre-bound from a preceding MATCH clause, both forms MUST return
+> identical result sets against a live IRIS database.
+
+This gate exists because the openCypher TCK has no scenario asserting direction
+equivalence for directed patterns with a pre-bound target — the gap that let the same
+cross-join bug ship independently in cbm (`571196db`) and IVG (≤v2.5.1).  Unit tests
+cannot catch it; only a live database reveals wrong row counts.
+
+Reference: `tests/integration/test_cypher_advanced.py::test_integration_direction_symmetry_optional_match`
+
+#### Conformance resources to consult when changing the translator
+
+- **openCypher TCK** (`github.com/opencypher/openCypher`, `tck/features/`):
+  ~1,615 scenarios across 220 `.feature` files.  No Python runner exists — official
+  harness is Scala/JVM only.  Key files for IVG's scope:
+  `clauses/match/Match7.feature` (bound-target patterns),
+  `clauses/match/` (pattern matching),
+  `expressions/aggregation/` (count, collect),
+  `expressions/existentialSubqueries/` (EXISTS).
+- **openCypher OPTIONAL MATCH CIP**: `CIP2015-09-16-OPTIONAL-MATCH.adoc` in the
+  same repo — normative semantics for pre-bound variable behavior.
+- **cbm bug record**: `productivity-framework/specs/073-suite-failure-repair/CBM-BUG-optional-match-cross-join.md`
+
+#### Future obligation (tracked, not yet required)
+
+IVG has **not run the openCypher TCK**.  Spec 201 (`201-opencypher-tck-harness`)
+MUST deliver a `behave`-based harness that runs **all 1,339 TCK scenarios**.
+Every scenario that runs must pass at 100%.  Scenarios IVG cannot pass are tagged
+`@wip` with a documented reason; only four categories are known `@wip` at spec
+time: `expressions/graph` (Neo4j-specific), `expressions/temporal` (IRIS extension
+model), `expressions/pattern` (partial), and `@NegativeTest` scenarios requiring
+exact Neo4j error message text.  All other TCK categories — including all mutation
+clauses — are in scope and must pass.
+
+The `@wip` count MUST NOT increase on any PR.  Until the harness ships, the
+direction-symmetry gate above is the minimum bar.
+
+**Unit tests alone are insufficient** for translator changes that affect JOIN shape.
+
 ## Additional Constraints
 
 - Use the existing RDF schema (`nodes`, `rdf_labels`, `rdf_props`, `rdf_edges`,
@@ -117,4 +164,4 @@ amendments MUST be documented and explicitly approved before implementation begi
 Version increments follow semantic versioning: MAJOR for backward-incompatible governance
 changes, MINOR for new or materially expanded principles, PATCH for clarifications.
 
-**Version**: 1.1.1 | **Ratified**: 2026-01-31 | **Last Amended**: 2026-02-21
+**Version**: 1.2.0 | **Ratified**: 2026-01-31 | **Last Amended**: 2026-08-01

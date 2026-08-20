@@ -15,11 +15,11 @@ open http://localhost:8200/bio
 
 ### Three Pre-Built Scenarios
 
-| Scenario | Query | Purpose |
-|----------|-------|---------|
-| Cancer protein | TP53 (tumor suppressor) | Find structurally similar proteins across species |
-| Metabolic pathway | GAPDH → LDHA (2 hops) | Trace glycolysis pathway connections |
-| Drug target | Kinase inhibitor search | Find proteins targetable by a drug class |
+| Scenario          | Query                   | Purpose                                           |
+| ----------------- | ----------------------- | ------------------------------------------------- |
+| Cancer protein    | TP53 (tumor suppressor) | Find structurally similar proteins across species |
+| Metabolic pathway | GAPDH → LDHA (2 hops)   | Trace glycolysis pathway connections              |
+| Drug target       | Kinase inhibitor search | Find proteins targetable by a drug class          |
 
 ### Vector Similarity Search
 
@@ -33,8 +33,9 @@ ORDER BY score DESC
 ```
 
 Similarity thresholds:
+
 - **Very High** (≥ 0.9) — likely same protein family
-- **High** (≥ 0.75) — related function or structural homolog  
+- **High** (≥ 0.75) — related function or structural homolog
 - **Moderate** (≥ 0.5) — distant relationship, worth investigating
 - **Low** (< 0.5) — weak signal
 
@@ -48,14 +49,15 @@ RETURN neighbor.id, neighbor.name, type(r) LIMIT 25
 ```
 
 Edge types and their visual encoding in the D3 force graph:
+
 - `ACTIVATES` → green edges (stimulatory)
-- `INHIBITS` → red edges (inhibitory)  
+- `INHIBITS` → red edges (inhibitory)
 - `BINDS` → blue edges (physical binding)
 - `INTERACTS_WITH` → grey edges (general)
 
 ### Hybrid Search: Vector + Graph
 
-The power of IVG is combining both modalities in one query: find similar proteins *and* their network neighborhood.
+The power of IVG is combining both modalities in one query: find similar proteins _and_ their network neighborhood.
 
 ```cypher
 CALL ivg.vector.search('Protein', 'emb', $query_vector, 5) YIELD node AS seed, score
@@ -69,12 +71,13 @@ This is how you find drug targets: start from a known protein, find structurally
 ## Interactive Network Visualization
 
 The D3.js force-directed graph is interactive:
+
 - **Click** a node to expand its 1-hop neighborhood (up to 500 total nodes)
 - **Drag** nodes to rearrange the layout
 - **Zoom** with scroll wheel
 - **Double-click** to reset the view
 
-Node colors indicate organism: teal = *Homo sapiens*, purple = *Mus musculus*, orange = others.
+Node colors indicate organism: teal = _Homo sapiens_, purple = _Mus musculus_, orange = others.
 
 ## Data Model
 

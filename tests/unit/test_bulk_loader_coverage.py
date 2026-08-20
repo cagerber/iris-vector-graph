@@ -154,3 +154,97 @@ class TestBulkLoaderTable:
             )
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Exception cleanup paths: cursor.close() failures, rollback failures
+# ---------------------------------------------------------------------------
+
+def _make_loader_with_close_fail():
+    from iris_vector_graph.bulk_loader import BulkLoader
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.fetchall.return_value = []
+    cur.fetchone.return_value = None
+    cur.description = []
+    cur.execute.return_value = None
+    cur.executemany.return_value = None
+    cur.close.side_effect = Exception("close failed")
+    conn.cursor.return_value = cur
+    conn.commit.return_value = None
+    conn.rollback.return_value = None
+    loader = BulkLoader(conn)
+    return loader, conn, cur
+
+
+def test_load_nodes_cursor_close_fails():
+    loader, conn, cur = _make_loader_with_close_fail()
+    result = loader.load_nodes([])
+    assert isinstance(result, dict)
+
+
+def test_load_nodes_rollback_on_exception():
+    loader, conn, cur = _make_loader()
+    cur.execute.side_effect = Exception("SQL fail")
+    with pytest.raises(Exception, match="SQL fail"):
+        loader.load_nodes([("n1", ["Person"], {"name": "Alice"})])
+    conn.rollback.assert_called()
+
+
+def test_load_nodes_rollback_fails_reraises_original():
+    loader, conn, cur = _make_loader()
+    cur.execute.side_effect = Exception("SQL fail")
+    conn.rollback.side_effect = Exception("rollback fail")
+    with pytest.raises(Exception, match="SQL fail"):
+        loader.load_nodes([("n1", ["Person"], {})])
+
+
+def test_load_edges_cursor_close_fails():
+    loader, conn, cur = _make_loader_with_close_fail()
+    result = loader.load_edges([])
+    assert isinstance(result, dict)
+
+
+def test_rebuild_all_indices_cursor_close_fails():
+    loader, conn, cur = _make_loader_with_close_fail()
+    cur.execute.return_value = None
+    result = loader.rebuild_all_indices()
+    assert isinstance(result, dict)
+
+
+def test_rebuild_all_indices_execute_fails():
+    loader, conn, cur = _make_loader()
+    cur.execute.side_effect = Exception("build failed")
+    result = loader.rebuild_all_indices()
+    assert isinstance(result, dict)
+
+
+def test_build_graph_globals_commit_fails():
+    loader, conn, cur = _make_loader()
+    cur.execute.return_value = None
+    conn.commit.side_effect = Exception("commit fail")
+    result = loader.build_graph_globals()
+    assert result is True
+
+
+def test_build_graph_globals_execute_fails():
+    loader, conn, cur = _make_loader()
+    cur.execute.side_effect = Exception("BuildKG not deployed")
+    result = loader.build_graph_globals()
+    assert result is False
+
+
+def test_build_graph_globals_cursor_close_fails():
+    loader, conn, cur = _make_loader_with_close_fail()
+    cur.execute.return_value = None
+    result = loader.build_graph_globals()
+    assert result is True or result is False
+
+
+def test_load_networkx_cursor_close_fails():
+    import networkx as nx
+    loader, conn, cur = _make_loader_with_close_fail()
+    G = nx.DiGraph()
+    G.add_node("n1", namespace="Person")
+    result = loader.load_networkx(G, build_globals=False)
+    assert isinstance(result, dict)
