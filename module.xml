@@ -29,19 +29,7 @@
       <Resource Name="PageRankEmbedded.CLS"/>
       <Resource Name="User.Exec.CLS"/>
       <Resource Name="iris.vector.graph.GraphOperators.CLS"/>
-      <Keywords>
-        <Keyword>vector</Keyword>
-        <Keyword>graph</Keyword>
-        <Keyword>knowledge-graph</Keyword>
-        <Keyword>cypher</Keyword>
-        <Keyword>temporal-graph</Keyword>
-        <Keyword>vector-search</Keyword>
-        <Keyword>graphql</Keyword>
-        <Keyword>FHIR</Keyword>
-        <Keyword>PLAID</Keyword>
-        <Keyword>openCypher</Keyword>
-        <Keyword>analytics</Keyword>
-      </Keywords>
+      <Keywords>vector,graph,knowledge-graph,cypher,temporal-graph,vector-search,graphql,FHIR,PLAID,openCypher,analytics</Keywords>
     </Module>
   </Document>
 </Export>
