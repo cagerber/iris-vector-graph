@@ -1,16 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Trifour fork of intersystems-community/iris-vector-graph.
+  Based on upstream v2.7.0 (merge commit caf9241 on main).
+  Fork policy: module Name carries the trifour- identity; versions are
+  always plain x.x.x (no +trifour.n suffixes). Upstream base is re-recorded
+  here and in FORK.md at every upstream merge.
+-->
 <Export generator="Cache" version="25">
   <Document name="iris-vector-graph.ZPM">
     <Module>
-      <Name>iris-vector-graph</Name>
+      <Name>trifour-iris-vector-graph</Name>
       <Description>Knowledge graph engine for InterSystems IRIS — temporal property graph, openCypher queries, graph analytics (PageRank, WCC, PPR), and pre-aggregated time-series analytics. Python SDK on PyPI: iris-vector-graph.</Description>
-      <Version>2.7.0+trifour.8</Version>
+      <Version>2.7.1</Version>
       <Packaging>module</Packaging>
       <SourcesRoot>iris_src/src</SourcesRoot>
       <Dependencies>
         <ModuleReference>
-          <Name>iris-vector-graph-core</Name>
-          <Version>2.7.0+trifour.8</Version>
+          <Name>trifour-iris-vector-graph-core</Name>
+          <Version>2.7.1</Version>
         </ModuleReference>
       </Dependencies>
       <Resource Name="Graph.KG.ArnoAccel.CLS"/>
