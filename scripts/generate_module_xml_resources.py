@@ -63,6 +63,19 @@ def cls_path_to_resource(cls_path: Path) -> str:
     return f"{dotted}.CLS"
 
 
+def assert_no_unpackaged_ipm_resources(resource_names: frozenset[str]) -> None:
+    """Reject resources whose class name has no package (ZPM MapPackages SUBSCRIPT)."""
+    bad = sorted(
+        name
+        for name in resource_names
+        if name.upper().endswith(".CLS") and "." not in name[: -4]
+    )
+    if bad:
+        raise ValueError(
+            "unpackaged root IPM resources (empty package map): " + ", ".join(bad)
+        )
+
+
 def filesystem_class_files() -> list[Path]:
     paths = sorted(SRC_ROOT.rglob("*.cls"))
     if not paths:
@@ -197,7 +210,11 @@ def parse_module_resources(path: Path) -> frozenset[str]:
 
 def generate(*, check_only: bool = False) -> tuple[int, int, int, int]:
     all_resources = filesystem_resources()
+    assert_no_unpackaged_ipm_resources(all_resources)
     core, full, vector = split_resources(all_resources)
+    assert_no_unpackaged_ipm_resources(frozenset(core))
+    assert_no_unpackaged_ipm_resources(frozenset(full))
+    assert_no_unpackaged_ipm_resources(frozenset(vector))
     partitions = core, full, vector
     if sum(len(p) for p in partitions) != len(all_resources):
         raise RuntimeError("core/full/vector partition does not cover all classes")

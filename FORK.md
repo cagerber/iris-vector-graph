@@ -23,7 +23,7 @@
 | Field | Value |
 |-------|-------|
 | Upstream base | `v2.20.0` (tag `8c435972`) |
-| Fork module version | `2.20.0` (tracks upstream release tag until next upstream tag) |
+| Fork module version | `2.20.1` (adk-402: drop unpackaged `PageRankEmbedded.cls`; IPM reload hygiene) |
 | Renamed modules | `module.xml`, `module-core.xml` |
 | MCP resources | **Excluded** from default IPM modules (optional site flag / `module-mcp` future) |
 | Not renamed | `module-vector.xml` (unused by ODS packaging) |

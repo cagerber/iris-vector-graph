@@ -5,7 +5,7 @@
     <Module>
       <Name>trifour-iris-vector-graph-core</Name>
       <Description>Pure ObjectScript graph primitives for IRIS. No Python required. No VECTOR license required.</Description>
-      <Version>2.20.0</Version>
+      <Version>2.20.1</Version>
       <Packaging>module</Packaging>
       <SourcesRoot>iris_src/src</SourcesRoot>
       <Resource Name="Graph.KG.Algorithms.CLS"/>
