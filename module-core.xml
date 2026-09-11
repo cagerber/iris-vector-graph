@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Trifour fork of intersystems-community/iris-vector-graph; based on upstream v2.7.0. -->
+<!-- Trifour fork of intersystems-community/iris-vector-graph; upstream_base v2.20.0. -->
 <Export generator="Cache" version="25">
-  <Document name="iris-vector-graph-core.ZPM">
+  <Document name="trifour-iris-vector-graph-core.ZPM">
     <Module>
       <Name>trifour-iris-vector-graph-core</Name>
       <Description>Pure ObjectScript graph primitives for IRIS. No Python required. No VECTOR license required.</Description>
-      <Version>2.7.1</Version>
+      <Version>2.20.0</Version>
       <Packaging>module</Packaging>
       <SourcesRoot>iris_src/src</SourcesRoot>
       <Resource Name="Graph.KG.Algorithms.CLS"/>
@@ -14,8 +14,6 @@
       <Resource Name="Graph.KG.EdgeScan.CLS"/>
       <Resource Name="Graph.KG.GraphIndex.CLS"/>
       <Resource Name="Graph.KG.IVFIndex.CLS"/>
-      <Resource Name="Graph.KG.MCPService.CLS"/>
-      <Resource Name="Graph.KG.MCPToolSet.CLS"/>
       <Resource Name="Graph.KG.Meta.CLS"/>
       <Resource Name="Graph.KG.NKGAccel.CLS"/>
       <Resource Name="Graph.KG.NKGAccelAdjacency.CLS"/>

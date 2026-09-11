@@ -1,23 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   Trifour fork of intersystems-community/iris-vector-graph.
-  Based on upstream v2.7.0 (merge commit caf9241 on main).
-  Fork policy: module Name carries the trifour- identity; versions are
-  always plain x.x.x (no +trifour.n suffixes). Upstream base is re-recorded
-  here and in FORK.md at every upstream merge.
+  upstream_base: v2.20.0 (8c435972). Fork policy: module Name carries the
+  trifour- identity; versions are plain x.x.x aligned with upstream release tag.
 -->
 <Export generator="Cache" version="25">
-  <Document name="iris-vector-graph.ZPM">
+  <Document name="trifour-iris-vector-graph.ZPM">
     <Module>
       <Name>trifour-iris-vector-graph</Name>
       <Description>Knowledge graph engine for InterSystems IRIS — temporal property graph, openCypher queries, graph analytics (PageRank, WCC, PPR), and pre-aggregated time-series analytics. Python SDK on PyPI: iris-vector-graph.</Description>
-      <Version>2.7.1</Version>
+      <Version>2.20.0</Version>
       <Packaging>module</Packaging>
       <SourcesRoot>iris_src/src</SourcesRoot>
       <Dependencies>
         <ModuleReference>
           <Name>trifour-iris-vector-graph-core</Name>
-          <Version>2.7.1</Version>
+          <Version>2.20.0</Version>
         </ModuleReference>
       </Dependencies>
       <Resource Name="Graph.KG.ArnoAccel.CLS"/>
@@ -28,12 +26,10 @@
       <Resource Name="Graph.KG.Edge.CLS"/>
       <Resource Name="Graph.KG.EmbedQueue.CLS"/>
       <Resource Name="Graph.KG.Loader.CLS"/>
-      <Resource Name="Graph.KG.MCPTools.CLS"/>
       <Resource Name="Graph.KG.PyOps.CLS"/>
       <Resource Name="Graph.KG.Service.CLS"/>
       <Resource Name="Graph.KG.TraversalBFS.CLS"/>
       <Resource Name="IVG.CypherEngine.CLS"/>
-      <Resource Name="PageRankEmbedded.CLS"/>
       <Resource Name="User.Exec.CLS"/>
       <Resource Name="iris.vector.graph.GraphOperators.CLS"/>
       <Keywords>vector,graph,knowledge-graph,cypher,temporal-graph,vector-search,graphql,FHIR,PLAID,openCypher,analytics</Keywords>
