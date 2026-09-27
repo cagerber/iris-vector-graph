@@ -1,0 +1,69 @@
+# Packages this repo provides, and the versions they carry.
+#
+# PATCH mode, twice, over ONE tree. This is a third-party FORK, so upstream's hand-written
+# `module.xml` is authoritative — the coordinator stamps the version and ships the manifest
+# otherwise unchanged. The fork keeps TWO upstream manifests at its root:
+#
+#   module.xml       -> iris-vector-graph        (full engine; depends on the core package)
+#   module-core.xml  -> iris-vector-graph-core   (pure ObjectScript primitives)
+#
+# `manifest:` selects which one a package ships. Without a filter both would pack the WHOLE
+# repo root, so the two archives would be identical content under two identities. `include`
+# is the file filter that makes them disjoint, and it is exactly the resource list each
+# manifest already declares:
+#
+#   module.xml      <SourcesRoot>iris_src/src</SourcesRoot> + 7 <Resource> entries:
+#                   Graph.KG.{Edge,Loader,PyOps,Service,ArnoAccel,BenchFormat,Benchmark}
+#                   It declares a dependency on iris-vector-graph-core, so the core classes
+#                   come from the other package and must NOT be duplicated here.
+#   module-core.xml <SourcesRoot>iris_src/src</SourcesRoot> + 9 <Resource> entries:
+#                   Graph.KG.{VecIndex,PLAIDSearch,GraphIndex,Traversal,PageRank,Algorithms,
+#                             Subgraph,BenchSeeder,Meta}
+#
+# An IPM `<Resource Name="Graph.KG.Edge.CLS"/>` under `<SourcesRoot>iris_src/src</SourcesRoot>`
+# resolves to the nested file `iris_src/src/Graph/KG/Edge.cls` (the same mapping ODS's
+# `tools/deploy/support/ivg_ipm_lib.py` uses). The include paths below are those exact files,
+# repo-relative. Upstream names only these classes, so only these travel: the other ~36 `.cls`
+# files in the tree are resources of neither manifest and stay out of both packages rather
+# than being duplicated into one.
+
+schema: trifour-ipm-packages-v1
+
+repo: cagerber/iris-vector-graph
+
+mode: patch
+
+packages:
+  - id: iris-vector-graph
+    manifest: module.xml
+    description: "Knowledge graph engine for InterSystems IRIS (full package; depends on iris-vector-graph-core)"
+    # Declared for the formal channel. `sprint`/`incubating` are MINTED as a chrono-semver at
+    # build time and must not be declared here. This is the <Version> in module.xml.
+    versions:
+      release: "2.0.0"
+    include:
+      - iris_src/src/Graph/KG/Edge.cls
+      - iris_src/src/Graph/KG/Loader.cls
+      - iris_src/src/Graph/KG/PyOps.cls
+      - iris_src/src/Graph/KG/Service.cls
+      - iris_src/src/Graph/KG/ArnoAccel.cls
+      - iris_src/src/Graph/KG/BenchFormat.cls
+      - iris_src/src/Graph/KG/Benchmark.cls
+
+  - id: iris-vector-graph-core
+    manifest: module-core.xml
+    description: "Pure ObjectScript graph + vector primitives for IRIS (no Python required)"
+    # The <Version> in module-core.xml. It is deliberately NOT forced to match the full
+    # package's 2.0.0: the version on the branch is the one in effect.
+    versions:
+      release: "1.27.0"
+    include:
+      - iris_src/src/Graph/KG/VecIndex.cls
+      - iris_src/src/Graph/KG/PLAIDSearch.cls
+      - iris_src/src/Graph/KG/GraphIndex.cls
+      - iris_src/src/Graph/KG/Traversal.cls
+      - iris_src/src/Graph/KG/PageRank.cls
+      - iris_src/src/Graph/KG/Algorithms.cls
+      - iris_src/src/Graph/KG/Subgraph.cls
+      - iris_src/src/Graph/KG/BenchSeeder.cls
+      - iris_src/src/Graph/KG/Meta.cls
