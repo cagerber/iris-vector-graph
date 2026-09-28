@@ -1,11 +1,19 @@
 # Packages this repo provides, and the versions they carry.
 #
 # PATCH mode, twice, over ONE tree. This is a third-party FORK, so upstream's hand-written
-# `module.xml` is authoritative — the coordinator stamps the version and ships the manifest
-# otherwise unchanged. The fork keeps TWO upstream manifests at its root:
+# `module.xml` is authoritative for its CONTENT — but not for its IDENTITY. The coordinator
+# stamps the version, forces `<Name>` to the package id below, and remaps a
+# `<ModuleReference>` to a sibling renamed in the same declaration. That last part matters
+# here: upstream's manifest name is `iris-vector-graph`, while the estate's id is
+# `trifour-iris-vector-graph` (what all seven site manifests and ODS's catalogue ask for),
+# and this file's full package declares a `<Dependencies>` reference to the core package.
+# Without the remap, renaming the pair would leave the engine depending on a module id that
+# no longer exists.
 #
-#   module.xml       -> iris-vector-graph        (full engine; depends on the core package)
-#   module-core.xml  -> iris-vector-graph-core   (pure ObjectScript primitives)
+# The fork keeps TWO upstream manifests at its root:
+#
+#   module.xml       -> trifour-iris-vector-graph        (full engine; depends on core)
+#   module-core.xml  -> trifour-iris-vector-graph-core   (pure ObjectScript primitives)
 #
 # `manifest:` selects which one a package ships. Without a filter both would pack the WHOLE
 # repo root, so the two archives would be identical content under two identities. `include`
@@ -34,7 +42,7 @@ repo: cagerber/iris-vector-graph
 mode: patch
 
 packages:
-  - id: iris-vector-graph
+  - id: trifour-iris-vector-graph
     manifest: module.xml
     description: "Knowledge graph engine for InterSystems IRIS (full package; depends on iris-vector-graph-core)"
     # Declared for the formal channel. `sprint`/`incubating` are MINTED as a chrono-semver at
@@ -50,7 +58,7 @@ packages:
       - iris_src/src/Graph/KG/BenchFormat.cls
       - iris_src/src/Graph/KG/Benchmark.cls
 
-  - id: iris-vector-graph-core
+  - id: trifour-iris-vector-graph-core
     manifest: module-core.xml
     description: "Pure ObjectScript graph + vector primitives for IRIS (no Python required)"
     # The <Version> in module-core.xml. It is deliberately NOT forced to match the full
