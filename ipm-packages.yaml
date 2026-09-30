@@ -38,6 +38,7 @@
 schema: trifour-ipm-packages-v1
 
 repo: cagerber/iris-vector-graph
+versions: {release: "2.20.2", develop: "2.20.2", sprint: "2.20.2", incubating: "2.20.2"}
 
 mode: patch
 
