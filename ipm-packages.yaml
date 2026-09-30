@@ -45,10 +45,6 @@ packages:
   - id: trifour-iris-vector-graph
     manifest: module.xml
     description: "Knowledge graph engine for InterSystems IRIS (full package; depends on iris-vector-graph-core)"
-    # Declared for the formal channel. `sprint`/`incubating` are MINTED as a chrono-semver at
-    # build time and must not be declared here. This is the <Version> in module.xml.
-    versions:
-      release: "2.0.0"
     include:
       - iris_src/src/Graph/KG/Edge.cls
       - iris_src/src/Graph/KG/Loader.cls
@@ -61,10 +57,6 @@ packages:
   - id: trifour-iris-vector-graph-core
     manifest: module-core.xml
     description: "Pure ObjectScript graph + vector primitives for IRIS (no Python required)"
-    # The <Version> in module-core.xml. It is deliberately NOT forced to match the full
-    # package's 2.0.0: the version on the branch is the one in effect.
-    versions:
-      release: "1.27.0"
     include:
       - iris_src/src/Graph/KG/VecIndex.cls
       - iris_src/src/Graph/KG/PLAIDSearch.cls
