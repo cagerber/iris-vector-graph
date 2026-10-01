@@ -16,6 +16,15 @@
       <Resource Name="Graph.KG.Subgraph.CLS"/>
       <Resource Name="Graph.KG.BenchSeeder.CLS"/>
       <Resource Name="Graph.KG.Meta.CLS"/>
+      <Resource Name="Graph.KG.TraversalBuild.CLS"/>
+      <Resource Name="Graph.KG.TraversalBFS.CLS"/>
+      <Resource Name="Graph.KG.TraversalKHop.CLS"/>
+      <Resource Name="Graph.KG.TraversalPaths.CLS"/>
+      <Resource Name="Graph.KG.NKGAccel.CLS"/>
+      <Resource Name="Graph.KG.NKGAccelAdjacency.CLS"/>
+      <Resource Name="Graph.KG.NKGAccelCentrality.CLS"/>
+      <Resource Name="Graph.KG.NKGAccelLoader.CLS"/>
+      <Resource Name="Graph.KG.NKGAccelTraversal.CLS"/>
       <Keywords>
         <Keyword>vector</Keyword>
         <Keyword>graph</Keyword>

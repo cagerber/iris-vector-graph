@@ -24,16 +24,22 @@
 #                   Graph.KG.{Edge,Loader,PyOps,Service,ArnoAccel,BenchFormat,Benchmark}
 #                   It declares a dependency on iris-vector-graph-core, so the core classes
 #                   come from the other package and must NOT be duplicated here.
-#   module-core.xml <SourcesRoot>iris_src/src</SourcesRoot> + 9 <Resource> entries:
+#   module-core.xml <SourcesRoot>iris_src/src</SourcesRoot> + 18 <Resource> entries:
 #                   Graph.KG.{VecIndex,PLAIDSearch,GraphIndex,Traversal,PageRank,Algorithms,
 #                             Subgraph,BenchSeeder,Meta}
+#                   plus the siblings Traversal delegates to since upstream spec 187 split it
+#                   (2.20.7 — 2.20.6 shipped without them, so BuildKG hit
+#                   <CLASS DOES NOT EXIST>): Graph.KG.{TraversalBuild,TraversalBFS,
+#                   TraversalKHop,TraversalPaths,NKGAccel,NKGAccelAdjacency,
+#                   NKGAccelCentrality,NKGAccelLoader,NKGAccelTraversal}
 #
 # An IPM `<Resource Name="Graph.KG.Edge.CLS"/>` under `<SourcesRoot>iris_src/src</SourcesRoot>`
 # resolves to the nested file `iris_src/src/Graph/KG/Edge.cls` (the same mapping ODS's
 # `tools/deploy/support/ivg_ipm_lib.py` uses). The include paths below are those exact files,
-# repo-relative. Upstream names only these classes, so only these travel: the other ~36 `.cls`
-# files in the tree are resources of neither manifest and stay out of both packages rather
-# than being duplicated into one.
+# repo-relative. Only these travel: the other ~27 `.cls` files in the tree are referenced by
+# no shipped class and stay out of both packages rather than being duplicated into one.
+# tests/unit/test_ipm_package_closure.py fails when a shipped class needs an unshipped one,
+# and when these include lists drift from the manifests.
 
 schema: trifour-ipm-packages-v1
 
@@ -67,3 +73,12 @@ packages:
       - iris_src/src/Graph/KG/Subgraph.cls
       - iris_src/src/Graph/KG/BenchSeeder.cls
       - iris_src/src/Graph/KG/Meta.cls
+      - iris_src/src/Graph/KG/TraversalBuild.cls
+      - iris_src/src/Graph/KG/TraversalBFS.cls
+      - iris_src/src/Graph/KG/TraversalKHop.cls
+      - iris_src/src/Graph/KG/TraversalPaths.cls
+      - iris_src/src/Graph/KG/NKGAccel.cls
+      - iris_src/src/Graph/KG/NKGAccelAdjacency.cls
+      - iris_src/src/Graph/KG/NKGAccelCentrality.cls
+      - iris_src/src/Graph/KG/NKGAccelLoader.cls
+      - iris_src/src/Graph/KG/NKGAccelTraversal.cls
