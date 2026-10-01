@@ -7,6 +7,9 @@ dist
 .env.local
 .env.test
 .env.*.local
+.env.*
+!.env.example
+!.env.sample
 
 # Logs
 *.log
