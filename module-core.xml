@@ -25,6 +25,7 @@
       <Resource Name="Graph.KG.NKGAccelCentrality.CLS"/>
       <Resource Name="Graph.KG.NKGAccelLoader.CLS"/>
       <Resource Name="Graph.KG.NKGAccelTraversal.CLS"/>
+      <Resource Name="Graph.KG.BM25Index.CLS"/>
       <Keywords>
         <Keyword>vector</Keyword>
         <Keyword>graph</Keyword>

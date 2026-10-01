@@ -24,7 +24,7 @@
 #                   Graph.KG.{Edge,Loader,PyOps,Service,ArnoAccel,BenchFormat,Benchmark}
 #                   It declares a dependency on iris-vector-graph-core, so the core classes
 #                   come from the other package and must NOT be duplicated here.
-#   module-core.xml <SourcesRoot>iris_src/src</SourcesRoot> + 18 <Resource> entries:
+#   module-core.xml <SourcesRoot>iris_src/src</SourcesRoot> + 19 <Resource> entries:
 #                   Graph.KG.{VecIndex,PLAIDSearch,GraphIndex,Traversal,PageRank,Algorithms,
 #                             Subgraph,BenchSeeder,Meta}
 #                   plus the siblings Traversal delegates to since upstream spec 187 split it
@@ -37,14 +37,17 @@
 #                   created and migrated at runtime by the Python schema, so embedded SQL
 #                   made core uncompilable on a fresh namespace and over a pre-spec-214
 #                   rdf_edges (2.20.7: "Field 'GRAPH_ID' not found").
+#                   Graph.KG.BM25Index (2.20.9): no shipped class references it, but the
+#                   Python SDK and ODS GraphImport call it (iris.cls), so 2.20.8 imports
+#                   failed "BM25 index build failed: iris.cls: error finding class".
 #
 # An IPM `<Resource Name="Graph.KG.Edge.CLS"/>` under `<SourcesRoot>iris_src/src</SourcesRoot>`
 # resolves to the nested file `iris_src/src/Graph/KG/Edge.cls` (the same mapping ODS's
 # `tools/deploy/support/ivg_ipm_lib.py` uses). The include paths below are those exact files,
-# repo-relative. Only these travel: the other ~27 `.cls` files in the tree are referenced by
-# no shipped class and stay out of both packages rather than being duplicated into one.
-# tests/unit/test_ipm_package_closure.py fails when a shipped class needs an unshipped one,
-# and when these include lists drift from the manifests.
+# repo-relative. Only these travel: the other `.cls` files in the tree are optional SDK
+# features no shipped class or estate caller needs, and stay out of both packages.
+# tests/unit/test_ipm_package_closure.py fails when a shipped class or the shipped Python
+# needs an unshipped class, and when these include lists drift from the manifests.
 
 schema: trifour-ipm-packages-v1
 
@@ -87,3 +90,4 @@ packages:
       - iris_src/src/Graph/KG/NKGAccelCentrality.cls
       - iris_src/src/Graph/KG/NKGAccelLoader.cls
       - iris_src/src/Graph/KG/NKGAccelTraversal.cls
+      - iris_src/src/Graph/KG/BM25Index.cls

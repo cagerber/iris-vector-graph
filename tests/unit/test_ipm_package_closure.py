@@ -34,6 +34,24 @@ DDL_OWNED = {"Graph.KG.kgNodeEmbeddings"}
 # release would fail to install over full 2.20.6 ("already defined as part of module").
 CORE_REACHES_FULL = {"Graph.KG.ArnoAccel", "Graph.KG.Edge"}
 
+# In-repo classes the Python SDK names but neither package ships: optional SDK features
+# whose calls are guarded (or unused by the estate). Anything else the Python names must ship.
+PYTHON_SDK_ONLY = {
+    "Graph.KG.Centrality",
+    "Graph.KG.Communities",
+    "Graph.KG.EdgeScan",
+    "Graph.KG.EmbedQueue",
+    "Graph.KG.IVFIndex",
+    "Graph.KG.Ledger",
+    "Graph.KG.Snapshot",
+    "Graph.KG.TemporalIndex",
+    "Graph.KG.TestEdge",
+}
+
+# Classes ODS GraphImport (ods/tools/ods_kg_backend/graph_import.py) calls via iris.cls;
+# ods pins the same set in tests/test_graph_import.py. Never allowlistable.
+ODS_KG_BACKEND_CALLS = {"Graph.KG.Traversal", "Graph.KG.BM25Index"}
+
 
 def _classes() -> dict[str, Path]:
     out = {}
@@ -155,6 +173,21 @@ def test_compile_time_dependencies_resolve_inside_the_package() -> None:
         "compile-time dependency outside the package (use dynamic SQL / runtime ##class "
         "for tables the Python schema owns or classes full ships):\n" + "\n".join(offences)
     )
+
+
+def test_python_iris_cls_references_ship() -> None:
+    classes = _classes()
+    shipped = _manifest_resources("module-core.xml") | _manifest_resources("module.xml")
+    named: set[str] = set()
+    for path in (ROOT / "iris_vector_graph").rglob("*.py"):
+        code = "\n".join(
+            line for line in path.read_text(errors="ignore").splitlines() if not line.lstrip().startswith("#")
+        )
+        named |= set(re.findall(r"(?<![\w.])(Graph\.KG\.\w+)(?![\w.])", code)) & set(classes)
+    assert not PYTHON_SDK_ONLY & shipped, f"allowlisted but shipped: {sorted(PYTHON_SDK_ONLY & shipped)}"
+    missing = (named | ODS_KG_BACKEND_CALLS) - shipped - PYTHON_SDK_ONLY - DDL_OWNED
+    assert not missing, f"Python calls classes no package ships (iris.cls: error finding class): {sorted(missing)}"
+    assert ODS_KG_BACKEND_CALLS <= shipped
 
 
 def test_ipm_packages_yaml_includes_match_the_manifests() -> None:
