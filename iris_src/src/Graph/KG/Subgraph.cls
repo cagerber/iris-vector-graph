@@ -125,15 +125,11 @@ ClassMethod SubgraphJson(seedJson As %String, maxHops As %Integer = 2, edgeTypes
 		// ^KG("label", labelName, nodeId) = ""
 		Set labelArr = ##class(%DynamicArray).%New()
 		Set hasLabel = 0
-		&sql(DECLARE lblCursor CURSOR FOR SELECT label FROM Graph_KG.rdf_labels WHERE s = :n)
-		&sql(OPEN lblCursor)
-		For {
-			&sql(FETCH lblCursor INTO :lbl)
-			Quit:SQLCODE'=0
-			Do labelArr.%Push(lbl)
+		Set lblRS = ##class(%SQL.Statement).%ExecDirect(, "SELECT label FROM Graph_KG.rdf_labels WHERE s = ?", n)
+		While lblRS.%Next() {
+			Do labelArr.%Push(lblRS.%GetData(1))
 			Set hasLabel = 1
 		}
-		&sql(CLOSE lblCursor)
 		If hasLabel Do labelsObj.%Set(n, labelArr)
 	}
 	

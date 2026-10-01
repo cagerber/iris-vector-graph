@@ -6,6 +6,13 @@
 shipped class but listed in neither is absent on the server (``<CLASS DOES NOT EXIST>``
 at runtime, as ``Graph.KG.TraversalBuild`` was in 2.20.6). Core may reach into full only
 through ``CORE_REACHES_FULL``, since full depends on core.
+
+Compile-time dependencies are stricter, because core installs and compiles before full
+exists: ``Extends``, property/relationship types, ``CompileAfter``/``DependsOn`` and
+embedded-SQL tables must resolve inside the class's own package (or core). Embedded SQL
+may not name a table no shipped class defines either: the Graph_KG tables are created and
+migrated at runtime by the Python schema, so 2.20.7 core failed to compile both on a fresh
+namespace and over a pre-spec-214 ``rdf_edges`` (``Field 'GRAPH_ID' not found``).
 """
 
 from __future__ import annotations
@@ -20,10 +27,11 @@ SOURCES = ROOT / "iris_src" / "src"
 # dimension); their .cls twins must not ship or they pre-create a clashing table.
 DDL_OWNED = {"Graph.KG.kgNodeEmbeddings"}
 
-# Full classes core reaches anyway. ArnoAccel: NKGAccel probes its optional Rust callout via
-# IsAvailable(). Edge: TraversalBuild reads its table Graph_KG.rdf_edges in embedded SQL.
-# Neither can move to core: IPM refuses a resource another installed module owns, so core
-# 2.20.7 would fail to install over full 2.20.6 ("already defined as part of module").
+# Full classes core reaches at RUNTIME only (never at compile time — the test below checks).
+# ArnoAccel: NKGAccel probes its optional Rust callout via ##class(...).IsAvailable().
+# Edge: TraversalBuild reads its table Graph_KG.rdf_edges through dynamic SQL.
+# Neither can move to core: IPM refuses a resource another installed module owns, so a core
+# release would fail to install over full 2.20.6 ("already defined as part of module").
 CORE_REACHES_FULL = {"Graph.KG.ArnoAccel", "Graph.KG.Edge"}
 
 
@@ -46,12 +54,16 @@ def _sql_tables(classes: dict[str, Path]) -> dict[str, str]:
     return out
 
 
-def _references(name: str, classes: dict[str, Path], tables: dict[str, str]) -> set[str]:
-    code = "\n".join(
+def _code(path: Path) -> str:
+    return "\n".join(
         line
-        for line in classes[name].read_text(errors="ignore").splitlines()
+        for line in path.read_text(errors="ignore").splitlines()
         if not re.match(r"\s*(///|//|#;|;)", line)
     )
+
+
+def _references(name: str, classes: dict[str, Path], tables: dict[str, str]) -> set[str]:
+    code = _code(classes[name])
     found = {
         other
         for other in classes
@@ -62,6 +74,25 @@ def _references(name: str, classes: dict[str, Path], tables: dict[str, str]) -> 
         if table and table != name:
             found.add(table)
     return found - DDL_OWNED
+
+
+def _compile_time(name: str, classes: dict[str, Path], tables: dict[str, str]) -> set[str]:
+    """In-repo classes, and ``table:<name>`` for unowned tables, the compiler must resolve."""
+    code = _code(classes[name])
+    names: set[str] = set()
+    if match := re.search(r"(?m)^Class\s+[\w.%]+\s+Extends\s+\(?([\w.%,\s]+?)\)?\s*(\[|\{|$)", code):
+        names |= {n.strip() for n in match.group(1).split(",")}
+    names |= set(
+        re.findall(r"(?m)^(?:Property|Relationship)\s+\w+\s+As\s+(?:(?:list|array)\s+Of\s+)?([\w.%]+)", code)
+    )
+    for keyword in re.findall(r"(?:CompileAfter|DependsOn)\s*=\s*\(?([\w.%,\s]+)\)?", code):
+        names |= {n.strip() for n in keyword.split(",")}
+    out = {n for n in names if n in classes}
+    for sql in re.findall(r"&sql\((.*?)\)\s*$", code, flags=re.IGNORECASE | re.MULTILINE):
+        for table in re.findall(r"(?i)\b(?:FROM|JOIN|INTO|UPDATE)\s+([\w.]+)", sql):
+            owner = tables.get(table.lower())
+            out.add(owner if owner in classes else f"table:{table}")
+    return out - {name}
 
 
 def _manifest_resources(manifest: str) -> set[str]:
@@ -107,6 +138,23 @@ def test_shipped_classes_reference_only_shipped_classes() -> None:
     full_missing = _closure(full, classes, tables) - core - full
     assert not core_missing, f"core classes need classes core does not ship: {sorted(core_missing)}"
     assert not full_missing, f"full classes need unshipped classes: {sorted(full_missing)}"
+
+
+def test_compile_time_dependencies_resolve_inside_the_package() -> None:
+    classes = _classes()
+    tables = _sql_tables(classes)
+    core = _manifest_resources("module-core.xml")
+    full = _manifest_resources("module.xml")
+    offences = [
+        f"{name} -> {dep}"
+        for shipped, allowed in ((core, core), (full, core | full))
+        for name in sorted(shipped)
+        for dep in sorted(_compile_time(name, classes, tables) - allowed)
+    ]
+    assert not offences, (
+        "compile-time dependency outside the package (use dynamic SQL / runtime ##class "
+        "for tables the Python schema owns or classes full ships):\n" + "\n".join(offences)
+    )
 
 
 def test_ipm_packages_yaml_includes_match_the_manifests() -> None:

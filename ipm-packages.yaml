@@ -32,6 +32,11 @@
 #                   <CLASS DOES NOT EXIST>): Graph.KG.{TraversalBuild,TraversalBFS,
 #                   TraversalKHop,TraversalPaths,NKGAccel,NKGAccelAdjacency,
 #                   NKGAccelCentrality,NKGAccelLoader,NKGAccelTraversal}
+#                   Fork delta (2.20.8): TraversalBuild and Subgraph read the Graph_KG
+#                   tables through dynamic SQL instead of embedded SQL. Those tables are
+#                   created and migrated at runtime by the Python schema, so embedded SQL
+#                   made core uncompilable on a fresh namespace and over a pre-spec-214
+#                   rdf_edges (2.20.7: "Field 'GRAPH_ID' not found").
 #
 # An IPM `<Resource Name="Graph.KG.Edge.CLS"/>` under `<SourcesRoot>iris_src/src</SourcesRoot>`
 # resolves to the nested file `iris_src/src/Graph/KG/Edge.cls` (the same mapping ODS's

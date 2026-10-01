@@ -13,33 +13,34 @@ ClassMethod BuildKG() As %Status
 		Kill ^KG("label"), ^KG("prop"), ^KG("out"), ^KG("in"), ^KG("deg"), ^KG("degp")
 		TStart
 
+		// Dynamic SQL: the Graph_KG tables are created and migrated at runtime by the
+		// Python schema (iris_vector_graph/schema.py), so the class must compile without them.
 		// 1. Labels
-		&sql(DECLARE c1 CURSOR FOR SELECT s, label FROM Graph_KG.rdf_labels)
-		&sql(OPEN c1)
-		For {
-			&sql(FETCH c1 INTO :s, :label)
-			Quit:SQLCODE'=0
-			Set ^KG("label", label, s) = ""
+		Set rs = ##class(%SQL.Statement).%ExecDirect(, "SELECT s, label FROM Graph_KG.rdf_labels")
+		If rs.%SQLCODE < 0 Throw ##class(%Exception.SQL).CreateFromSQLCODE(rs.%SQLCODE, rs.%Message)
+		While rs.%Next() {
+			Set ^KG("label", rs.%GetData(2), rs.%GetData(1)) = ""
 		}
-		&sql(CLOSE c1)
 
 		// 2. Props
-		&sql(DECLARE c2 CURSOR FOR SELECT s, key, val FROM Graph_KG.rdf_props)
-		&sql(OPEN c2)
-		For {
-			&sql(FETCH c2 INTO :s, :key, :val)
-			Quit:SQLCODE'=0
-			Set ^KG("prop", s, key) = val
+		Set rs = ##class(%SQL.Statement).%ExecDirect(, "SELECT s, key, val FROM Graph_KG.rdf_props")
+		If rs.%SQLCODE < 0 Throw ##class(%Exception.SQL).CreateFromSQLCODE(rs.%SQLCODE, rs.%Message)
+		While rs.%Next() {
+			Set ^KG("prop", rs.%GetData(1), rs.%GetData(2)) = rs.%GetData(3)
 		}
-		&sql(CLOSE c2)
 
 		// 3. Edges — spec 214: read graph_id from rdf_edges; write to ^KG("out", graph, 0, ...)
+		// A table created before spec 214 has no graph_id: every edge is in the default graph.
 		Set count = 0
-		&sql(DECLARE c3 CURSOR FOR SELECT s, p, o_id, qualifiers, graph_id FROM Graph_KG.rdf_edges)
-		&sql(OPEN c3)
-		For {
-			&sql(FETCH c3 INTO :s, :p, :o, :qual, :edgeGraph)
-			Quit:SQLCODE'=0
+		Set stmt = ##class(%SQL.Statement).%New()
+		Set sc = stmt.%Prepare("SELECT s, p, o_id, qualifiers, graph_id FROM Graph_KG.rdf_edges")
+		If $$$ISERR(sc) Set sc = stmt.%Prepare("SELECT s, p, o_id, qualifiers, '' AS graph_id FROM Graph_KG.rdf_edges")
+		$$$ThrowOnError(sc)
+		Set rs = stmt.%Execute()
+		If rs.%SQLCODE < 0 Throw ##class(%Exception.SQL).CreateFromSQLCODE(rs.%SQLCODE, rs.%Message)
+		While rs.%Next() {
+			Set s = rs.%GetData(1), p = rs.%GetData(2), o = rs.%GetData(3)
+			Set qual = rs.%GetData(4), edgeGraph = rs.%GetData(5)
 			If (s = "") || (p = "") || (o = "") Continue
 			// graph_id is '' (empty) for the default graph (spec 214 FR-003 sentinel).
 			// IRIS SQL %GetData returns $C(0) for empty-string VARCHAR NOT NULL, so strip
@@ -60,7 +61,6 @@ ClassMethod BuildKG() As %Status
 			Set count = count + 1
 			If count # 50000 = 0 { TCommit  TStart }
 		}
-		&sql(CLOSE c3)
 		TCommit
 
 		Try { Do ..BuildNKG() } Catch buildEx {
