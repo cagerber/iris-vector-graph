@@ -8,18 +8,9 @@
       <Packaging>module</Packaging>
       <SourcesRoot>iris_src/src</SourcesRoot>
       <Resource Name="Graph.KG.Algorithms.CLS"/>
+      <Resource Name="Graph.KG.BM25Index.CLS"/>
       <Resource Name="Graph.KG.BenchSeeder.CLS"/>
-      <Resource Name="Graph.KG.Centrality.CLS"/>
-      <Resource Name="Graph.KG.EdgeScan.CLS"/>
       <Resource Name="Graph.KG.GraphIndex.CLS"/>
-      <Resource Name="Graph.KG.IVFIndex.CLS"/>
-      <Resource Name="Graph.KG.Ledger.CLS"/>
-      <Resource Name="Graph.KG.LedgerApply.CLS"/>
-      <Resource Name="Graph.KG.LedgerGenesis.CLS"/>
-      <Resource Name="Graph.KG.LedgerRevision.CLS"/>
-      <Resource Name="Graph.KG.LedgerStats.CLS"/>
-      <Resource Name="Graph.KG.MCPService.CLS"/>
-      <Resource Name="Graph.KG.MCPToolSet.CLS"/>
       <Resource Name="Graph.KG.Meta.CLS"/>
       <Resource Name="Graph.KG.NKGAccel.CLS"/>
       <Resource Name="Graph.KG.NKGAccelAdjacency.CLS"/>
@@ -28,21 +19,13 @@
       <Resource Name="Graph.KG.NKGAccelTraversal.CLS"/>
       <Resource Name="Graph.KG.PLAIDSearch.CLS"/>
       <Resource Name="Graph.KG.PageRank.CLS"/>
-      <Resource Name="Graph.KG.Snapshot.CLS"/>
       <Resource Name="Graph.KG.Subgraph.CLS"/>
-      <Resource Name="Graph.KG.TemporalIndex.CLS"/>
-      <Resource Name="Graph.KG.TemporalIndexMS.CLS"/>
-      <Resource Name="Graph.KG.TestEdge.CLS"/>
       <Resource Name="Graph.KG.Traversal.CLS"/>
+      <Resource Name="Graph.KG.TraversalBFS.CLS"/>
       <Resource Name="Graph.KG.TraversalBuild.CLS"/>
       <Resource Name="Graph.KG.TraversalKHop.CLS"/>
       <Resource Name="Graph.KG.TraversalPaths.CLS"/>
       <Resource Name="Graph.KG.VecIndex.CLS"/>
-      <Resource Name="IVG.Percentile.CLS"/>
-      <Resource Name="User.CypherFn.CLS"/>
-      <Resource Name="User.SQL.CLS"/>
-      <Resource Name="User.funcJSONKEYS.CLS"/>
-      <Resource Name="User.funcSTRSPLIT.CLS"/>
       <Keywords>
         <Keyword>vector</Keyword>
         <Keyword>graph</Keyword>
