@@ -2,6 +2,16 @@
 
 # Changelog
 
+## [2.20.12] - 2026-10-20
+
+### Changed
+
+- **The Trifour fork line is reconciled into `incubating`** (2.20.9 → 2.20.12): IPM manifests and
+  includes ship exactly what they declare (`fix(ipm)`), and the unpublished `iris-agentic-dev`
+  extra is dropped with the lockfile refreshed.
+
+_Entries below predate this format (they were written per minor line)._
+
 ### v2.20.0 (2026-09-10)
 
 **Architecture: four module-deepening refactors**
