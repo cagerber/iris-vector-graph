@@ -1,0 +1,8 @@
+# Last issued IPM module versions — tracked.
+# Working/next catalog pins live in scripts/*_upstream.yaml (release-ipm --bump).
+# Updated on site/registry publish staging package. Each entry is the real version
+# last issued for that module. Never records versionless placeholder 0.0.1.
+schema: ods-ipm-issued-versions-v1
+modules:
+  trifour-iris-vector-graph-core-incubating: "2.20.13"
+  trifour-iris-vector-graph-incubating: "2.20.13"
