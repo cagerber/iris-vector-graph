@@ -2,6 +2,15 @@
 
 # Changelog
 
+## [2.20.13] - 2026-11-03
+
+### Changed
+
+- **Released at the current tip; no functional change.** 2.20.12 was built at its bump commit and
+  then moved by this release's own CHANGELOG and issued-version ledger commits, so the coordinator
+  had bound 2.20.12 to a commit the channel no longer pointed at and refused to rebuild. The package
+  content is identical; this bump gives the channel a version whose commit is its tip.
+
 ## [2.20.12] - 2026-10-20
 
 ### Changed
